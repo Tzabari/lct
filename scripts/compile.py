@@ -21,6 +21,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))  # allow sibling imports when run from elsewhere
 import term
+import lua_strings
 import validate_maps
 
 # Warnings collected across the whole run so the closing summary can report them
@@ -572,6 +573,19 @@ def main():
             version = "v" + version
 
     lua_files = collect_lua_files()
+
+    # --- Reject unterminated string literals ---
+    # TTS only surfaces these at runtime ("unfinished string near ..."), and the
+    # affected object silently loses its whole script. Generic Lua parsers are not
+    # a reliable guard here, so check explicitly before anything is injected.
+    string_errors = []
+    for f in lua_files:
+        for _, line_no, quote, snippet in lua_strings.check_file(f):
+            string_errors.append(f"{f.name}:{line_no}: unterminated {quote} string -> {snippet}")
+    if string_errors:
+        for err in string_errors:
+            print(f"  {err}")
+        fail(f"{len(string_errors)} unterminated string literal(s). Ending compilation.")
 
     # --- Extract GUIDs from each non-global lua file ---
     lua_guids = []  # [(guid_str, file_index), ...]

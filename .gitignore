@@ -22,3 +22,7 @@ MM/
 GW/
 *Alpine/
 .github/
+
+# Battle report tooling: local virtualenv and generated reports
+.venv/
+report/
