@@ -1272,6 +1272,10 @@ function onSave()
         svRedSecondaryDeckGUID = redSecondaryDeckGUID,
         svBlueSecondaryDeckGUID = blueSecondaryDeckGUID,
         svPlayerHudSettings = playerHudSettings,
+        -- Battle log: army registrations plus one snapshot per phase. Small by
+        -- construction (roughly 400 KB for a full two-army game), so unlike the
+        -- start menu restore point it is cheap to encode on every autosave.
+        svBattleLog = battleLog,
         svVersion = GAME_VERSION
     })
     --saved_data = ""
@@ -1322,23 +1326,881 @@ function updateTeamModel(obj, team)
     Global.setTable("teamModels", teamModels)
 end
 
-function tagSelectedAsRed(playerColor, target)
-    local objs = Player[playerColor].getSelectedObjects()
-    for _, obj in ipairs(objs) do
-      obj.setGMNotes("Red")
-      updateTeamModel(obj, "Red")
-    end
-    printToColor("Tagged selected objects as Red", playerColor, "Red")
-  end
+-- ====================================================================
+-- BATTLE LOG
+-- ====================================================================
+-- Each player registers their army once (select models -> REGISTER ARMY on the
+-- spawn-game-tools object). From then on every phase/turn transition records
+-- where every registered model stands, alongside round/VP/CP context and the
+-- terrain layout, so a finished game can be rendered into a battle report by
+-- scripts/export_battle_report.py (or, live, by the local report server).
+--
+-- Size discipline (compare the onSave note in startMenu.ttslua): a full 5-round
+-- game with two ~100-model armies encodes to roughly 400 KB, about 10x under the
+-- blob sizes documented to stall TTS autosaves. Snapshots are therefore stored in
+-- full rather than delta-encoded; only datasheet Descriptions are deduplicated,
+-- per ForceOrg unit uuid, since they are identical across a unit. The caps below
+-- bound pathological cases.
 
-  function tagSelectedAsBlue(playerColor, target)
-    local objs = Player[playerColor].getSelectedObjects()
-    for _, obj in ipairs(objs) do
-      obj.setGMNotes("Blue")
-      updateTeamModel(obj, "Blue")
+BATTLE_LOG_SCHEMA = 1
+BATTLE_MAX_MODELS = 400
+BATTLE_MAX_SNAPS  = 250
+BATTLE_REPORT_URL = "http://127.0.0.1:8787/report"
+
+-- GMNotes sentinels the rest of the mod uses for overlays, markers and mission
+-- cards. Anything carrying one of these is furniture, never a player model.
+-- ("Red"/"Blue" are deliberately absent: the legacy tagSelectedAs* wrote those
+-- onto real models, and such models must still be registerable.)
+BATTLE_EXCLUDED_GMNOTES = {
+    MapExclude = true, objective = true, deployZone = true, quarter = true,
+    stratreserves = true, areaDeny = true, coherencyLabel = true,
+    TacticalObjectives = true,
+}
+
+-- The physical table mats. They sit inside the play zone but are not terrain.
+BATTLE_BOARD_SKIP_GUIDS = {["28865a"] = true, ["4ee1f2"] = true}
+
+-- Terrain descriptions are one word ("Dense" / "Light"); this only has to be long
+-- enough for the mixed "Tower = Dense / Walls = Light" case without letting some
+-- unrelated object's description into the log.
+BATTLE_BOARD_DESC_MAX = 64
+
+function defaultBattleLog()
+    return {
+        v = BATTLE_LOG_SCHEMA,
+        game = {},
+        board = {},
+        units = {},
+        roster = {},
+        dead = {},
+        snaps = {},
+    }
+end
+
+battleLog = battleLog or defaultBattleLog()
+_battleDeployTried = _battleDeployTried or false
+_battleArtTried = _battleArtTried or false
+_battleCaptureGuard = false
+_battleCapWarned = false
+
+function battleRound(n, places)
+    local m = 10 ^ (places or 2)
+    return math.floor((tonumber(n) or 0) * m + 0.5) / m
+end
+
+-- ForceOrg / yellowscribe stamps a live wound counter into the model nickname:
+--   "[00ff16]2/2[-] Intercessor Sergeant"
+-- Returns cleanName, currentWounds, maxWounds. Models from any other source keep
+-- their name (colour markup stripped) and report nil wounds.
+function parseBattleModelName(raw)
+    if type(raw) ~= "string" or raw == "" then return "", nil, nil end
+    local cur, maxw, rest = string.match(raw, "^%[%x+%](%d+)/(%d+)%[%-%]%s*(.*)$")
+    if cur ~= nil then
+        if rest == nil or rest == "" then rest = raw end
+        return rest, tonumber(cur), tonumber(maxw)
     end
-    printToColor("Tagged selected objects as Blue", playerColor, "Blue")
-  end
+    local clean = raw:gsub("%[%x+%]", ""):gsub("%[%-%]", "")
+    return clean, nil, nil
+end
+
+-- ForceOrg groups a unit with a shared "uuid:<unit uuid>" tag. Note an attached
+-- Character is its own ForceOrg unit with its own uuid, so one model's uuid does
+-- not necessarily cover everything a player thinks of as "the unit".
+function battleUnitUuid(tags)
+    if type(tags) ~= "table" then return nil end
+    for _, t in ipairs(tags) do
+        local u = string.match(tostring(t), "^uuid:(.+)$")
+        if u ~= nil then return u end
+    end
+    return nil
+end
+
+-- A registerable model, using the same tag set as SelectionHighlighter and the
+-- dice tray. Map terrain is Interactable=false so it can never reach a selection,
+-- but the locked / BCBtype / GMNotes checks keep tokens, markers and overlay
+-- geometry out if one is ever box-selected alongside real models.
+function isBattleModel(o)
+    if o == nil then return false end
+    local t = o.tag
+    if t ~= "Figurine" and t ~= "Generic" and t ~= "Custom_Model" then return false end
+    local locked = false
+    pcall(function() locked = o.getLock() end)
+    if locked then return false end
+    local gm = ""
+    pcall(function() gm = o.getGMNotes() or "" end)
+    if BATTLE_EXCLUDED_GMNOTES[gm] then return false end
+    local bcb = nil
+    pcall(function() bcb = o.getVar("BCBtype") end)
+    if bcb ~= nil then return false end
+    return true
+end
+
+function battleModelTags(o)
+    local tags = {}
+    pcall(function() tags = o.getTags() or {} end)
+    return tags
+end
+
+-- Reuse the dice tray base-size inference rather than duplicating the mm base
+-- table; it also caches its answer on the model. Falls back to raw bounds when
+-- neither tray is available.
+function battleBaseExtents(o)
+    for _, guid in ipairs({redCustomDiceMat_GUID, blueCustomDiceMat_GUID}) do
+        local mat = getObjectFromGUID(guid)
+        if mat ~= nil then
+            local ok, dims = pcall(function()
+                local base = mat.call("determineBaseInInches", o)
+                if type(base) ~= "table" or base.x == nil or base.z == nil then return nil end
+                return {battleRound(base.x), battleRound(base.z)}
+            end)
+            if ok and dims ~= nil then return dims end
+        end
+    end
+    local size = nil
+    pcall(function() size = o.getBoundsNormalized().size end)
+    if size ~= nil then return {battleRound(size.x / 2), battleRound(size.z / 2)} end
+    return {0.63, 0.63}
+end
+
+-- True when one person is driving both sides. "singles" is the mod's real solo
+-- mode -- it is what relaxes the both-seated gate and the per-turn control guards
+-- in startMenu -- while `simulation` is only true for the duration of startGame
+-- (it is reset on that function's last line). Check both, so registration behaves
+-- identically whether the solo player is seated Red or Blue.
+function battleSoloModeActive()
+    local sm = getObjectFromGUID(startMenu_GUID)
+    if sm == nil then return false end
+    local ok, singles = pcall(function() return sm.getVar("singlesMode") end)
+    if ok and singles == "singles" then return true end
+    local ok2, sim = pcall(function() return sm.getVar("simulation") end)
+    return ok2 and sim == true
+end
+
+-- A player may always register their own side. Beyond that, registration is
+-- allowed when nobody is sitting in the target seat, or when the table is in solo
+-- mode -- so one person can set up and record both armies from either seat.
+function canRegisterFor(clicker, target)
+    if clicker == nil or target == nil then return false end
+    if clicker == target then return true end
+    if battleSoloModeActive() then return true end
+    local p = Player[target]
+    if p == nil or not p.seated then return true end
+    return false
+end
+
+function battleRosterCount(color)
+    local n = 0
+    if battleLog == nil or battleLog.roster == nil then return 0 end
+    for _, rec in pairs(battleLog.roster) do
+        if color == nil or rec.c == color then n = n + 1 end
+    end
+    return n
+end
+
+-- Rebuild the legacy teamModels registry for one side in a single Global
+-- round-trip. updateTeamModel does one round-trip per model, which is O(n^2)
+-- across a whole army.
+function battleSyncTeamModels(color)
+    local teams = Global.getTable("teamModels") or {Red = {}, Blue = {}}
+    teams[color] = {}
+    for guid, rec in pairs(battleLog.roster) do
+        if rec.c == color then table.insert(teams[color], guid) end
+    end
+    Global.setTable("teamModels", teams)
+    teamModels = teams
+end
+
+function registerArmy(color, objs, mode)
+    if battleLog == nil then battleLog = defaultBattleLog() end
+
+    if mode ~= "add" then
+        for guid, rec in pairs(battleLog.roster) do
+            if rec.c == color then
+                local o = getObjectFromGUID(guid)
+                if o ~= nil then
+                    pcall(function() o.removeTag(color == "Red" and "lct_army_red" or "lct_army_blue") end)
+                end
+                battleLog.roster[guid] = nil
+            end
+        end
+        for uuid, u in pairs(battleLog.units) do
+            if u.c == color then battleLog.units[uuid] = nil end
+        end
+    end
+
+    local total = battleRosterCount(nil)
+    local added, skipped, capped = 0, 0, false
+    local seenUnits = {}
+
+    for _, o in ipairs(objs or {}) do
+        if not isBattleModel(o) then
+            skipped = skipped + 1
+        elseif total >= BATTLE_MAX_MODELS then
+            capped = true
+        else
+            local guid = o.getGUID()
+            local tags = battleModelTags(o)
+            local name, _, maxw = parseBattleModelName(o.getName())
+            local uuid = battleUnitUuid(tags)
+
+            if battleLog.roster[guid] == nil then total = total + 1 end
+            battleLog.roster[guid] = {
+                c = color,
+                u = uuid,
+                n = name,
+                w = maxw,
+                b = battleBaseExtents(o),
+                tags = tags,
+            }
+            battleLog.dead[guid] = nil
+            added = added + 1
+
+            if uuid ~= nil then
+                seenUnits[uuid] = true
+                if battleLog.units[uuid] == nil then
+                    local desc = ""
+                    pcall(function() desc = o.getDescription() or "" end)
+                    battleLog.units[uuid] = {n = name, c = color, d = desc}
+                end
+            end
+
+            pcall(function() o.addTag(color == "Red" and "lct_army_red" or "lct_army_blue") end)
+        end
+    end
+
+    battleSyncTeamModels(color)
+
+    local unitCount = 0
+    for _ in pairs(seenUnits) do unitCount = unitCount + 1 end
+
+    local msg = color .. " registered " .. added .. " model(s)"
+    if unitCount > 0 then msg = msg .. " across " .. unitCount .. " unit(s)" end
+    msg = msg .. ". Army total: " .. battleRosterCount(color) .. "."
+    if skipped > 0 then msg = msg .. " (" .. skipped .. " non-model object(s) ignored.)" end
+    if capped then msg = msg .. " MODEL CAP REACHED." end
+    broadcastToAll(msg, color == "Red" and {1, 0.45, 0.45} or {0.45, 0.65, 1})
+
+    return added
+end
+
+function battleDenied(clicker, target, verb)
+    printToColor(target .. " is seated - only that player can " .. verb .. " their army.",
+                 clicker, {1, 0.5, 0.2})
+end
+
+function battleRegisterFromSelection(params)
+    params = params or {}
+    local clicker = params.clicker
+    local target  = params.target
+    local mode    = params.mode or "replace"
+    if not canRegisterFor(clicker, target) then
+        battleDenied(clicker, target, "register")
+        return
+    end
+    local p = Player[clicker]
+    local objs = (p ~= nil) and p.getSelectedObjects() or {}
+    if objs == nil or #objs == 0 then
+        printToColor("Select your models first, then press REGISTER ARMY.", clicker, {1, 0.5, 0.2})
+        return
+    end
+    registerArmy(target, objs, mode)
+end
+
+-- Secondary path: expand the selection to every model sharing a selected model
+-- ForceOrg unit uuid, then add them. An attached Character carries its own uuid,
+-- so include one model of each when a character has joined a squad.
+function battleRegisterUnitFromSelection(params)
+    params = params or {}
+    local clicker, target = params.clicker, params.target
+    if not canRegisterFor(clicker, target) then
+        battleDenied(clicker, target, "register")
+        return
+    end
+    local p = Player[clicker]
+    local sel = (p ~= nil) and p.getSelectedObjects() or {}
+    if sel == nil or #sel == 0 then
+        printToColor("Select at least one model of the unit first.", clicker, {1, 0.5, 0.2})
+        return
+    end
+
+    local wanted, expanded, seen, anyWanted = {}, {}, {}, false
+    for _, o in ipairs(sel) do
+        if isBattleModel(o) then
+            table.insert(expanded, o)
+            seen[o.getGUID()] = true
+            local u = battleUnitUuid(battleModelTags(o))
+            if u ~= nil then
+                wanted[u] = true
+                anyWanted = true
+            end
+        end
+    end
+
+    if anyWanted then
+        for _, o in ipairs(getAllObjects()) do
+            local guid = o.getGUID()
+            if guid ~= nil and not seen[guid] and isBattleModel(o) then
+                local u = battleUnitUuid(battleModelTags(o))
+                if u ~= nil and wanted[u] then
+                    table.insert(expanded, o)
+                    seen[guid] = true
+                end
+            end
+        end
+    end
+
+    if #expanded == 0 then
+        printToColor("No models in that selection.", clicker, {1, 0.5, 0.2})
+        return
+    end
+    registerArmy(target, expanded, "add")
+end
+
+function battleClearArmy(params)
+    params = params or {}
+    local clicker, target = params.clicker, params.target
+    if not canRegisterFor(clicker, target) then
+        battleDenied(clicker, target, "clear")
+        return
+    end
+    if battleLog == nil then battleLog = defaultBattleLog() end
+
+    local removed = 0
+    for guid, rec in pairs(battleLog.roster) do
+        if rec.c == target then
+            local o = getObjectFromGUID(guid)
+            if o ~= nil then
+                pcall(function() o.removeTag(target == "Red" and "lct_army_red" or "lct_army_blue") end)
+            end
+            battleLog.roster[guid] = nil
+            removed = removed + 1
+        end
+    end
+    for uuid, u in pairs(battleLog.units) do
+        if u.c == target then battleLog.units[uuid] = nil end
+    end
+    battleSyncTeamModels(target)
+    broadcastToAll(target .. " army registration cleared (" .. removed .. " model(s)).", {1, 0.6, 0.2})
+end
+
+function battleCounterValue(guid)
+    local o = getObjectFromGUID(guid or "")
+    if o == nil then return 0 end
+    local ok, v = pcall(function() return o.call("getValue") end)
+    if ok and v ~= nil then return tonumber(v) or 0 end
+    return 0
+end
+
+-- Scores for both sides in one call. NOTE: playerSum takes a plain number, so
+-- Object.call("playerSum", {1}) hands it the TABLE {1} and it errors indexing
+-- scores[pId] -- getMatchSummary is the supported entry point and calls
+-- playerSum(1) / playerSum(2) itself.
+function battleScores()
+    local out = {r = 0, b = 0, rp = 0, rs = 0, bp = 0, bs = 0}
+    local sheet = getObjectFromGUID(scoresheet_GUID)
+    if sheet == nil then return out end
+    -- Field reads stay inside the pcall: a table returned by another object's
+    -- script can belong to that script, and touching it then raises rather than
+    -- returning nil. getMatchSummary builds a fresh table so it is safe today,
+    -- but this must never be able to spam the chat log if that changes.
+    pcall(function()
+        local sum = sheet.call("getMatchSummary")
+        if type(sum) ~= "table" then return end
+        if type(sum.red) == "table" then
+            out.r  = tonumber(sum.red.total) or 0
+            out.rp = tonumber(sum.red.primary) or 0
+            out.rs = tonumber(sum.red.secondary) or 0
+        end
+        if type(sum.blue) == "table" then
+            out.b  = tonumber(sum.blue.total) or 0
+            out.bp = tonumber(sum.blue.primary) or 0
+            out.bs = tonumber(sum.blue.secondary) or 0
+        end
+    end)
+    return out
+end
+
+-- Snapshot the terrain/objective layout by sweeping a play-zone trigger sized from
+-- the table mat, the same relation extractTerrain uses. Asynchronous: zone
+-- population is not immediate, so the sweep runs a few frames after the spawn, and
+-- the zone is destroyed afterwards (extractTerrain leaks its own; do not copy that).
+function captureBoard(done)
+    if battleLog == nil then battleLog = defaultBattleLog() end
+    local mat = getObjectFromGUID(mat_GUID)
+    if mat == nil then
+        if done ~= nil then done() end
+        return
+    end
+
+    local scale = mat.getScale()
+    local w = scale.x * 36.02
+    local h = scale.z * 35.83
+    if type(battleLog.game) ~= "table" then battleLog.game = {} end
+    battleLog.game.board = {w = battleRound(w), h = battleRound(h)}
+
+    local zone = spawnObject({
+        type = "ScriptingTrigger",
+        position = {x = 0, y = 10, z = 0},
+        rotation = {x = 0, y = 0, z = 0},
+        scale = {x = w + 0.2, y = 100, z = h + 0.2},
+        sound = false,
+        snap_to_grid = false,
+    })
+
+    Wait.frames(function()
+        local board = {}
+        pcall(function()
+            for _, o in ipairs(zone.getObjects()) do
+                local guid = o.getGUID()
+                if guid ~= nil and o ~= zone
+                   and not BATTLE_BOARD_SKIP_GUIDS[guid]
+                   and battleLog.roster[guid] == nil then
+                    local p = o.getPosition()
+                    local r = o.getRotation()
+                    local s = o.getScale()
+                    local bx, bz = nil, nil
+                    pcall(function()
+                        local size = o.getBoundsNormalized().size
+                        bx = battleRound(size.x / 2)
+                        bz = battleRound(size.z / 2)
+                    end)
+                    -- Battlemaster stamps each terrain piece's material into its
+                    -- Description -- "Dense", "Light", or the mixed
+                    -- "Tower = Dense / Walls = Light" -- in applyRuinPartMetadata
+                    -- (battlemasterDynamicSpawner.ttslua). That is the authority the
+                    -- report colours by. The tag name is NOT a usable proxy for it:
+                    -- Corner and the barriers are Light while Generator and Pipes
+                    -- are Dense, which no amount of guessing from name or size gets
+                    -- right. Capped because this is the one free-text field on the
+                    -- board and a non-terrain object could carry an essay.
+                    local desc = o.getDescription()
+                    if type(desc) ~= "string" or desc == "" then
+                        desc = nil
+                    elseif #desc > BATTLE_BOARD_DESC_MAX then
+                        desc = string.sub(desc, 1, BATTLE_BOARD_DESC_MAX)
+                    end
+                    -- Terrain AREAS are outline meshes named
+                    -- battlemaster-rugged-NN-<shape>-5mm-border.obj, and they carry
+                    -- no Description at all. That shape word is what separates an
+                    -- area from the terrain standing inside it, and it names the
+                    -- real footprint -- a triangle's bounding box looks nothing
+                    -- like the triangle.
+                    local sh = nil
+                    pcall(function()
+                        local custom = o.getCustomObject()
+                        if type(custom) == "table" and type(custom.mesh) == "string" then
+                            sh = string.match(custom.mesh, "%-(%a+)%-5mm%-border")
+                        end
+                    end)
+                    -- Battlemaster mirrors a terrain plate with an extra 180 on x
+                    -- or z rather than by negating a scale (see _build_terrain_plate
+                    -- in scripts/battlemaster_reconstruct.py). The rectangular
+                    -- plates do not care, but the trapezoid faces the wrong way
+                    -- without this. Stored only when actually set, which is a
+                    -- handful of objects per map.
+                    local rx = math.floor((r.x or 0) + 0.5) % 360
+                    local rz = math.floor((r.z or 0) + 0.5) % 360
+                    if rx == 0 then rx = nil end
+                    if rz == 0 then rz = nil end
+                    table.insert(board, {
+                        g  = guid,
+                        n  = o.getName(),
+                        t  = battleModelTags(o),
+                        x  = battleRound(p.x),
+                        z  = battleRound(p.z),
+                        ry = math.floor((r.y or 0) + 0.5),
+                        rx = rx,
+                        rz = rz,
+                        sx = battleRound(s.x),
+                        sz = battleRound(s.z),
+                        bx = bx,
+                        bz = bz,
+                        d  = desc,
+                        sh = sh,
+                    })
+                end
+            end
+        end)
+        battleLog.board = board
+        pcall(function() zone.destruct() end)
+        if done ~= nil then done() end
+    end, 3)
+end
+
+-- Reinforcements and Reserves boards. What is sitting on these is the clearest
+-- record of what each player is holding off the table; the plain "outside the
+-- board rectangle" test cannot tell reserves apart from a staging area.
+BATTLE_RESERVE_BOARDS = {Red = "fe7926", Blue = "85f0cf"}
+
+-- Secondary objective card zones per side. LCT only tracks secondaries when a
+-- mission pack is in play, so empty zones simply yield no entry and the report
+-- leaves the panel out rather than inventing one.
+BATTLE_SECONDARY_ZONES = {
+    Red  = {"c1e001", "c1e002"},
+    Blue = {"b1e001", "b1e002"},
+}
+
+-- World bounds of each reserves board, ready for models to be tested against as
+-- the snapshot loop walks the roster. Bounds are read live, so a board moved by
+-- its own Move Board button still reports the right footprint.
+function battleReserveBounds()
+    local out = {}
+    for color, guid in pairs(BATTLE_RESERVE_BOARDS) do
+        local board = getObjectFromGUID(guid)
+        if board ~= nil then
+            local entry = {g = guid, models = {}}
+            pcall(function()
+                local b = board.getBounds()
+                entry.x  = battleRound(b.center.x)
+                entry.z  = battleRound(b.center.z)
+                entry.sx = battleRound(b.size.x)
+                entry.sz = battleRound(b.size.z)
+            end)
+            out[color] = entry
+        end
+    end
+    return out
+end
+
+function battleReserveContains(entry, x, z)
+    if entry == nil or entry.sx == nil or entry.sz == nil then return false end
+    return math.abs(x - entry.x) <= entry.sx / 2
+       and math.abs(z - entry.z) <= entry.sz / 2
+end
+
+-- Cards currently in each side's two secondary zones. Face-down state is kept so
+-- a report can show which were still hidden at that point in the game.
+-- NOTE: this goes through getCardsInSecondarySlot rather than reading
+-- zone.getObjects() directly. A card dealt into a slot is often not registered as
+-- being "in" the zone -- it is dropped on top of it, and TTS only counts an object
+-- as inside once it has settled and reported in -- so the direct read came back
+-- empty even with all four slots visibly filled. That helper is the mod's own
+-- proven path: it takes the zone's contents AND sweeps every object sitting within
+-- the zone's footprint, and it accepts .type as well as .tag, which is the other
+-- half of why the direct read missed cards.
+function battleSecondaryState()
+    local out = {}
+    for color, guids in pairs(BATTLE_SECONDARY_ZONES) do
+        local cards = {}
+        for _, zguid in ipairs(guids) do
+            local zone = getObjectFromGUID(zguid)
+            if zone ~= nil then
+                -- One slot holds one active secondary, so this stops at the first
+                -- named object. A loose card wins over a deck: the helper returns
+                -- decks as well (it has to, since a card can still be sitting in
+                -- one), and a deck's name is the deck's, not the secondary's.
+                pcall(function()
+                    local fallback = nil
+                    for _, o in ipairs(getCardsInSecondarySlot(zone)) do
+                        local name = o.getName()
+                        if name ~= nil and name ~= "" then
+                            local entry = {n = name, fd = o.is_face_down == true}
+                            if o.tag ~= "Deck" and o.type ~= "Deck" then
+                                table.insert(cards, entry)
+                                return
+                            end
+                            if fallback == nil then fallback = entry end
+                        end
+                    end
+                    if fallback ~= nil then table.insert(cards, fallback) end
+                end)
+            end
+        end
+        if #cards > 0 then out[color] = cards end
+    end
+    return out
+end
+
+-- Fill in any game context the log is missing, without disturbing what is already
+-- there. battleStartGame is the normal source, but it only fires when someone
+-- presses Start Game with this build loaded -- join a game already in progress, or
+-- register partway through one, and the log would otherwise carry no map name,
+-- players or deployment, leaving the report without a header or a deployment map.
+function battleEnsureGameContext()
+    if battleLog == nil then battleLog = defaultBattleLog() end
+    local g = battleLog.game
+    if type(g) ~= "table" then g = {}; battleLog.game = g end
+
+    if g.started == nil then g.started = os.time() end
+    local sm = getObjectFromGUID(startMenu_GUID)
+    if sm ~= nil then
+        if g.map == nil then g.map = sm.getVar("debugCurrentMapName") end
+        if g.mapGuid == nil then g.mapGuid = sm.getVar("debugCurrentMapGuid") end
+        -- Missions with no deployment zone legitimately yield nil, so this is
+        -- tried once per game rather than re-attempted on every snapshot.
+        if g.deploy == nil and not _battleDeployTried then
+            _battleDeployTried = true
+            g.deploy = battleDeploymentSpec(sm)
+        end
+        -- Same one-shot treatment: a mission with no paired layout art yields an
+        -- empty string forever, so there is nothing to gain by asking again.
+        if g.art == nil and not _battleArtTried then
+            _battleArtTried = true
+            g.art = battleLayoutArtURL(sm)
+        end
+    end
+    -- Seats can fill after the game starts, so a name is taken the first time it
+    -- is actually available rather than only at game start.
+    if g.red == nil and Player.Red ~= nil and Player.Red.seated then
+        g.red = Player.Red.steam_name
+    end
+    if g.blue == nil and Player.Blue ~= nil and Player.Blue.seated then
+        g.blue = Player.Blue.steam_name
+    end
+end
+
+function recordBattleSnapshot(reason)
+    if battleLog == nil then battleLog = defaultBattleLog() end
+    if _battleCaptureGuard then return end
+
+    local sm = getObjectFromGUID(startMenu_GUID)
+    if sm == nil then return end
+
+    -- Nothing registered yet: stay silent rather than logging empty snapshots.
+    if battleRosterCount(nil) == 0 then return end
+
+    if #battleLog.snaps >= BATTLE_MAX_SNAPS then
+        if not _battleCapWarned then
+            _battleCapWarned = true
+            broadcastToAll("Battle log: snapshot cap (" .. BATTLE_MAX_SNAPS ..
+                           ") reached; no further snapshots will be recorded.", {1, 0.5, 0.2})
+        end
+        return
+    end
+
+    -- nextPhase falls through into passTurn on wrap; one press must record once.
+    _battleCaptureGuard = true
+    Wait.frames(function() _battleCaptureGuard = false end, 1)
+
+    -- Context is a nice-to-have; the model positions are the point. A failure
+    -- gathering the map name or deployment must never abort the snapshot -- an
+    -- unguarded raise here cost a whole game's log once already.
+    pcall(battleEnsureGameContext)
+
+    local phase  = tonumber(sm.getVar("currentPhase")) or 1
+    local turn   = sm.getVar("currentTurn") or "Red"
+    local phases = sm.getTable("phases") or {}
+    local phaseName = phases[phase] or ("Phase " .. tostring(phase))
+
+    local round = battleCounterValue(gameTurnCounter_GUID)
+
+    local label = "Round " .. round .. ", " .. tostring(turn) .. " Turn"
+    local okLbl, built = pcall(function() return sm.call("getTurnStateLabel") end)
+    if okLbl and type(built) == "string" and built ~= "" then label = built end
+    label = label .. " - " .. phaseName
+
+    -- Reserve board footprints are read once, then each model is tested against
+    -- them inside the loop below rather than in a second pass, so occupancy costs
+    -- two comparisons per model instead of another getObjectFromGUID sweep.
+    local reserves = battleReserveBounds()
+
+    local m = {}
+    local newDead = {}
+    for guid, rec in pairs(battleLog.roster) do
+        if battleLog.dead[guid] == nil then
+            local o = getObjectFromGUID(guid)
+            if o == nil then
+                battleLog.dead[guid] = true
+                table.insert(newDead, guid)
+            else
+                local p = o.getPosition()
+                local r = o.getRotation()
+                local _, cur = parseBattleModelName(o.getName())
+                m[guid] = {battleRound(p.x), battleRound(p.z),
+                           math.floor((r.y or 0) + 0.5), cur}
+                for _, entry in pairs(reserves) do
+                    if battleReserveContains(entry, p.x, p.z) then
+                        table.insert(entry.models, guid)
+                    end
+                end
+            end
+        end
+    end
+
+    table.insert(battleLog.snaps, {
+        r    = round,
+        t    = turn,
+        p    = phase,
+        lbl  = label,
+        why  = reason or "phase",
+        ts   = os.time(),
+        vp   = battleScores(),
+        cp   = {r = battleCounterValue(redCPCounter_GUID),
+                b = battleCounterValue(blueCPCounter_GUID)},
+        m    = m,
+        dead = newDead,
+        res  = reserves,
+        sec  = battleSecondaryState(),
+    })
+
+    -- Encoding the whole log is not free, so only sample it in debug builds.
+    if DEBUG == true and (#battleLog.snaps % 10) == 0 then
+        local encoded = JSON.encode(battleLog)
+        printToAll("[DEBUG] battle log: " .. #battleLog.snaps .. " snapshot(s), " ..
+                   math.floor(#encoded / 1024) .. " KB", {0.6, 0.6, 0.6})
+    end
+end
+
+function resetBattleLog(keepRoster)
+    local roster, units = {}, {}
+    if keepRoster and battleLog ~= nil then
+        roster = battleLog.roster or {}
+        units  = battleLog.units or {}
+    end
+    battleLog = defaultBattleLog()
+    battleLog.roster = roster
+    battleLog.units  = units
+    _battleCapWarned = false
+    _battleDeployTried = false
+    _battleArtTried = false
+end
+
+-- The chosen deployment as data, not geometry. LCT destroys the drawn deployment
+-- zones at game start, so the report cannot capture them as objects -- but the
+-- draw spec (line / stepped / quarter / triangle / circle plus its offsets) is
+-- enough to reproduce the exact same shapes off-table.
+-- NOTE: this must go through selectedDeploymentJSON, not selectedDeployment.
+-- The latter returns an entry of startMenu's DeployZonesData -- a table owned by
+-- that script -- and merely reading a field off it from here raises "Attempt to
+-- perform operations with resources owned by different scripts". A JSON string
+-- has no owner, so it crosses safely. (Contrast getMatchSummary, which is fine
+-- because it builds a fresh table in its return statement.)
+--
+-- The whole body is inside one pcall on purpose: a narrower one that covers only
+-- the call still lets the field reads escape, which is exactly how the first
+-- version of this spammed an error on every single snapshot.
+function battleDeploymentSpec(sm)
+    if sm == nil then return nil end
+    local ok, spec = pcall(function()
+        local raw = sm.call("selectedDeploymentJSON")
+        if type(raw) ~= "string" or raw == "" then return nil end
+        local decoded = JSON.decode(raw)
+        if type(decoded) ~= "table" then return nil end
+        return decoded
+    end)
+    if not ok then return nil end
+    return spec
+end
+
+-- Image URL of the mission's layout-art diagram, which the report shows as its
+-- deployment view. The lookup itself lives in startMenu (loadedLayoutArtURL); all
+-- that crosses the boundary here is a string, for the reason spelled out above.
+function battleLayoutArtURL(sm)
+    if sm == nil then return nil end
+    local ok, url = pcall(function()
+        local raw = sm.call("loadedLayoutArtURL")
+        if type(raw) ~= "string" or raw == "" then return nil end
+        return raw
+    end)
+    if not ok then return nil end
+    return url
+end
+
+-- Called by startMenu.startGame: one log per game, seeded with a deployment
+-- snapshot and the terrain layout. Registrations made during setup are kept.
+--
+-- Ordering note: startGame sets inGame before calling startCustomTurns(), which
+-- passes the turn and therefore records one snapshot of the pre-game board. The
+-- reset below deliberately discards it, so this call must stay AFTER
+-- startCustomTurns() -- moving it earlier would leave that phantom snapshot as
+-- the first frame of every report.
+function battleStartGame()
+    if battleLog ~= nil and battleLog.snaps ~= nil and #battleLog.snaps > 0 then
+        broadcastToAll("Battle log: the previous game's report was discarded. " ..
+                       "Export before starting a new game.", {1, 0.6, 0.2})
+    end
+    resetBattleLog(true)
+
+    local sm = getObjectFromGUID(startMenu_GUID)
+    battleLog.game = {
+        started = os.time(),
+        map     = (sm ~= nil and sm.getVar("debugCurrentMapName")) or "?",
+        mapGuid = (sm ~= nil and sm.getVar("debugCurrentMapGuid")) or nil,
+        red     = (Player.Red ~= nil and Player.Red.seated) and Player.Red.steam_name or nil,
+        blue    = (Player.Blue ~= nil and Player.Blue.seated) and Player.Blue.steam_name or nil,
+        board   = {},
+        deploy  = battleDeploymentSpec(sm),
+    }
+
+    -- The deployment frame is the board as it stood the moment Start Game was
+    -- pressed, so it can only be taken if an army was registered by then. Say so
+    -- rather than leaving the report quietly missing its first round.
+    if battleRosterCount(nil) == 0 then
+        broadcastToAll("Battle log: no army registered yet, so this game has no " ..
+                       "deployment snapshot. Register, then press CAPTURE.",
+                       {1, 0.6, 0.2})
+    end
+
+    captureBoard(function()
+        recordBattleSnapshot("deploy")
+    end)
+end
+
+-- Manual capture button: refresh the terrain too, since a player may have moved
+-- or removed a piece, then record.
+function battleManualCapture(playerColor)
+    if battleRosterCount(nil) == 0 then
+        printToColor("Register an army first - nothing to capture.", playerColor, {1, 0.6, 0.2})
+        return
+    end
+    captureBoard(function()
+        recordBattleSnapshot("manual")
+        printToColor("Battle log: snapshot " .. #battleLog.snaps .. " captured.",
+                     playerColor, {0.4, 1, 0.4})
+    end)
+end
+
+-- TTS cannot write files or launch processes, so the in-game export POSTs the log
+-- to a small local helper (scripts/battle_report_server.py) which renders the HTML
+-- and opens it. Failure is expected whenever that helper is not running, so it
+-- must stay a soft, informative miss.
+function exportBattleReport(playerColor)
+    if battleLog == nil or battleLog.snaps == nil or #battleLog.snaps == 0 then
+        printToColor("Battle log is empty - nothing to export yet.", playerColor, {1, 0.6, 0.2})
+        return
+    end
+    local body = JSON.encode(battleLog)
+    printToColor("Sending battle report (" .. math.floor(#body / 1024) .. " KB)...",
+                 playerColor, {0.7, 0.8, 1})
+    WebRequest.custom(BATTLE_REPORT_URL, "POST", true, body,
+        {["Content-Type"] = "application/json"},
+        function(request)
+            local failed = request.is_error or
+                           (request.response_code ~= nil and request.response_code ~= 200)
+            if failed then
+                printToColor("No local report server. Run:  python3 scripts/battle_report_server.py",
+                             playerColor, {1, 0.5, 0.3})
+                printToColor("Or export the save and run:  python3 scripts/export_battle_report.py <save.json>",
+                             playerColor, {1, 0.7, 0.4})
+            else
+                printToColor("Battle report opened in your browser.", playerColor, {0.4, 1, 0.4})
+            end
+        end)
+end
+
+function restoreBattleLog(raw)
+    if type(raw) ~= "table" then return defaultBattleLog() end
+    if tonumber(raw.v) ~= BATTLE_LOG_SCHEMA then return defaultBattleLog() end
+    local log = defaultBattleLog()
+    if type(raw.game)   == "table" then log.game   = raw.game end
+    if type(raw.board)  == "table" then log.board  = raw.board end
+    if type(raw.units)  == "table" then log.units  = raw.units end
+    if type(raw.roster) == "table" then log.roster = raw.roster end
+    if type(raw.dead)   == "table" then log.dead   = raw.dead end
+    if type(raw.snaps)  == "table" then log.snaps  = raw.snaps end
+    return log
+end
+
+-- Legacy hotkey entry points, now routed through the battle-log registry. They
+-- used to overwrite GMNotes, which collides with the map/overlay sentinels the
+-- rest of the mod stores there; registration adds a tag instead.
+function tagSelectedAsRed(playerColor, target)
+    battleRegisterFromSelection({clicker = playerColor, target = "Red", mode = "add"})
+end
+
+function tagSelectedAsBlue(playerColor, target)
+    battleRegisterFromSelection({clicker = playerColor, target = "Blue", mode = "add"})
+end
 
 function hideMissionDeckUntilSelected(deckGUID)
     local deck = getObjectFromGUID(deckGUID)
@@ -1395,6 +2257,7 @@ function onLoad(saved_data)
         bluePlayerID = loaded_data.svbluePlayerID
         packSelected = loaded_data.svPackSelected
         playerHudSettings = loaded_data.svPlayerHudSettings or playerHudSettings
+        battleLog = restoreBattleLog(loaded_data.svBattleLog)
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         if packSelected then
@@ -1405,6 +2268,7 @@ function onLoad(saved_data)
         redPlayerID = ""
         bluePlayerID = ""
         packSelected = nil
+        battleLog = defaultBattleLog()
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
     end

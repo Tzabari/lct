@@ -13,6 +13,30 @@ How this file is used by the compiler (`compile.py --release`):
 To cut a release: add a new `## vX.Y.Z` section at the top with its bullets,
 then run `python3 compile.py --release`.
 
+## v1.12.0
+- Feat: Battle Log. Each player selects their models and presses REGISTER ARMY on the game-tools object; from then on the table records where every registered model stands at each phase change, plus the terrain layout, VP/CP and per-model wounds. Press EXPORT REPORT (or run the exporter on a saved game) to get a browsable battle report with a top-down board per phase.
+- Feat: Battle Log works with only one player seated, from either seat, so solo games and testing record properly. A present player can register an empty seat's army.
+- Feat: CAPTURE button records an extra snapshot mid-phase, for moments a phase boundary would miss.
+- Feat: The battle report is now a viewer: one board fills the window, with Round tabs, a player tab, per-round phase tabs and Next/Prev phase buttons (arrow keys work too).
+- Feat: Report overlay toggles mirror the in-game ones - deployment zones, objectives, territory line, table quarters, 6" strategic reserves and the 3"/6" centre rings.
+- Feat: The report tracks both Reinforcements and Reserves boards and each side's currently active secondaries.
+- Feat: The report board zooms and pans (mouse wheel to zoom, drag to pan, double-click or 0 to reset), and the terrain, deployment and name markings are drawn at true table scale so they no longer swamp the models.
+- Feat: A Deployment map view shows the mission setup on its own - zones, quarters and objectives - instead of a moment in the game.
+- Feat: The board as it stood when Start Game was pressed is its own **Deploy** round in the report, ahead of Round 1. Register your army before starting the game to get it; the table says so if nothing was registered in time.
+- Feat: The score panel shows each side's primary/secondary split alongside the VP total.
+- Bug fix: VP always read 0 in the battle log. The score sheet's playerSum takes a plain number, but Object.call hands it the parameter table, so every snapshot threw "attempt to index a nil value" - scores now come from getMatchSummary.
+- Bug fix: The battle log recorded no map name, players or deployment when the game was already in progress (only pressing Start Game filled them in). Any snapshot now backfills whatever context is missing, without overwriting what Start Game recorded.
+- Bug fix: Recording a snapshot raised "Attempt to perform operations with resources owned by different scripts" on every phase, which aborted the snapshot and left the whole game unlogged. The chosen deployment now crosses between scripts as JSON instead of as a table owned by the start menu.
+- Bug fix: The report server rendered with whatever version of the renderer was on disk when it started, so a server left running kept serving the old report. It now re-reads the renderer per export, and the page header stamps the time it was rendered.
+- Feat: Report terrain now uses the map's own colour coding - grey for terrain areas, yellow for light terrain, green for dense - read from the material each piece carries rather than guessed from its name.
+- Feat: Terrain areas in the report are drawn as their true footprints, taken from Battlemaster's own plate meshes, instead of the oversized boxes the table's bounds imply - including the wedge-shaped plate, which is a trapezoid rather than the triangle its name suggests.
+- Feat: The Deployment map view now shows the mission's own layout-art diagram where the log captured it, instead of a reconstruction.
+- Bug fix: The report board was mirrored top-to-bottom. It was drawn as if seen from under the table, which also reversed every model's facing.
+- Bug fix: Report terrain was unreadable. The battlemat is untagged on many maps, so it was drawn as a board-sized slab of terrain covering everything; the outlines that mark terrain areas were drawn as if they were the terrain; and objective markers were drawn as terrain boxes while the outlines around them were drawn as the objectives.
+- Bug fix: The report's territory line was always the centre line. It is now derived from the deployment that was played, as the table derives it, so it tilts correctly for stepped and diagonal zones - and Combat Patrol's own declared divider is used where a mission has one.
+- Bug fix: Active secondaries never appeared in the report. The scan read each slot zone directly, and a card dropped into a slot is not registered as inside it until it settles; it now goes through the same slot helper the scoreboard uses.
+- Bug fix: The report drew only five of the mod's eight deployment shapes, so Combat Patrol zones went missing, and a "No Deployment Zone" mission could blank the page.
+
 ## v1.11.3
 - UI Scoreboard change for better visibility and new button underneath scoring overlay.
 

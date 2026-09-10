@@ -27,6 +27,62 @@ local showArmyBtnB = {
     height=500, width=2400, font_size=200, color="Green", font_color={1,1,1}
 }
 
+-- Battle log: each side registers its army once, then every phase/turn change
+-- records where every registered model stands (see the BATTLE LOG section in
+-- global.ttslua). These buttons are thin forwarders -- all state and permission
+-- logic lives in Global, which deliberately lets a present player stand in for an
+-- empty seat so solo play and debugging work with one person at the table.
+--
+-- Placement: one row inboard of the HIDE/SHOW ARMY buttons, matching their size,
+-- spacing and Red(+Z) / Blue(-Z) mirroring so the whole tool reads as one panel.
+local ZposBattle      = ZposHideArmy - 2.5   -- next row in from HIDE/SHOW ARMY
+local battleBtnWidth  = 2400                 -- same as the HIDE/SHOW ARMY buttons
+local battleBtnHeight = 500
+local battleBtnFont   = 200
+local battleBtnGap    = 6                    -- matches their column spacing
+
+local registerBtnLbl = "REGISTER ARMY\nLMB set  /  RMB clear"
+local registerArmyBtnR = {
+    label=registerBtnLbl, click_function="registerArmyR", function_owner=self,
+    position={XposHideArmy,Ypos,ZposBattle}, rotation={0,0,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.55,0.15,0.15}, font_color={1,1,1},
+    tooltip="Select your models, then LEFT CLICK to register them as the Red army.\nRIGHT CLICK clears Red's registration."
+}
+local registerArmyBtnB = {
+    label=registerBtnLbl, click_function="registerArmyB", function_owner=self,
+    position={XposHideArmy+Xoffset,Ypos,-ZposBattle}, rotation={0,180,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.25,0.6}, font_color={1,1,1},
+    tooltip="Select your models, then LEFT CLICK to register them as the Blue army.\nRIGHT CLICK clears Blue's registration."
+}
+
+local captureBtnLbl = "CAPTURE\nsnapshot now"
+local captureBtnR = {
+    label=captureBtnLbl, click_function="captureSnapshot", function_owner=self,
+    position={XposHideArmy-battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.2,0.2,0.2}, font_color={1,1,1},
+    tooltip="Record an extra battle-log snapshot right now, in addition to the automatic one per phase."
+}
+local captureBtnB = {
+    label=captureBtnLbl, click_function="captureSnapshot", function_owner=self,
+    position={XposHideArmy+Xoffset-battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.2,0.2,0.2}, font_color={1,1,1},
+    tooltip="Record an extra battle-log snapshot right now, in addition to the automatic one per phase."
+}
+
+local exportBtnLbl = "EXPORT\nbattle report"
+local exportBtnR = {
+    label=exportBtnLbl, click_function="exportReport", function_owner=self,
+    position={XposHideArmy-2*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
+    tooltip="Render the battle report and open it in your browser.\nNeeds the local helper running:  python3 scripts/battle_report_server.py"
+}
+local exportBtnB = {
+    label=exportBtnLbl, click_function="exportReport", function_owner=self,
+    position={XposHideArmy+Xoffset-2*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
+    tooltip="Render the battle report and open it in your browser.\nNeeds the local helper running:  python3 scripts/battle_report_server.py"
+}
+
 -- Activation / Wound tracker tokens: a Reset button (also auto-fired at every
 -- phase change from startMenu) plus per-token Spawn buttons that clone the parked
 -- master copies. Mirrored on the Red (+Z) and Blue (-Z) edges of the tool.
@@ -124,6 +180,12 @@ function createMenu()
     self.createButton(hideArmyBtnB)
     self.createButton(showArmyBtnR)
     self.createButton(showArmyBtnB)
+    self.createButton(registerArmyBtnR)
+    self.createButton(registerArmyBtnB)
+    self.createButton(captureBtnR)
+    self.createButton(captureBtnB)
+    self.createButton(exportBtnR)
+    self.createButton(exportBtnB)
 end
 
 -- Reset every Activation token on the table to its "not acted" (green) state.
@@ -181,6 +243,33 @@ end
 function showArmyB(obj, player, alt)
     if player ~= "Blue" then print("INTRUDER") return end
     hideShowArmy("Blue", false)
+end
+
+-- Battle-log forwarders. Unlike the hide/show army buttons above these carry no
+-- local seat guard: Global.canRegisterFor owns the rule, because an unseated side
+-- must remain registerable by whoever is present.
+function registerArmyR(obj, player, alt)
+    if alt then
+        Global.call("battleClearArmy", {clicker = player, target = "Red"})
+    else
+        Global.call("battleRegisterFromSelection", {clicker = player, target = "Red", mode = "replace"})
+    end
+end
+
+function registerArmyB(obj, player, alt)
+    if alt then
+        Global.call("battleClearArmy", {clicker = player, target = "Blue"})
+    else
+        Global.call("battleRegisterFromSelection", {clicker = player, target = "Blue", mode = "replace"})
+    end
+end
+
+function captureSnapshot(obj, player, alt)
+    Global.call("battleManualCapture", player)
+end
+
+function exportReport(obj, player, alt)
+    Global.call("exportBattleReport", player)
 end
 
 function hideShowArmy(color, hideShow)

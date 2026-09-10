@@ -1030,6 +1030,25 @@ function selectedDeploymentSpawnsOverlay()
     return zone ~= nil and zone.draw and zone.draw.type ~= "none"
 end
 
+-- The battle log records which deployment was played. selectedDeployment()
+-- hands back an entry of DeployZonesData, a table owned by THIS script's state,
+-- and reading its fields from Global raises "Attempt to perform operations with
+-- resources owned by different scripts". A JSON string crosses that boundary
+-- safely, so the encoding happens here, where the table is legal to touch.
+function selectedDeploymentJSON()
+    local zone = selectedDeployment()
+    if zone == nil then return "" end
+    return JSON.encode({
+        name = zone.name,
+        objectivesID = zone.objectivesID,
+        draw = zone.draw,
+        -- Only the Combat Patrol zones carry this, and where it exists it wins:
+        -- drawTerritoryLine draws it verbatim instead of deriving an angle, so a
+        -- report that lacked it could not reproduce their divider at all.
+        territory = zone.territory,
+    })
+end
+
 -- END size changer
 
 -- ********************
@@ -2495,6 +2514,34 @@ function returnLoadedLayoutArtCardToDeck()
         card.setScale(layoutArtDeckScale)
         returnDeploymentCardToSourceDeck(card)
     end
+end
+
+-- Image URL of the mission's layout-art card -- the diagram that shows terrain,
+-- deployment zones, objectives and the territory divider on one page. The battle
+-- report uses it as its deployment view, where it beats any reconstruction.
+--
+-- Resolved here rather than in Global on purpose: the guid lives in this script's
+-- state, and a bare string crosses the script boundary safely where the card's own
+-- table would not (see selectedDeploymentJSON for the same reason).
+function loadedLayoutArtURL()
+    local card = nil
+    if loadedLayoutArtCardGuid then
+        card = getObjectFromGUID(loadedLayoutArtCardGuid)
+    end
+    if card == nil then
+        -- Joining a game already in progress leaves this script with no guid, but
+        -- the card itself is still parked on the table wearing its tag.
+        for _, obj in ipairs(getAllObjects()) do
+            if obj.hasTag ~= nil and obj.hasTag(layoutArtCardTag) then
+                card = obj
+                break
+            end
+        end
+    end
+    if card == nil then return "" end
+    local custom = card.getCustomObject()
+    if type(custom) ~= "table" or type(custom.face) ~= "string" then return "" end
+    return custom.face
 end
 
 function placeLoadedLayoutArtCard(mapName)
@@ -5568,6 +5615,9 @@ function startGame(obj, player, alt)
     Notes.setNotes("")
     writeMenus()
     updateGameStateHUD()
+    -- Battle log: one log per game. Seeds the terrain layout and a deployment
+    -- snapshot; army registrations made during setup are kept.
+    Global.call("battleStartGame")
     simulation = false
 end
 
@@ -5701,6 +5751,9 @@ function hudPhaseFgtRed(player) hudJumpToPhaseForTurn(player, "Red", 5) end
 
 function jumpToPhase(idx)
     if gameNotStartedGuard() then return end
+    -- Battle log: the HUD phase glyphs bypass nextPhase, so hook them too or a
+    -- report loses every phase advanced from the overlay.
+    Global.call("recordBattleSnapshot", "phase")
     currentPhase = idx
     broadcastToAll(phases[currentPhase], "Yellow")
     writeMenus()
@@ -5731,6 +5784,11 @@ function updateGameStateHUD()
 end
 
 function nextPhase(obj, player_color_click, alt_click)
+    -- Battle log: record the board as it stood at the END of the phase being
+    -- left, before currentPhase/currentTurn are mutated below. Capturing here
+    -- also avoids mislabelling -- the wrap path resets currentPhase before
+    -- passTurn has had its chance to reject a non-active player's press.
+    Global.call("recordBattleSnapshot", "phase")
     resetActivationTokens()
     if alt_click then
         passTurn(obj, player_color_click, alt_click)
@@ -5756,6 +5814,11 @@ function passTurn(obj, player_color_click, alt_click)
             end
         end
     end
+
+    -- Battle log: the board at the end of this turn. Placed after the guard
+    -- above so a rejected press records nothing; the one-frame dedupe in
+    -- recordBattleSnapshot keeps the nextPhase wrap from double-recording.
+    Global.call("recordBattleSnapshot", "turn")
 
     currentPhase = 1
     local cpMessage

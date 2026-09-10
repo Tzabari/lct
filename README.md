@@ -33,6 +33,99 @@ At build time `bake_map_index` generates a GUID-keyed `MAP_INDEX` table (`{creat
 
 Map-card nicknames and manifest `card_name` values carry a trailing creator credit (e.g. ` - T5S2`, ` - BTTF`); runtime matching strips it when resolving layout art and deployment zones. Creator tag→display mappings must stay aligned between `MAP_CREATOR_DISPLAY_NAMES` (`validate_maps.py`) and `mapCreatorDisplaySuffixes` (`startMenu.ttslua`); validation rejects mismatches.
 
+### Battle reports
+
+Players register their armies once per game, and the table then records a snapshot
+at every phase/turn change: each registered model's position, facing, base size and
+current wounds, plus the terrain layout, round, VP and CP. The log lives in Global's
+saved state (`svBattleLog`) and rides out with the save.
+
+In game, the three buttons sit on the game-tools object beside that side's
+HIDE / SHOW ARMY pair, one row further in:
+
+- **REGISTER ARMY** (one per side) — select your models, left-click to register them,
+  right-click to clear. A player may always register their own side; an empty seat may
+  be registered by whoever is present, so solo games work from either seat.
+- **CAPTURE** — record an extra snapshot mid-phase.
+- **EXPORT REPORT** — render the report and open it in a browser (needs the local
+  helper below; the button fails softly and tells you what to run if it is not up).
+
+The tooling is standard-library only. Create the environment once:
+
+```bash
+uv venv .venv
+```
+
+Then either leave the helper running while you play and use the in-game button
+(it re-reads the renderer on every export, so edits to `battle_report.py` take
+effect without restarting it):
+
+```bash
+.venv/Scripts/python.exe scripts/battle_report_server.py     # Windows
+.venv/bin/python scripts/battle_report_server.py             # macOS / Linux
+```
+
+...or skip the server entirely, save the game in TTS, and render the exported save:
+
+```bash
+.venv/Scripts/python.exe scripts/export_battle_report.py            # newest TTS save
+.venv/Scripts/python.exe scripts/export_battle_report.py <save.json> -o report/
+```
+
+Both write `report/report.html` and `report/snapshots.json` (the full
+reconstruction, and the stable interface for a future in-game viewer). The page
+header carries the time it was rendered, so a stale tab is easy to spot.
+
+The page is a viewer, not a scroll: one board fills the window, picked with three
+rows of tabs - Round, then player, then the phases of that round - so Round 2 ->
+Blue -> Charge is three clicks. The board as it stood when Start Game was pressed
+is its own **Deploy** round ahead of Round 1; it is only recorded if an army was
+registered by then, and the table says so in chat if none was. Prev / Next phase step through in order and the
+arrow keys do the same. The board zooms on the mouse wheel about the cursor, pans
+on drag, and resets on double-click, the `0` key or the Reset view button.
+
+The board is drawn looking down on the table the way you sit at it: +z is the far
+edge, at the top of the picture.
+
+Terrain areas are drawn as their real footprints, taken from Battlemaster's own
+plate meshes rather than from the bounding box the table reports - those boxes are
+up to an inch too deep, and the plate the maps call a "triangle" is really a right
+trapezoid that no box describes. Logs recorded before the plate name was captured
+still get real footprints, because the five plates are identifiable by size.
+
+Terrain follows the map's own colour coding - grey outlines for the terrain
+**areas**, yellow for **light** terrain and green for **dense**. That split is not
+inferred from the piece's name, which would get it wrong (Corner and the barriers
+are light; Generator and Pipes are dense): Battlemaster writes each piece's
+material into its Description, and the log captures it. Logs recorded before that
+was captured still colour correctly, from a per-tag table checked against every
+shipped map. Hovering a piece names it and its material.
+
+A side panel carries VP/CP with each side's primary/secondary split, both
+Reinforcements and Reserves boards, the
+secondaries currently in each side's zones, and casualties as they accumulate.
+Overlay toggles mirror the in-game buttons - deployment zones (redrawn from the
+mission's own draw spec), objectives, territory line, table quarters, the 6"
+strategic reserves inset, and the 3"/6" centre rings. The territory line is
+derived from the deployment that was played, exactly as the table derives it, so
+it tilts with a stepped zone instead of sitting on the centre line.
+
+**Deployment map** is a separate view, off by default. Where the log captured the
+mission's layout-art card it shows that diagram itself - terrain, zones,
+objectives and the divider as the mission prints them. It is shown as a picture in
+its own view rather than used as a background under the models: the art is
+portrait, bordered, and differs by map creator, so cropping and rotating it to
+line up with the board would need calibrating per art set. Without that card the
+view falls back to a drawn diagram - terrain, deployment zones drawn heavier and
+labelled by colour, quarters, divider and objectives. Either way the round, player
+and phase tabs park until you turn it off. Board markings are drawn in inches at
+true table scale, so a name label or a zone line stays in proportion to a 32mm base
+however far you zoom.
+
+Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model's
+`uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
+so models imported by other means still record position but report no wounds.
+
 ### Validation
 
 Every build validates the baked-in map cards (inventory, tags, terrain, zone size, GUID collisions, mission-matrix references) unless `--no-validate` is passed; errors abort the build. `--test`/`--release` add strict checks (`validate_maps.py --require-map-tags`) that also fail if a manifest map isn't fully wired into `startMenu.ttslua` — each card's head matches `data/map_card_machinery.lua` (no foreign/self-excluding loaders), every source bag is in `deploymentMatrixDecks`, `randomDeploymentDecks` and `GAME_MODE_OBJECTS`, all 25 disposition matchups have a dedicated deck, and each map's logical name has matching layout art in deck `fb4b5d`. Add new checks with the `@check` decorator; runtime behaviors the validator can't model are locked by `scripts/test_validate_maps.py`.
