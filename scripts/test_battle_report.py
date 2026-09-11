@@ -6,18 +6,27 @@ format, casualty accumulation, reserve detection from the board rectangle, and
 tolerance of logs that are partly malformed (a report should still render).
 """
 
+import argparse
+import contextlib
 import gzip
+import importlib
 import json
+import os
 import re
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import bake_terrain_cache as BTC
 import battle_report as BR
+import battle_report_server as SRV
 import map_payloads as MP
 import map_terrain as MT
 import report_store as RS
@@ -672,6 +681,346 @@ class TestReportServer(unittest.TestCase):
         block = block[:block.index("\nROOT")]
         self.assertIn("try:", block)
         self.assertIn("except Exception", block)
+
+
+@contextlib.contextmanager
+def _live_server(**overrides):
+    """A real ThreadingHTTPServer on 127.0.0.1:0, torn down on exit.
+
+    Sets SRV.ReportHandler's class attributes directly rather than going
+    through resolve_config()/main() -- this is what main() does at boot, just
+    with a Config built by hand so each test controls exactly what it needs
+    (a tiny store cap, a short TTL, a low rate limit) without touching argv or
+    the environment.
+    """
+    defaults = dict(
+        host="127.0.0.1", port=0, mode="hosted", out_dir=Path("unused"),
+        open_browser=False, dev_reload=False, public_base_url="", token="",
+        max_body_bytes=SRV.HOSTED_MAX_BODY_BYTES, store_dir="",
+        report_max=500, store_max_bytes=32 * 1024 * 1024,
+        ttl_seconds=900.0, ttl_under_load=120.0, high_watermark=0.8,
+        download_grace=60.0, rate_window=600.0,
+        rate_limit_ip=1000, rate_limit_steam=1000,
+    )
+    defaults.update(overrides)
+    config = SRV.Config(**defaults)
+
+    SRV.CONFIG = config
+    SRV.ReportHandler.config = config
+    SRV.ReportHandler.store = RS.ReportStore(
+        directory=config.store_dir or None, max_reports=config.report_max,
+        max_bytes=config.store_max_bytes, ttl_seconds=config.ttl_seconds,
+        ttl_under_load=config.ttl_under_load, high_watermark=config.high_watermark,
+        download_grace=config.download_grace)
+    SRV.ReportHandler.ip_limiter = SRV.RateLimiter(config.rate_limit_ip, config.rate_window)
+    SRV.ReportHandler.steam_limiter = SRV.RateLimiter(config.rate_limit_steam, config.rate_window)
+
+    server = SRV.ThreadingHTTPServer((config.host, config.port), SRV.ReportHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _post(base, path, body, headers=None):
+    req = urllib.request.Request(base + path, data=body, method="POST",
+                                 headers=headers or {})
+    try:
+        resp = urllib.request.urlopen(req)
+        return resp.status, json.loads(resp.read()), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        try:
+            data = json.loads(exc.read())
+        except (ValueError, UnicodeDecodeError):
+            data = None
+        return exc.code, data, dict(exc.headers)
+
+
+def _get(base, path, headers=None):
+    req = urllib.request.Request(base + path, headers=headers or {})
+    try:
+        resp = urllib.request.urlopen(req)
+        return resp.status, resp.read(), dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+
+
+class TestReportServerHosted(unittest.TestCase):
+    """Live HTTP against a real server, in hosted mode -- this is Step 8's LAN
+    rehearsal, minus the LAN: the same code path a Render deploy runs."""
+
+    def _post_log(self, base, **headers):
+        body = json.dumps(make_log()).encode("utf-8")
+        headers = {"Content-Type": "application/json", **headers}
+        return _post(base, SRV.REPORT_PATH, body, headers)
+
+    def test_a_hosted_export_returns_view_and_download_links(self):
+        with _live_server() as base:
+            code, data, _ = self._post_log(base)
+            self.assertEqual(code, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["mode"], "hosted")
+            self.assertIsNone(data["path"])
+            self.assertTrue(data["url"].startswith(base + SRV.VIEW_PREFIX))
+            self.assertTrue(data["download_url"].startswith(base + SRV.DOWNLOAD_PREFIX))
+            # Not exactly 900: expires_in is measured a moment after put() set
+            # the deadline, so a few milliseconds have already elapsed.
+            self.assertAlmostEqual(data["expires_in"], 900, delta=2)
+
+    def test_the_view_url_serves_the_report_with_a_matching_csp_nonce(self):
+        with _live_server() as base:
+            _, data, _ = self._post_log(base)
+            code, body, headers = _get(base, urllib.request.urlparse(data["url"]).path)
+            self.assertEqual(code, 200)
+            text = body.decode("utf-8")
+            self.assertIn("Battle Report", text)
+            self.assertIn("temporarily hosted copy", text)   # the injected banner
+            self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+            csp = headers.get("Content-Security-Policy", "")
+            m = re.search(r"nonce-([A-Za-z0-9_-]+)", csp)
+            self.assertIsNotNone(m, "no nonce in CSP header")
+            self.assertIn(f'nonce="{m.group(1)}"', text)
+
+    def test_the_download_url_offers_a_sane_filename_and_identical_bytes(self):
+        with _live_server() as base:
+            _, data, _ = self._post_log(base)
+            _, view_body, _ = _get(base, urllib.request.urlparse(data["url"]).path)
+            code, dl_body, headers = _get(base, urllib.request.urlparse(data["download_url"]).path)
+            self.assertEqual(code, 200)
+            self.assertEqual(dl_body, view_body)
+            disposition = headers.get("Content-Disposition", "")
+            self.assertIn("attachment", disposition)
+            self.assertRegex(disposition, r'filename="battle-report-[\w.-]+\.html"')
+
+    def test_a_bad_token_is_rejected(self):
+        with _live_server(token="secret123") as base:
+            code, data, _ = self._post_log(base, **{"X-LCT-Token": "wrong"})
+            self.assertEqual(code, 401)
+            code, data, _ = self._post_log(base)   # missing entirely
+            self.assertEqual(code, 401)
+            code, data, _ = self._post_log(base, **{"X-LCT-Token": "secret123"})
+            self.assertEqual(code, 200)
+
+    def test_an_oversized_body_is_rejected(self):
+        with _live_server(max_body_bytes=100) as base:
+            code, data, _ = self._post_log(base)
+            self.assertEqual(code, 413)
+
+    def test_an_unknown_view_id_is_404(self):
+        with _live_server() as base:
+            code, body, _ = _get(base, SRV.VIEW_PREFIX + "deadbeef")
+            self.assertEqual(code, 404)
+            self.assertIn("not found", json.loads(body)["error"])
+
+    def test_healthz_is_ok(self):
+        with _live_server() as base:
+            code, body, _ = _get(base, SRV.HEALTH_PATH)
+            self.assertEqual(code, 200)
+            self.assertTrue(json.loads(body)["ok"])
+
+    def test_a_full_store_answers_503_with_retry_after(self):
+        with _live_server(report_max=1) as base:
+            code, _, _ = self._post_log(base)
+            self.assertEqual(code, 200)
+            code, data, headers = self._post_log(base)
+            self.assertEqual(code, 503)
+            self.assertIn("busy", data["error"])
+            self.assertIn("Retry-After", headers)
+
+    def test_a_download_shortens_the_view_links_remaining_life(self):
+        with _live_server(ttl_seconds=900.0, download_grace=0.2) as base:
+            _, data, _ = self._post_log(base)
+            view_path = urllib.request.urlparse(data["url"]).path
+            dl_path = urllib.request.urlparse(data["download_url"]).path
+            code, _, _ = _get(base, dl_path)   # triggers mark_downloaded
+            self.assertEqual(code, 200)
+            time.sleep(0.3)
+            code, body, _ = _get(base, view_path)
+            self.assertEqual(code, 404)
+            self.assertIn("expired", json.loads(body)["error"])
+
+    def test_ip_only_rate_limiting_when_no_steam_header_is_sent(self):
+        with _live_server(rate_limit_ip=1, rate_limit_steam=1000) as base:
+            code, _, _ = self._post_log(base)
+            self.assertEqual(code, 200)
+            code, data, headers = self._post_log(base)
+            self.assertEqual(code, 429)
+            self.assertIn("Retry-After", headers)
+
+    def test_distinct_steam_ids_are_not_throttled_by_a_shared_ip(self):
+        with _live_server(rate_limit_ip=1000, rate_limit_steam=1) as base:
+            code, _, _ = self._post_log(base, **{"X-LCT-Steam-Id": "111"})
+            self.assertEqual(code, 200)
+            # Same IP (it's all localhost), different Steam id -- allowed.
+            code, _, _ = self._post_log(base, **{"X-LCT-Steam-Id": "222"})
+            self.assertEqual(code, 200)
+            # Reusing "111" hits its own bucket's limit of 1.
+            code, data, _ = self._post_log(base, **{"X-LCT-Steam-Id": "111"})
+            self.assertEqual(code, 429)
+
+
+class TestReportServerLocalMode(unittest.TestCase):
+    """Local mode keeps writing report/ + opening a browser, unchanged -- and
+    also populates the store, which is what lets hosted mode be rehearsed
+    against a plain local run (see the plan's Step 8)."""
+
+    def test_local_mode_still_writes_a_file_and_also_populates_the_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with _live_server(mode="local", out_dir=Path(tmp)) as base:
+                code, data, _ = _post(base, SRV.REPORT_PATH,
+                                      json.dumps(make_log()).encode("utf-8"),
+                                      {"Content-Type": "application/json"})
+                self.assertEqual(code, 200)
+                self.assertEqual(data["mode"], "local")
+                self.assertIsNotNone(data["path"])
+                self.assertTrue(Path(data["path"]).exists())
+                # The hosted-style links work too, from the very same export.
+                code, body, _ = _get(base, urllib.request.urlparse(data["url"]).path)
+                self.assertEqual(code, 200)
+                self.assertNotIn("temporarily hosted copy", body.decode("utf-8"),
+                                 "local mode must not get the hosted banner")
+
+    def test_open_browser_is_gated_by_config(self):
+        import unittest.mock as mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(SRV.webbrowser, "open") as m_open, \
+                 _live_server(mode="local", out_dir=Path(tmp), open_browser=True) as base:
+                code, _, _ = _post(base, SRV.REPORT_PATH,
+                                   json.dumps(make_log()).encode("utf-8"),
+                                   {"Content-Type": "application/json"})
+                self.assertEqual(code, 200)
+            self.assertEqual(m_open.call_count, 1)
+
+            with mock.patch.object(SRV.webbrowser, "open") as m_open, \
+                 _live_server(mode="local", out_dir=Path(tmp), open_browser=False) as base:
+                code, _, _ = _post(base, SRV.REPORT_PATH,
+                                   json.dumps(make_log()).encode("utf-8"),
+                                   {"Content-Type": "application/json"})
+                self.assertEqual(code, 200)
+            self.assertEqual(m_open.call_count, 0)
+
+
+class TestRendererGating(unittest.TestCase):
+    """dev_reload is what tells renderer() whether it is safe to hot-reload --
+    on in local mode (the whole point is editing the renderer while a game is
+    running), off in hosted mode (reloading under a live ThreadingHTTPServer is
+    a race, and a half-written edit has no business reaching a real player)."""
+
+    def test_renderer_reloads_only_when_dev_reload_is_true(self):
+        import unittest.mock as mock
+        original_config = SRV.CONFIG
+        try:
+            with mock.patch.object(SRV.importlib, "reload",
+                                   wraps=SRV.importlib.reload) as m_reload:
+                SRV.CONFIG = SRV.Config(dev_reload=False)
+                SRV.renderer()
+                m_reload.assert_not_called()
+
+                SRV.CONFIG = SRV.Config(dev_reload=True)
+                SRV.renderer()
+                m_reload.assert_called_once_with(SRV.BR)
+        finally:
+            SRV.CONFIG = original_config
+
+
+class TestResolveConfig(unittest.TestCase):
+    """CLI args win, then the matching env var, then the literal default."""
+
+    def _args(self, **overrides):
+        base = dict(host=None, port=None, mode=None, out=None, no_open=False,
+                   public_base_url=None, token=None, store_dir=None)
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def setUp(self):
+        # Every LCT_REPORT_* / PORT / HOST env var this reads, cleared for the
+        # duration of the test so the real environment cannot leak in.
+        self._env_keys = ("PORT", "HOST", "LCT_REPORT_MODE", "LCT_PUBLIC_BASE_URL",
+                          "LCT_REPORT_TOKEN", "LCT_REPORT_STORE_DIR", "LCT_REPORT_MAX",
+                          "LCT_REPORT_TTL", "LCT_MAX_BODY_BYTES", "LCT_REPORT_TTL_UNDER_LOAD",
+                          "LCT_REPORT_STORE_HIGH_WATERMARK", "LCT_REPORT_DOWNLOAD_GRACE",
+                          "LCT_REPORT_RATE_WINDOW", "LCT_REPORT_RATE_LIMIT",
+                          "LCT_REPORT_RATE_STEAM_LIMIT", "LCT_REPORT_STORE_MAX_BYTES")
+        self._saved = {k: os.environ.pop(k, None) for k in self._env_keys}
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_defaults_with_nothing_set(self):
+        config = SRV.resolve_config(self._args())
+        self.assertEqual(config.mode, "local")
+        self.assertEqual(config.host, SRV.DEFAULT_HOST)
+        self.assertEqual(config.port, SRV.DEFAULT_PORT)
+        self.assertEqual(config.max_body_bytes, SRV.MAX_BODY_BYTES)
+        self.assertTrue(config.open_browser)
+        self.assertTrue(config.dev_reload)
+
+    def test_env_vars_are_read_when_no_cli_arg_is_given(self):
+        os.environ["LCT_REPORT_MODE"] = "hosted"
+        os.environ["LCT_REPORT_TTL"] = "42"
+        config = SRV.resolve_config(self._args())
+        self.assertEqual(config.mode, "hosted")
+        self.assertEqual(config.ttl_seconds, 42.0)
+        self.assertEqual(config.max_body_bytes, SRV.HOSTED_MAX_BODY_BYTES,
+                         "hosted mode's body cap must apply once mode comes from the env")
+        self.assertFalse(config.open_browser)
+        self.assertFalse(config.dev_reload)
+
+    def test_a_cli_arg_overrides_the_matching_env_var(self):
+        os.environ["LCT_REPORT_MODE"] = "hosted"
+        config = SRV.resolve_config(self._args(mode="local"))
+        self.assertEqual(config.mode, "local")
+
+    def test_hosted_mode_never_opens_a_browser_even_without_no_open(self):
+        config = SRV.resolve_config(self._args(mode="hosted", no_open=False))
+        self.assertFalse(config.open_browser)
+
+    def test_import_has_no_environment_dependent_side_effect(self):
+        """test_report_url_matches_the_server_default imports this module and
+        reads its constants directly -- they must not depend on the process
+        environment, only resolve_config()'s return value may."""
+        os.environ["LCT_REPORT_MODE"] = "hosted"
+        os.environ["PORT"] = "1"
+        try:
+            reloaded = importlib.reload(SRV)
+            self.assertEqual(reloaded.DEFAULT_PORT, 8787)
+            self.assertEqual(reloaded.CONFIG.mode, "local")
+        finally:
+            importlib.reload(SRV)   # restore a clean module for later tests
+
+
+class TestRateLimiter(unittest.TestCase):
+    def test_allows_up_to_the_limit_then_denies(self):
+        clock = _FakeClock()
+        limiter = SRV.RateLimiter(2, 60, now=clock)
+        self.assertEqual(limiter.check("a")[0], True)
+        self.assertEqual(limiter.check("a")[0], True)
+        allowed, retry_after = limiter.check("a")
+        self.assertFalse(allowed)
+        self.assertGreater(retry_after, 0)
+
+    def test_different_keys_have_independent_budgets(self):
+        clock = _FakeClock()
+        limiter = SRV.RateLimiter(1, 60, now=clock)
+        self.assertTrue(limiter.check("a")[0])
+        self.assertTrue(limiter.check("b")[0])
+        self.assertFalse(limiter.check("a")[0])
+
+    def test_the_window_slides(self):
+        clock = _FakeClock()
+        limiter = SRV.RateLimiter(1, 60, now=clock)
+        self.assertTrue(limiter.check("a")[0])
+        self.assertFalse(limiter.check("a")[0])
+        clock.advance(61)
+        self.assertTrue(limiter.check("a")[0])
 
 
 class TestGeneratedStamp(unittest.TestCase):
