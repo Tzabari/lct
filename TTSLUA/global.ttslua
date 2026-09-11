@@ -2892,17 +2892,6 @@ function battleOpenRewindOverlay(color)
     battleRefreshRewindOverlay()
 end
 
-function hudToggleRewind(player, value, id)
-    local color = getHudColorFromCallback(player, id)
-    local settings = ensureHudSettings(color)
-    if settings.rewindOverlayOpen then
-        settings.rewindOverlayOpen = false
-        applyHudPreferencesForColor(color)
-    else
-        battleOpenRewindOverlay(color)
-    end
-end
-
 function hudCloseRewind(player, value, id)
     local color = getHudColorFromCallback(player, id)
     local settings = ensureHudSettings(color)

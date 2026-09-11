@@ -83,6 +83,23 @@ local exportBtnB = {
     tooltip="Render the battle report and open it in your browser.\nNeeds the local helper running:  python3 scripts/battle_report_server.py"
 }
 
+local endGameBtnLbl = "END GAME
+open rewind"
+local endGameTip = "Record the final state, close the battle log, and open the rewind selector.
+Press again later to reopen the selector."
+local endGameBtnR = {
+    label=endGameBtnLbl, click_function="endGame", function_owner=self,
+    position={XposHideArmy-3*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.35,0.2,0.1}, font_color={1,1,1},
+    tooltip=endGameTip
+}
+local endGameBtnB = {
+    label=endGameBtnLbl, click_function="endGame", function_owner=self,
+    position={XposHideArmy+Xoffset-3*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
+    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.35,0.2,0.1}, font_color={1,1,1},
+    tooltip=endGameTip
+}
+
 -- Activation / Wound tracker tokens: a Reset button (also auto-fired at every
 -- phase change from startMenu) plus per-token Spawn buttons that clone the parked
 -- master copies. Mirrored on the Red (+Z) and Blue (-Z) edges of the tool.
@@ -186,6 +203,8 @@ function createMenu()
     self.createButton(captureBtnB)
     self.createButton(exportBtnR)
     self.createButton(exportBtnB)
+    self.createButton(endGameBtnR)
+    self.createButton(endGameBtnB)
 end
 
 -- Reset every Activation token on the table to its "not acted" (green) state.
@@ -270,6 +289,10 @@ end
 
 function exportReport(obj, player, alt)
     Global.call("exportBattleReport", player)
+end
+
+function endGame(obj, player, alt)
+    Global.call("battleEndGame", player)
 end
 
 function hideShowArmy(color, hideShow)
