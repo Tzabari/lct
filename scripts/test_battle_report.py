@@ -15,6 +15,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
+import bake_terrain_cache as BTC
 import battle_report as BR
 import map_payloads as MP
 import map_terrain as MT
@@ -1182,6 +1183,63 @@ class TestPlateOutlines(unittest.TestCase):
         self.assertEqual(svg.count("t-area"), 16)
         self.assertNotIn("t-light", svg)
         self.assertNotIn("t-dense", svg)
+
+
+class TestTerrainCache(unittest.TestCase):
+    """data/terrain_cache.json is what a hosted report server reads instead of
+    the 26 MB of raw data/maps/ payloads -- this class is what keeps it honest.
+    """
+
+    def test_the_checked_in_cache_is_not_stale(self):
+        """This is bake_terrain_cache.py --check, run as a test.
+
+        A map added or changed by scripts/sync_battlemaster_maps.py without a
+        rebaked cache would otherwise ship a hosted server that silently draws
+        less terrain than the payloads it was generated from -- this is the one
+        thing that catches that before it reaches production.
+        """
+        fresh, _ = BTC.build()
+        self.assertEqual(
+            json.loads(BTC.CACHE_PATH.read_text(encoding="utf-8"))["maps"], fresh,
+            "data/terrain_cache.json is stale -- rerun scripts/bake_terrain_cache.py")
+
+    def test_every_cached_map_reproduces_map_terrain_computed_from_its_payload(self):
+        for guid in sorted(MT.load_cache()):
+            cached = MT.map_terrain(guid, use_cache=True)
+            fresh = MT.map_terrain(guid, use_cache=False)
+            self.assertEqual(cached, fresh, guid)
+
+    def test_map_terrain_still_works_with_the_cache_disabled(self):
+        terrain = MT.map_terrain("ff5fec", use_cache=False)
+        self.assertIsNotNone(terrain)
+        self.assertEqual(len(terrain["plates"]), 16)
+
+    def test_a_guid_absent_from_the_cache_falls_back_to_the_payload(self):
+        guid = next(iter(MT.load_cache()))
+        trimmed = dict(MT.load_cache())
+        del trimmed[guid]
+        original = MT._cache
+        MT._cache = trimmed
+        try:
+            self.assertEqual(MT.map_terrain(guid, use_cache=True),
+                              MT.map_terrain(guid, use_cache=False))
+        finally:
+            MT._cache = original
+
+    def test_the_three_unresolvable_maps_are_still_unresolvable(self):
+        """Pins the count so a real regression (a newly-broken mesh lookup)
+        cannot hide behind "well, some maps are always unresolved"."""
+        _, unresolved = BTC.build()
+        self.assertEqual(len(unresolved), 3)
+
+    def test_a_missing_cache_file_behaves_like_an_empty_one(self):
+        original = MT._cache
+        MT._cache = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                self.assertEqual(MT.load_cache(Path(tmp) / "missing.json"), {})
+        finally:
+            MT._cache = original
 
 
 if __name__ == "__main__":

@@ -29,6 +29,12 @@ import battlemaster_reconstruct as reconstruction
 
 OUTLINES_PATH = ROOT / "data" / "plate_outlines.json"
 
+# Precomputed by scripts/bake_terrain_cache.py: {"schema": 1, "maps": {guid: {...}}}.
+# A hosted server ships this and never opens data/maps/ (26 MB of raw payloads,
+# 228 files) -- see that script's docstring for the measured size difference.
+CACHE_PATH = ROOT / "data" / "terrain_cache.json"
+CACHE_SCHEMA = 1
+
 # Each terrain object is embedded as a Lua long string inside `objectJSONs = {...}`.
 OBJECT_ENTRY_RE = re.compile(r"\[\[(\{.*?\})\]\]", re.DOTALL)
 
@@ -39,6 +45,7 @@ BATTLEMAT_MESH = reconstruction.BATTLEMAT_MESH_URL
 MIRROR_TOLERANCE = 1.0
 
 _outlines = None
+_cache = None
 
 
 def load_outlines(path=OUTLINES_PATH):
@@ -50,6 +57,25 @@ def load_outlines(path=OUTLINES_PATH):
                   for name, ring in (data.get("shapes") or {}).items()}
         _outlines = (shapes, dict(data.get("meshes") or {}))
     return _outlines
+
+
+def load_cache(path=CACHE_PATH):
+    """The precomputed {guid: {"plates": [...], "board": [w, h] or None}} map.
+
+    Cached at module level like load_outlines(); returns {} when the file is
+    absent (a normal checkout with no cache baked yet, or a guid a fresher sync
+    added since the cache was last built) rather than raising, so callers always
+    have a payload fallback available.
+    """
+    global _cache
+    if _cache is None:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            _cache = {}
+        else:
+            _cache = data.get("maps") or {} if data.get("schema") == CACHE_SCHEMA else {}
+    return _cache
 
 
 def mesh_url(obj):
@@ -172,19 +198,34 @@ def plates_from_objects(objects, outlines=None):
     return placed
 
 
-def map_terrain(map_guid, read_payload=None):
+def map_terrain(map_guid, read_payload=None, use_cache=True):
     """Terrain for one map card, or None when it cannot be resolved.
 
     Returns {"plates": [...], "board": (w, h) or None}. None means the card has no
     shipped payload (a Combat Patrol map, or a log with no map recorded) or uses a
     mesh that data/plate_outlines.json does not cover.
+
+    Cache first: scripts/bake_terrain_cache.py precomputes this exact result for
+    every shipped map into data/terrain_cache.json (1.04 MB) so a hosted server
+    never has to open data/maps/ (26 MB, 228 files) at request time. A guid absent
+    from the cache -- not yet baked in after a map sync, or the cache file missing
+    entirely -- falls through to the payload, so a normal checkout is never wrong,
+    only slower; only a deployment that ships the cache without data/maps/ depends
+    on the cache actually being current (see bake_terrain_cache.py --check).
     """
     if not map_guid:
         return None
+    guid = str(map_guid)
+    if use_cache:
+        cached = load_cache().get(guid)
+        if cached is not None:
+            board = cached.get("board")
+            return {"plates": cached.get("plates") or [],
+                    "board": tuple(board) if board else None}
     if read_payload is None:
         import map_payloads
         read_payload = map_payloads.read_payload
-    payload = read_payload(str(map_guid))
+    payload = read_payload(guid)
     if not payload:
         return None
     objects = payload_objects(payload)
