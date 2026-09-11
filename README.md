@@ -153,6 +153,46 @@ count on an unscripted model (no datasheet popup) still comes back correctly. A
 model that is alive now but was already dead at the moment you rewind to goes back
 into the bag; rewinding forward past its death takes it back out.
 
+#### Hosting the report server (Render, free tier)
+
+The local helper above only works for whoever is running it. `scripts/battle_report_server.py`
+also runs in a **hosted** mode (`--mode hosted`, or `$LCT_REPORT_MODE=hosted`) that binds every
+interface, writes nothing to disk, and answers with a short `/r/<id>` view link and a `/d/<id>`
+download link instead of a local file path — this is what `render.yaml` deploys to
+[Render](https://render.com)'s free tier.
+
+- **No preemptive traffic.** The mod contacts the server only when EXPORT REPORT is pressed —
+  nothing during setup, registration or play. That costs nothing from Render's 750 free
+  instance-hours/month, but means the *first* export after 15 minutes idle pays Render's own
+  ~60-second container wake. The export button probes `GET /healthz` first and retries with
+  backoff (`BATTLE_EXPORT_BACKOFF` in `global.ttslua`) rather than trusting TTS's undocumented
+  `WebRequest` timeout.
+- **No persistent disk on the free tier**, so hosted reports live in memory
+  (`scripts/report_store.py`) behind a TTL — 15 minutes by default (`LCT_REPORT_TTL`), shortened
+  automatically once the store is busy, and capped to a minute after someone uses the download
+  link. A full store answers `503` rather than evicting anyone's live report. The **download**
+  link is what makes this acceptable: the page is fully self-contained, so a downloaded copy
+  keeps working offline, forever, after the ephemeral link dies.
+- **Runtime data is tiny.** The service only ever reads `data/terrain_cache.json` (1.04 MB) and
+  `data/plate_outlines.json` (7 KB) — never the 26 MB of raw payloads in `data/maps/`. Rebuild the
+  cache after touching a map's payload:
+  ```bash
+  python3 scripts/bake_terrain_cache.py            # write data/terrain_cache.json
+  python3 scripts/bake_terrain_cache.py --check    # exit 1 if stale (also run as a unit test)
+  ```
+  `scripts/sync_battlemaster_maps.py` rebakes it automatically as a post-write check.
+- **Auth is a deterrent, not a boundary.** POST requires a shared token (`X-LCT-Token`, baked
+  into the mod at compile time by `LCT_REPORT_TOKEN`) and is rate-limited per client IP and,
+  when the mod sends `X-LCT-Steam-Id`, per the table host's Steam id as well — both budgets must
+  allow. All three signals are attacker-controlled (a publicly distributed mod, a rotatable IP),
+  so none of this is authentication; it raises the cost of casual abuse rather than claiming to
+  stop a targeted one. Reports are unlisted, not private — anyone with a link can view it.
+
+To run the LAN rehearsal that exercises this whole path with nothing deployed (Step 8 of the
+plan): run the server in hosted mode bound to your machine's LAN address, point the mod at it
+from the in-game console (`Global.setVar("BATTLE_REPORT_REMOTE_BASE", "http://<lan-ip>:<port>")`,
+`Global.setVar("BATTLE_REPORT_MODE", "remote")`), and export as normal.
+
 ### Validation
 
 Every build validates the baked-in map cards (inventory, tags, terrain, zone size, GUID collisions, mission-matrix references) unless `--no-validate` is passed; errors abort the build. `--test`/`--release` add strict checks (`validate_maps.py --require-map-tags`) that also fail if a manifest map isn't fully wired into `startMenu.ttslua` — each card's head matches `data/map_card_machinery.lua` (no foreign/self-excluding loaders), every source bag is in `deploymentMatrixDecks`, `randomDeploymentDecks` and `GAME_MODE_OBJECTS`, all 25 disposition matchups have a dedicated deck, and each map's logical name has matching layout art in deck `fb4b5d`. Add new checks with the `@check` decorator; runtime behaviors the validator can't model are locked by `scripts/test_validate_maps.py`.

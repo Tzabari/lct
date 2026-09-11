@@ -1023,6 +1023,48 @@ class TestRateLimiter(unittest.TestCase):
         self.assertTrue(limiter.check("a")[0])
 
 
+class TestRenderDeployment(unittest.TestCase):
+    """render.yaml and requirements.txt, regex-parsed (no PyYAML dependency)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.render_yaml = (ROOT / "render.yaml").read_text(encoding="utf-8")
+        cls.requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    def test_start_command_names_the_script_and_binds_every_interface(self):
+        m = re.search(r'startCommand:\s*"([^"]+)"', self.render_yaml)
+        self.assertIsNotNone(m, "no startCommand in render.yaml")
+        command = m.group(1)
+        self.assertIn("battle_report_server.py", command)
+        self.assertIn("--host 0.0.0.0", command)
+        self.assertIn("$PORT", command)
+        self.assertIn("--mode hosted", command)
+
+    def test_health_check_path_matches_the_server(self):
+        m = re.search(r"healthCheckPath:\s*(\S+)", self.render_yaml)
+        self.assertIsNotNone(m, "no healthCheckPath in render.yaml")
+        self.assertEqual(m.group(1), SRV.HEALTH_PATH)
+
+    def test_runtime_is_python_on_the_free_plan(self):
+        self.assertIn("runtime: python", self.render_yaml)
+        self.assertIn("plan: free", self.render_yaml)
+
+    def test_the_token_is_never_committed(self):
+        # sync: false means "set this in the dashboard" -- a literal token
+        # value here would ship a secret in the repo.
+        block = self.render_yaml[self.render_yaml.index("LCT_REPORT_TOKEN"):]
+        block = block[:block.index("\n      - key:") if "\n      - key:" in block else len(block)]
+        self.assertIn("sync: false", block)
+
+    def test_requirements_txt_has_no_real_dependencies(self):
+        # A comment-only file: Render's Python runtime detection needs the
+        # file to exist, but this project is stdlib-only -- a real entry here
+        # would be an accidental dependency nobody meant to add.
+        real_lines = [line for line in self.requirements.splitlines()
+                     if line.strip() and not line.strip().startswith("#")]
+        self.assertEqual(real_lines, [])
+
+
 class TestGeneratedStamp(unittest.TestCase):
     def test_the_page_says_when_it_was_rendered(self):
         # Rendered through a long-running server, so "is this page stale?" needs
