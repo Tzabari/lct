@@ -4,7 +4,7 @@ Compiles TTSLUA scripts into the TTS JSON save file.
 
 Usage:
     python3 compile.py            # prompts for version, writes compiled JSON
-    python3 compile.py --test     # uses "test" as version, copies to TTS saves folder
+    python3 compile.py --test     # uses "test-<branch>" as version, copies to TTS saves folder
     python3 compile.py --release  # version + patch notes from CHANGELOG.md, copies to TTS saves folder
 """
 
@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -129,6 +130,30 @@ def get_tts_saves_path() -> Path:
     else:
         return home / ".local" / "share" / "Tabletop Simulator" / "Saves"
 
+
+def get_git_branch(repo_root: Path):
+    """Current branch name, or None if not a git repo, detached HEAD, or git
+    is unavailable. Lets --test tag its build per-branch, so two worktrees
+    (or two branches in one checkout) building at once don't overwrite each
+    other's builds/ output or TTS saves copy."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":  # detached HEAD
+        return None
+    return branch
+
+
+def sanitize_version_tag(tag: str) -> str:
+    """Collapse a branch name to a single safe path/version segment, e.g.
+    "feature/battle-rewind" -> "feature-battle-rewind" -- it flows into a
+    filename (builds/, the TTS saves copy) and a JSON string value alike."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-")
 
 
 def inject_xml(json_lines: list, xml_file: Path):
@@ -340,7 +365,7 @@ def parse_changelog(path: Path):
 def stamp_global(lua_text: str, version: str, patch: str, notes: list, debug: bool) -> str:
     """Rewrite the GAME_VERSION / GAME_PATCH / GAME_CHANGELOG / DEBUG markers in global.ttslua.
 
-    version : build stamp ("test" or the release version) — drives chat + save name.
+    version : build stamp ("test", "test-<branch>", or the release version) — drives chat + save name.
     patch   : latest CHANGELOG version — shown on the splash overlay.
     notes   : latest CHANGELOG bullets — shown on the splash overlay.
     debug   : build-wide debug switch — true for --test, false otherwise.
@@ -511,7 +536,7 @@ def stamp_save_name(line: str, version: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Compile TTS Lua scripts into JSON.")
     parser.add_argument("--test", action="store_true",
-                        help="Tag as 'test' build and copy to TTS saves folder.")
+                        help="Tag as a 'test-<branch>' build and copy to TTS saves folder.")
     parser.add_argument("--release", action="store_true",
                         help="Take version and patch notes from CHANGELOG.md and copy to TTS saves folder.")
     parser.add_argument("--no-validate", action="store_true",
@@ -562,7 +587,11 @@ def main():
         warn(f"no '## vX.Y.Z' entry found in {CHANGELOG.name} — splash not updated.")
 
     if args.test:
-        version = "test"
+        branch = get_git_branch(SCRIPT_DIR.parent)
+        tag = sanitize_version_tag(branch) if branch else ""
+        version = f"test-{tag}" if tag else "test"
+        print(f"Test build tag: {version}"
+              + ("" if tag else " (branch name unavailable)"))
     elif args.release:
         if not patch:
             fail(f"--release needs a '## vX.Y.Z' entry at the top of {CHANGELOG.name}.")
