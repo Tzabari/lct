@@ -15,6 +15,7 @@ then run `python3 compile.py --release`.
 
 ## v1.12.0
 - Feat: Battle Log. Each player selects their models and presses REGISTER ARMY on the game-tools object; from then on the table records where every registered model stands at each phase change, plus the terrain layout, VP/CP and per-model wounds. Press EXPORT REPORT (or run the exporter on a saved game) to get a browsable battle report with a top-down board per phase.
+- Feat: EXPORT REPORT can also reach a hosted renderer instead of the local helper, so anyone at the table gets a shareable link with nothing installed. The mod never contacts it except when EXPORT is pressed, probing first so a sleeping free-tier instance's ~60s wake shows a progress message instead of failing. A view link and a permanent-download link are printed to chat and written to a "Battle Report" notebook tab; the view link expires (15 minutes by default, sooner if the server is busy or the report has been downloaded) but the downloaded copy is self-contained and keeps working offline forever.
 - Feat: Battle Log works with only one player seated, from either seat, so solo games and testing record properly. A present player can register an empty seat's army.
 - Feat: CAPTURE button records an extra snapshot mid-phase, for moments a phase boundary would miss.
 - Feat: The battle report is now a viewer: one board fills the window, with Round tabs, a player tab, per-round phase tabs and Next/Prev phase buttons (arrow keys work too).
