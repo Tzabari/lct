@@ -700,6 +700,33 @@ class TestLuaWiringRemote(unittest.TestCase):
         self.assertIn('BATTLE_REPORT_REMOTE_BASE = ""', out)
         self.assertIn('BATTLE_REPORT_TOKEN = ""', out)
 
+    def test_lct_report_bake_in_test_opts_a_test_build_into_a_real_base(self):
+        # The escape hatch for rehearsing the hosted path (e.g. a LAN-bound
+        # `battle_report_server.py --mode hosted`) without the in-game console.
+        import compile as C
+        saved = {k: os.environ.get(k) for k in
+                 ("LCT_REPORT_BAKE_IN_TEST", "LCT_REPORT_REMOTE_BASE", "LCT_REPORT_TOKEN")}
+        try:
+            os.environ["LCT_REPORT_BAKE_IN_TEST"] = "1"
+            os.environ["LCT_REPORT_REMOTE_BASE"] = "http://192.168.0.217:8799"
+            os.environ["LCT_REPORT_TOKEN"] = "testtoken123"
+            out = C.bake_battle_report_endpoint(self.src, is_test=True)
+            self.assertIn('BATTLE_REPORT_REMOTE_BASE = "http://192.168.0.217:8799"', out)
+            self.assertIn('BATTLE_REPORT_TOKEN = "testtoken123"', out)
+
+            # Without LCT_REPORT_BAKE_IN_TEST, the same env vars are ignored --
+            # a --test build stays local-only unless explicitly opted out.
+            del os.environ["LCT_REPORT_BAKE_IN_TEST"]
+            out = C.bake_battle_report_endpoint(self.src, is_test=True)
+            self.assertIn('BATTLE_REPORT_REMOTE_BASE = ""', out)
+            self.assertIn('BATTLE_REPORT_TOKEN = ""', out)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_the_health_path_matches_the_server(self):
         m = re.search(r'BATTLE_REPORT_HEALTH\s*=\s*"([^"]+)"', self.src)
         self.assertIsNotNone(m)
@@ -711,6 +738,18 @@ class TestLuaWiringRemote(unittest.TestCase):
         export_ladder = self._body(self.src, "battleExportLadder")
         self.assertIn("BATTLE_EXPORT_BACKOFF", export_ladder)
         self.assertIn("Wait.time", export_ladder)
+
+    def test_only_the_hosted_endpoint_is_retried_local_fails_fast(self):
+        # A local helper that isn't running fails near-instantly and will
+        # never start itself mid-game -- retrying it through the whole ~2 min
+        # ladder before ever trying the hosted fallback would make "auto" mode
+        # look hung for no reason. Only the endpoint marked retryable (hosted)
+        # gets the backoff ladder; local falls through after one probe.
+        endpoints_body = self._body(self.src, "battleReportEndpoints")
+        self.assertIn("retryable = false", endpoints_body)
+        self.assertIn("retryable = true", endpoints_body)
+        ladder_body = self._body(self.src, "battleExportLadder")
+        self.assertIn("endpoint.retryable", ladder_body)
 
     def test_each_attempt_has_its_own_watchdog_not_a_shared_one(self):
         # Never depend on TTS's undocumented WebRequest timeout -- each network
@@ -754,16 +793,20 @@ class TestLuaWiringRemote(unittest.TestCase):
         """Pins "contact the server only on EXPORT" so a later edit cannot
         quietly reintroduce a warm-up ping. This is the one that must never be
         weakened -- see the plan's round-1 correction on this exact point."""
+        # "WebRequest." (an actual call, e.g. WebRequest.get/.custom) rather
+        # than the bare word: a comment is allowed to mention WebRequest while
+        # explaining behaviour (see battleReportEndpoints' "local" entry)
+        # without that tripping this check.
         for fn in ("recordBattleSnapshot", "battleRegisterFromSelection",
                   "battleClearArmy", "battleStartGame", "battleManualCapture"):
             body = self._body(self.src, fn)
-            self.assertNotIn("WebRequest", body, f"{fn} must not call WebRequest")
+            self.assertNotIn("WebRequest.", body, f"{fn} must not call WebRequest")
 
         # Every WebRequest call in the BATTLE LOG block lives in a function
         # reachable only from exportBattleReport's own ladder.
         allowed = {"battleProbeThenPost", "battlePostReport"}
         for fn in allowed:
-            self.assertIn("WebRequest", self._body(self.src, fn))
+            self.assertIn("WebRequest.", self._body(self.src, fn))
         section_start = self.src.index("function battleWebStatusCode(")
         section_end = self.src.index("\nfunction battleSetReportMode(")
         section = self.src[section_start:section_end]
@@ -771,7 +814,7 @@ class TestLuaWiringRemote(unittest.TestCase):
         # the allowed two -- a stray third call site would be a regression.
         for fn_match in re.finditer(r"function (\w+)\(.*?\n(.*?)\nend", section, re.S):
             name, body = fn_match.group(1), fn_match.group(2)
-            if "WebRequest" in body:
+            if "WebRequest." in body:
                 self.assertIn(name, allowed, f"unexpected WebRequest call in {name}")
 
 

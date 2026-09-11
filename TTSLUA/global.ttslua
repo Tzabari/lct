@@ -2505,6 +2505,13 @@ function battleReportEndpoints()
         table.insert(endpoints, {
             label = "local", reportUrl = BATTLE_REPORT_URL,
             healthUrl = (BATTLE_REPORT_URL:gsub("/report$", BATTLE_REPORT_HEALTH)),
+            -- The local helper doesn't sleep and wake like a hosted service
+            -- does: it's either already running (answers in well under a
+            -- second) or it simply isn't (WebRequest fails almost instantly).
+            -- Retrying a process that isn't there six times over ~2 minutes
+            -- would only make "auto" mode look hung before it ever reaches
+            -- the hosted fallback -- so a single probe is all it gets.
+            retryable = false,
         })
     end
     if BATTLE_REPORT_MODE ~= "local" then
@@ -2513,6 +2520,9 @@ function battleReportEndpoints()
             table.insert(endpoints, {
                 label = "hosted", reportUrl = remoteReport,
                 healthUrl = battleReportRemoteUrl(BATTLE_REPORT_HEALTH),
+                -- This is the one that can genuinely be asleep (Render's free
+                -- tier), so it's the one that gets the backoff ladder.
+                retryable = true,
             })
         end
     end
@@ -2566,27 +2576,30 @@ function battleProbeThenPost(state)
     end, BATTLE_EXPORT_TIMEOUT)
 end
 
--- Retries the current endpoint through BATTLE_EXPORT_BACKOFF, printing a
--- progress line at each step so the wait never looks dead, then falls through
--- to the next configured endpoint, and finally to the soft-miss message once
--- every endpoint has been tried. This is the whole cold-start story: no
--- preemptive warming anywhere in the mod (see the plan's "Cold start" section)
--- means this ladder -- run only because EXPORT REPORT was actually pressed --
--- is what absorbs a sleeping Render instance's ~60s wake.
+-- Retries the current endpoint through BATTLE_EXPORT_BACKOFF -- but only when
+-- it's marked retryable (the hosted one; see battleReportEndpoints) -- printing
+-- a progress line at each step so the wait never looks dead, then falls
+-- through to the next configured endpoint, and finally to the soft-miss
+-- message once every endpoint has been tried. This is the whole cold-start
+-- story: no preemptive warming anywhere in the mod (see the plan's "Cold
+-- start" section) means this ladder -- run only because EXPORT REPORT was
+-- actually pressed -- is what absorbs a sleeping Render instance's ~60s wake.
 function battleExportLadder(state)
-    state.attemptIndex = state.attemptIndex + 1
-    local delay = BATTLE_EXPORT_BACKOFF[state.attemptIndex]
-    if delay ~= nil then
-        local label = state.endpoints[state.endpointIndex].label
-        if state.attemptIndex == 1 then
-            printToColor("Report server (" .. label .. ") is waking up - this can take about a minute...",
-                         state.playerColor, {0.8, 0.8, 1})
-        else
-            printToColor("Still waiting on the " .. label .. " report server...",
-                         state.playerColor, {0.7, 0.7, 0.9})
+    local endpoint = state.endpoints[state.endpointIndex]
+    if endpoint.retryable then
+        state.attemptIndex = state.attemptIndex + 1
+        local delay = BATTLE_EXPORT_BACKOFF[state.attemptIndex]
+        if delay ~= nil then
+            if state.attemptIndex == 1 then
+                printToColor("Report server (" .. endpoint.label .. ") is waking up - this can take about a minute...",
+                             state.playerColor, {0.8, 0.8, 1})
+            else
+                printToColor("Still waiting on the " .. endpoint.label .. " report server...",
+                             state.playerColor, {0.7, 0.7, 0.9})
+            end
+            Wait.time(function() battleProbeThenPost(state) end, delay)
+            return
         end
-        Wait.time(function() battleProbeThenPost(state) end, delay)
-        return
     end
 
     state.endpointIndex = state.endpointIndex + 1

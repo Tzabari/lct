@@ -432,12 +432,22 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
     unaffected by any of this) and hot-reload the renderer, never the real
     deployed service by accident.
 
+    Set LCT_REPORT_BAKE_IN_TEST=1 to opt a --test build out of that and bake a
+    real base/token anyway -- for rehearsing the hosted path (e.g. against a
+    LAN-bound `battle_report_server.py --mode hosted`) without needing the
+    in-game console. LCT_REPORT_REMOTE_BASE overrides BATTLE_REPORT_REMOTE_BASE
+    above when set, so that rehearsal can point at a LAN address instead of the
+    real deployed service. Neither variable does anything without the other:
+    a plain --test build stays local-only by default.
+
     The token comes from the environment and is never committed. Empty only
     warns, never fails -- a build without the secret still produces a working,
     local-only mod; the hosted path simply never gets tried (BATTLE_REPORT_MODE
     "auto" falls through to it only when a base is configured at all).
     """
-    base = "" if is_test else BATTLE_REPORT_REMOTE_BASE
+    bake_anyway = is_test and os.environ.get("LCT_REPORT_BAKE_IN_TEST", "") not in ("", "0", "false", "False")
+    skip = is_test and not bake_anyway
+    base = "" if skip else os.environ.get("LCT_REPORT_REMOTE_BASE", BATTLE_REPORT_REMOTE_BASE)
     base_literal = f"BATTLE_REPORT_REMOTE_BASE = {json.dumps(base)}   -- @@BATTLE_REPORT_REMOTE_BASE@@"
     lua_text, count = re.subn(r"^.*--\s*@@BATTLE_REPORT_REMOTE_BASE@@.*$", base_literal,
                               lua_text, count=1, flags=re.M)
@@ -445,7 +455,7 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
         warn("marker @@BATTLE_REPORT_REMOTE_BASE@@ not found in global.ttslua — "
              "hosted report endpoint not baked.")
 
-    token = "" if is_test else os.environ.get("LCT_REPORT_TOKEN", "")
+    token = "" if skip else os.environ.get("LCT_REPORT_TOKEN", "")
     if base and not token:
         warn("LCT_REPORT_TOKEN is not set — this build will POST to the hosted "
              "report server with no token; it works only if the server has no "
