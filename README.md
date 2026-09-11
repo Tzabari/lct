@@ -127,6 +127,32 @@ Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model'
 `uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
 so models imported by other means still record position but report no wounds.
 
+### In-game rewind
+
+The same log the report is built from can put the table itself back to any
+recorded moment, in TTS, with no export step.
+
+**END GAME** sits next to EXPORT REPORT. Pressing it records one last snapshot,
+closes the log to further recording (so a rewind can never overwrite the game it
+is reviewing), and opens a Round / Player / Phase selector - greyed out wherever
+no snapshot exists for that combination, the same gaps EXPORT REPORT's tabs would
+show. Pressing END GAME again later reopens the selector rather than ending the
+game a second time.
+
+Pick a round, a player and a phase and press **REWIND**: every model, CP, VP and
+secondary card returns to the state captured then. **RETURN TO END** puts
+everything back to the end-of-game state recorded by END GAME. This is a review,
+not an undo - the log is never truncated, so you can scrub back and forth as much
+as you like and always get back to where you were.
+
+A model destroyed during the game is not deleted; it is moved into a hidden bag
+under the table and comes back under its *original* GUID when a rewind needs it on
+the board again, at the position, wounds and health-bracket colour it had at that
+moment - restored from the model's own recorded nickname, which is why a wound
+count on an unscripted model (no datasheet popup) still comes back correctly. A
+model that is alive now but was already dead at the moment you rewind to goes back
+into the bag; rewinding forward past its death takes it back out.
+
 ### Validation
 
 Every build validates the baked-in map cards (inventory, tags, terrain, zone size, GUID collisions, mission-matrix references) unless `--no-validate` is passed; errors abort the build. `--test`/`--release` add strict checks (`validate_maps.py --require-map-tags`) that also fail if a manifest map isn't fully wired into `startMenu.ttslua` — each card's head matches `data/map_card_machinery.lua` (no foreign/self-excluding loaders), every source bag is in `deploymentMatrixDecks`, `randomDeploymentDecks` and `GAME_MODE_OBJECTS`, all 25 disposition matchups have a dedicated deck, and each map's logical name has matching layout art in deck `fb4b5d`. Add new checks with the `@check` decorator; runtime behaviors the validator can't model are locked by `scripts/test_validate_maps.py`.

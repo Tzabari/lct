@@ -37,6 +37,8 @@ then run `python3 compile.py --release`.
 - Bug fix: Active secondaries never appeared in the report. The scan read each slot zone directly, and a card dropped into a slot is not registered as inside it until it settles; it now goes through the same slot helper the scoreboard uses.
 - Bug fix: The report listed only the first two of a player's secondaries. The battle log kept its own two-entry list of slot zones rather than using the mod's, so a card drawn into slots 3 to 8 was recorded nowhere; all eight slots a side are now read.
 - Bug fix: The report drew only five of the mod's eight deployment shapes, so Combat Patrol zones went missing, and a "No Deployment Zone" mission could blank the page.
+- Feat: Battle Rewind. Press END GAME (next to EXPORT REPORT) to record the final state, close the battle log to further recording, and open a Round / Player / Phase selector - greyed out wherever no snapshot was recorded. Pick a moment and press REWIND to put every model, CP, VP and secondary back exactly as they were then; press RETURN TO END to put the table back to the end of the game. Rewinding is a review, not an undo - the log is never truncated, so you can scrub back and forth as much as you like without losing anything.
+- Feat: A model destroyed during the game comes back under its original GUID when a rewind puts it back on the board, at the position, wounds and health-bracket colour it had at that moment; a model still alive when you rewind past its death goes back to the graveyard until you return to a moment after it fell.
 
 ## v1.11.3
 - UI Scoreboard change for better visibility and new button underneath scoring overlay.
