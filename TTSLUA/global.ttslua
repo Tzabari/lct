@@ -1395,6 +1395,13 @@ function defaultBattleLog()
         -- resurrected model could not reclaim its original one.
         grave = nil,
         gmap = {},
+        -- A destroyed secondary card cannot be found by name on a later rewind
+        -- the way a live one can, so its JSON is kept here (one copy per card
+        -- name, most recently destroyed wins) and respawned on demand. Unlike
+        -- the model graveyard these are never parked in a bag: a card's target
+        -- slot and facing are already known at restore time, so it is spawned
+        -- straight into place.
+        secGrave = {},
         ended = false,
     }
 end
@@ -1598,6 +1605,30 @@ function battleCaptureDestroyed(obj)
         end)
         if not ok then _battleGraveGuard[guid] = nil end
     end, 1)
+end
+
+-- Called from the extended onObjectDestroy for loose secondary cards. A card
+-- that is deleted -- rather than merely moved to the discard -- leaves nothing
+-- for a later rewind to find by name, so its JSON is kept here (one copy per
+-- name; the most recently destroyed wins) and respawned fresh when a rewind
+-- needs it. Unlike battleCaptureDestroyed this never touches the graveyard bag:
+-- a secondary's target slot and facing are already known at restore time, so
+-- there is nothing to park -- battleRestoreSecondaries spawns it straight into
+-- place. Cards still sitting in a deck are not covered: a deck's own JSON has
+-- no single name to key on, and losing a whole deck box is not the reported
+-- failure this exists to recover from.
+function battleCaptureDestroyedSecondary(obj)
+    if battleLog == nil then return end
+    if battleLog.ended == true then return end
+    if obj.tag ~= "Card" and obj.type ~= "Card" then return end
+    local name = nil
+    pcall(function() name = obj.getName() end)
+    if name == nil or name == "" then return end
+    local json = nil
+    local ok = pcall(function() json = obj.getJSON() end)
+    if not ok or type(json) ~= "string" or json == "" then return end
+    if type(battleLog.secGrave) ~= "table" then battleLog.secGrave = {} end
+    battleLog.secGrave[name] = json
 end
 
 -- ForceOrg / yellowscribe stamps a live wound counter into the model nickname:
@@ -2125,7 +2156,11 @@ function battleSecondaryState()
                 end)
             end
         end
-        if #cards > 0 then out[color] = cards end
+        -- Recorded even when empty: battleRestoreSecondaries only clears a color's
+        -- slots for colors it finds a key for, so a color holding zero secondaries
+        -- at this moment still needs an entry here, or a rewind to this snapshot
+        -- would leave that color's currently-placed cards sitting in their slots.
+        out[color] = cards
     end
     return out
 end
@@ -2731,8 +2766,33 @@ function battleRestoreSecondaries(snap)
                     end
 
                     if hit == nil then
-                        table.insert(missing, color .. " slot " .. slotIndex ..
-                                              ": " .. entry.n)
+                        local json = (type(battleLog.secGrave) == "table") and battleLog.secGrave[entry.n] or nil
+                        if type(json) == "string" and json ~= "" then
+                            local idx = slotIndex
+                            pcall(function()
+                                spawnObjectJSON({
+                                    json = json,
+                                    position = target,
+                                    rotation = rot,
+                                    sound = false,
+                                    callback_function = function(card)
+                                        if card == nil then return end
+                                        assignSecondarySlotCard(color, idx, card)
+                                        Wait.frames(function()
+                                            pcall(function()
+                                                if card.is_face_down ~= wantFaceDown then
+                                                    card.flip()
+                                                end
+                                                card.locked = true
+                                            end)
+                                        end, 20)
+                                    end,
+                                })
+                            end)
+                        else
+                            table.insert(missing, color .. " slot " .. slotIndex ..
+                                                  ": " .. entry.n)
+                        end
                     elseif hit.obj ~= nil then
                         local found = hit.obj
                         pcall(function()
@@ -3042,6 +3102,7 @@ function restoreBattleLog(raw)
     if type(raw.names)  == "table" then log.names  = raw.names end
     if type(raw.gmap)   == "table" then log.gmap   = raw.gmap end
     if type(raw.grave)  == "string" then log.grave = raw.grave end
+    if type(raw.secGrave) == "table" then log.secGrave = raw.secGrave end
     log.ended = raw.ended == true
     -- The name pool's reverse lookup is derived, not saved; dropping it here has
     -- battleAddName rebuild it from log.names on first use after a load.
@@ -3102,6 +3163,7 @@ function onObjectDestroy(obj)
     -- The Red/Blue trash bins destroy by collision, so models binned that way
     -- arrive here like any other deletion.
     pcall(function() battleCaptureDestroyed(obj) end)
+    pcall(function() battleCaptureDestroyedSecondary(obj) end)
 end
 
 function onLoad(saved_data)
