@@ -1280,6 +1280,11 @@ function onSave()
         -- construction (roughly 400 KB for a full two-army game), so unlike the
         -- start menu restore point it is cheap to encode on every autosave.
         svBattleLog = battleLog,
+        -- A console dev override (battleSetReportMode / Global.setVar) survives
+        -- a reload. Deliberately not the token -- a session's override typed
+        -- into the console has no business leaking into a save file.
+        svBattleReportMode = BATTLE_REPORT_MODE,
+        svBattleReportBase = BATTLE_REPORT_REMOTE_BASE,
         svVersion = GAME_VERSION
     })
     --saved_data = ""
@@ -1356,7 +1361,37 @@ BATTLE_LOG_SCHEMA = 2
 BATTLE_MAX_MODELS = 400
 BATTLE_MAX_SNAPS  = 250
 BATTLE_MAX_NAMES  = 4000
+
+-- The local helper. Unchanged, and still the fast path: no cold start, and it
+-- hot-reloads the renderer between exports.
 BATTLE_REPORT_URL = "http://127.0.0.1:8787/report"
+
+-- The hosted renderer (scripts/battle_report_server.py --mode hosted, deployed
+-- via render.yaml). Baked at build time by scripts/compile.py; the empty
+-- defaults keep an uncompiled source build valid and local-only.
+BATTLE_REPORT_REMOTE_BASE = "" -- @@BATTLE_REPORT_REMOTE_BASE@@
+BATTLE_REPORT_TOKEN = "" -- @@BATTLE_REPORT_TOKEN@@
+
+-- "auto" probes the local helper first (no cold start, hot-reloads the
+-- renderer) and falls through to the hosted one if it's not there; "local" /
+-- "remote" force a single path. Runtime-overridable the same way BM_API_BASE
+-- is (battlemasterDynamicSpawner.ttslua), via battleSetReportMode() or a
+-- console Global.setVar, and persisted in onSave.
+BATTLE_REPORT_MODE = BATTLE_REPORT_MODE or "auto"
+BATTLE_REPORT_HEALTH = "/healthz"
+
+-- Per-attempt watchdog: exportBattleReport never depends on TTS's undocumented
+-- WebRequest timeout, since that could turn out to be shorter than a hosted
+-- server's wake time (see exportBattleReport's comment).
+BATTLE_EXPORT_TIMEOUT = 20
+-- Roughly 120s of probing across all six steps -- about double Render's own
+-- documented ~60s free-tier wake, in visible steps so the wait never looks
+-- dead. Tune against the real service once it is deployed.
+BATTLE_EXPORT_BACKOFF = {5, 10, 15, 20, 30, 40}
+
+-- Debounce for the EXPORT REPORT button: a mashed click must not launch a
+-- second upload while the first is still probing/posting/retrying.
+battleExportBusy = false
 
 -- GMNotes sentinels the rest of the mod uses for overlays, markers and mission
 -- cards. Anything carrying one of these is furniture, never a player model.
@@ -2416,32 +2451,275 @@ function battleManualCapture(playerColor)
     end)
 end
 
--- TTS cannot write files or launch processes, so the in-game export POSTs the log
--- to a small local helper (scripts/battle_report_server.py) which renders the HTML
--- and opens it. Failure is expected whenever that helper is not running, so it
--- must stay a soft, informative miss.
+-- TTS cannot write files or launch processes, so the in-game export POSTs the
+-- log to a renderer instead: the local helper (scripts/battle_report_server.py)
+-- when it is running, or the hosted one (Render, via BATTLE_REPORT_REMOTE_BASE)
+-- otherwise. Failure -- neither reachable -- is expected and must stay a soft,
+-- informative miss, same as before hosting existed.
+--
+-- Mirrors battlemasterDynamicSpawner.ttslua's getWebStatusCode: a field TTS has
+-- renamed before, and a rename that turns success into nil must not silently
+-- read as "the server is down".
+function battleWebStatusCode(request)
+    return tonumber(request.response_code) or tonumber(request.responseCode)
+        or tonumber(request.status_code) or tonumber(request.statusCode)
+        or tonumber(request.status) or 0
+end
+
+-- The seated player currently marked host, generalised over Player.getPlayers()
+-- so it finds the host regardless of seat colour (mirrors the Player[color].host
+-- idiom already used above, e.g. promotePlayers). Only the host's machine can
+-- ever issue WebRequest, so this is whose Steam id every export actually
+-- carries, whichever seat clicked the button.
+function battleHostSteamId()
+    for _, person in ipairs(Player.getPlayers()) do
+        if person.host then
+            return person.steam_id or ""
+        end
+    end
+    return ""
+end
+
+function battleReportHeaders()
+    local headers = {["Content-Type"] = "application/json"}
+    if BATTLE_REPORT_TOKEN ~= "" then
+        headers["X-LCT-Token"] = BATTLE_REPORT_TOKEN
+    end
+    local steamId = battleHostSteamId()
+    if steamId ~= "" then
+        headers["X-LCT-Steam-Id"] = steamId
+    end
+    return headers
+end
+
+-- base .. path, or "" when no hosted base is configured.
+function battleReportRemoteUrl(path)
+    if BATTLE_REPORT_REMOTE_BASE == "" then return "" end
+    return BATTLE_REPORT_REMOTE_BASE .. path
+end
+
+-- Ordered {label, reportUrl, healthUrl} endpoints to try, per BATTLE_REPORT_MODE.
+function battleReportEndpoints()
+    local endpoints = {}
+    if BATTLE_REPORT_MODE ~= "remote" then
+        table.insert(endpoints, {
+            label = "local", reportUrl = BATTLE_REPORT_URL,
+            healthUrl = (BATTLE_REPORT_URL:gsub("/report$", BATTLE_REPORT_HEALTH)),
+        })
+    end
+    if BATTLE_REPORT_MODE ~= "local" then
+        local remoteReport = battleReportRemoteUrl("/report")
+        if remoteReport ~= "" then
+            table.insert(endpoints, {
+                label = "hosted", reportUrl = remoteReport,
+                healthUrl = battleReportRemoteUrl(BATTLE_REPORT_HEALTH),
+            })
+        end
+    end
+    return endpoints
+end
+
 function exportBattleReport(playerColor)
     if battleLog == nil or battleLog.snaps == nil or #battleLog.snaps == 0 then
         printToColor("Battle log is empty - nothing to export yet.", playerColor, {1, 0.6, 0.2})
         return
     end
+    if battleExportBusy then
+        printToColor("Already exporting - hang on a moment.", playerColor, {1, 0.8, 0.3})
+        return
+    end
+    local endpoints = battleReportEndpoints()
+    if #endpoints == 0 then
+        printToColor("No report server configured. Run:  python3 scripts/battle_report_server.py",
+                     playerColor, {1, 0.5, 0.3})
+        return
+    end
+    battleExportBusy = true
+    battleProbeThenPost({endpoints = endpoints, endpointIndex = 1, attemptIndex = 0,
+                         playerColor = playerColor})
+end
+
+-- Probes /healthz (tens of bytes) before ever sending the battle log itself,
+-- so a sleeping or absent server fails fast instead of leaving an upload
+-- (up to a few MB, see the plan's payload-size table) hanging against TTS's
+-- undocumented WebRequest timeout -- and nothing large is ever sent twice. A
+-- 200 here triggers exactly one POST. Each attempt arms its own watchdog
+-- (BATTLE_EXPORT_TIMEOUT) rather than trusting that undocumented timeout to
+-- fire in any particular window; whichever settles first -- the real
+-- response or the watchdog -- wins, and the other is discarded.
+function battleProbeThenPost(state)
+    local endpoint = state.endpoints[state.endpointIndex]
+    local settled = false
+    WebRequest.get(endpoint.healthUrl, function(request)
+        if settled then return end
+        settled = true
+        if request.is_error or battleWebStatusCode(request) ~= 200 then
+            battleExportLadder(state)
+        else
+            battlePostReport(endpoint, state)
+        end
+    end)
+    Wait.time(function()
+        if settled then return end
+        settled = true
+        battleExportLadder(state)
+    end, BATTLE_EXPORT_TIMEOUT)
+end
+
+-- Retries the current endpoint through BATTLE_EXPORT_BACKOFF, printing a
+-- progress line at each step so the wait never looks dead, then falls through
+-- to the next configured endpoint, and finally to the soft-miss message once
+-- every endpoint has been tried. This is the whole cold-start story: no
+-- preemptive warming anywhere in the mod (see the plan's "Cold start" section)
+-- means this ladder -- run only because EXPORT REPORT was actually pressed --
+-- is what absorbs a sleeping Render instance's ~60s wake.
+function battleExportLadder(state)
+    state.attemptIndex = state.attemptIndex + 1
+    local delay = BATTLE_EXPORT_BACKOFF[state.attemptIndex]
+    if delay ~= nil then
+        local label = state.endpoints[state.endpointIndex].label
+        if state.attemptIndex == 1 then
+            printToColor("Report server (" .. label .. ") is waking up - this can take about a minute...",
+                         state.playerColor, {0.8, 0.8, 1})
+        else
+            printToColor("Still waiting on the " .. label .. " report server...",
+                         state.playerColor, {0.7, 0.7, 0.9})
+        end
+        Wait.time(function() battleProbeThenPost(state) end, delay)
+        return
+    end
+
+    state.endpointIndex = state.endpointIndex + 1
+    state.attemptIndex = 0
+    local nextEndpoint = state.endpoints[state.endpointIndex]
+    if nextEndpoint == nil then
+        battleExportBusy = false
+        printToColor("No report server reachable. Run:  python3 scripts/battle_report_server.py",
+                     state.playerColor, {1, 0.5, 0.3})
+        printToColor("Or export the save and run:  python3 scripts/export_battle_report.py <save.json>",
+                     state.playerColor, {1, 0.7, 0.4})
+        return
+    end
+    printToColor("Falling back to the " .. nextEndpoint.label .. " report server...",
+                 state.playerColor, {0.8, 0.8, 1})
+    battleProbeThenPost(state)
+end
+
+function battlePostReport(endpoint, state)
     local body = JSON.encode(battleLog)
-    printToColor("Sending battle report (" .. math.floor(#body / 1024) .. " KB)...",
-                 playerColor, {0.7, 0.8, 1})
-    WebRequest.custom(BATTLE_REPORT_URL, "POST", true, body,
-        {["Content-Type"] = "application/json"},
+    printToColor("Sending battle report (" .. math.floor(#body / 1024) .. " KB) to the " ..
+                 endpoint.label .. " server...", state.playerColor, {0.7, 0.8, 1})
+    local settled = false
+    WebRequest.custom(endpoint.reportUrl, "POST", true, body, battleReportHeaders(),
         function(request)
-            local failed = request.is_error or
-                           (request.response_code ~= nil and request.response_code ~= 200)
-            if failed then
-                printToColor("No local report server. Run:  python3 scripts/battle_report_server.py",
-                             playerColor, {1, 0.5, 0.3})
-                printToColor("Or export the save and run:  python3 scripts/export_battle_report.py <save.json>",
-                             playerColor, {1, 0.7, 0.4})
-            else
-                printToColor("Battle report opened in your browser.", playerColor, {0.4, 1, 0.4})
-            end
+            if settled then return end
+            settled = true
+            battleHandlePostResult(request, state)
         end)
+    Wait.time(function()
+        if settled then return end
+        settled = true
+        battleExportLadder(state)
+    end, BATTLE_EXPORT_TIMEOUT)
+end
+
+function battleHandlePostResult(request, state)
+    if request.is_error then
+        battleExportLadder(state)
+        return
+    end
+    local code = battleWebStatusCode(request)
+    if code == 503 then
+        -- The server is up but its store is full right now -- a different
+        -- situation from "server unreachable", and retrying immediately would
+        -- only add to the load that caused it.
+        battleExportBusy = false
+        printToColor("Report server is busy right now - try again in a few minutes.",
+                     state.playerColor, {1, 0.8, 0.3})
+        return
+    end
+    if code ~= 200 then
+        battleExportLadder(state)
+        return
+    end
+    local ok, result = pcall(function() return JSON.decode(request.text) end)
+    if not ok or type(result) ~= "table" or result.ok ~= true then
+        battleExportLadder(state)
+        return
+    end
+    battleExportBusy = false
+    battleDeliverReportUrl(result, state.playerColor)
+end
+
+-- The result reaches the table two ways: printToAll (ambient, visible to
+-- everyone, and the record that a report was made) and a Notebook tab (the
+-- workhorse -- bodies are real editable text fields, so a URL can be selected
+-- and copied, which chat in TTS does not allow; Notes sync to all clients and
+-- persist in the save, so a join-in-progress player gets the links too).
+function battleDeliverReportUrl(result, clicker)
+    battleWriteNotebookTab(result)
+    if result.mode == "local" then
+        printToAll("Battle report opened in the host's browser. Full links in the Battle Report notebook tab.",
+                   {0.4, 1, 0.4})
+        return
+    end
+    local expiresIn = tonumber(result.expires_in) or 0
+    local minutes = math.max(1, math.floor(expiresIn / 60 + 0.5))
+    printToAll("Battle report: " .. tostring(result.url or "") .. " - live ~" .. minutes ..
+               " min (sooner if busy or downloaded), anyone with the link can view it. " ..
+               "Full links in the Battle Report notebook tab.", {0.4, 1, 0.4})
+end
+
+-- Edits the tab in place (matched by title) so repeated exports don't spam
+-- new tabs. Worth knowing: the minute count below is a snapshot of what the
+-- server promised *at export time* -- it cannot account for someone else
+-- downloading the report afterwards and shortening its remaining life (see
+-- report_store.py's mark_downloaded), so it says "about" rather than
+-- promising an exact figure. Re-exporting is cheap once the service is warm.
+function battleWriteNotebookTab(result)
+    local title = "Battle Report"
+    local expiresIn = tonumber(result.expires_in) or 0
+    local minutes = math.max(1, math.floor(expiresIn / 60 + 0.5))
+    local body = "LCT Battle Report - " .. tostring(result.snapshots or "?") .. " snapshot(s)\n" ..
+        "Generated " .. os.date("%Y-%m-%d %H:%M") .. ". The view link is live for about " ..
+        minutes .. " more minute(s) - sooner if the server is busy, and it drops to under a " ..
+        "minute as soon as anyone uses the download link below.\n\n" ..
+        "View:      " .. tostring(result.url or "") .. "\n" ..
+        "Download:  " .. tostring(result.download_url or "") .. "\n\n" ..
+        "The downloaded file is self-contained - it keeps working offline, forever, after " ..
+        "the links above go dead. Anyone with a link can view the report, including both " ..
+        "players' names and army lists."
+
+    for _, tab in ipairs(Notes.getNotebookTabs() or {}) do
+        if tab.title == title then
+            Notes.editNotebookTab({index = tab.index, title = title, body = body})
+            return
+        end
+    end
+    Notes.addNotebookTab({title = title, body = body})
+end
+
+-- Runtime override, e.g. from the console:
+--   Global.call("battleSetReportMode", {mode = "remote", base = "http://192.168.1.50:8788"})
+-- A plain Global.setVar("BATTLE_REPORT_MODE", "remote") works too (same trick
+-- battlemasterDynamicSpawner.ttslua's BM_API_BASE uses) -- this wrapper just
+-- validates the mode and reports back what took effect. Mode and base persist
+-- across a save/load (see onSave/onLoad); the token deliberately does not, so
+-- a dev override typed into one session's console cannot leak into a save file.
+function battleSetReportMode(params)
+    params = params or {}
+    if params.mode ~= nil then
+        if params.mode == "local" or params.mode == "remote" or params.mode == "auto" then
+            BATTLE_REPORT_MODE = params.mode
+        else
+            log("battleSetReportMode: mode must be 'local', 'remote' or 'auto', got " ..
+                tostring(params.mode))
+        end
+    end
+    if params.base ~= nil then BATTLE_REPORT_REMOTE_BASE = tostring(params.base) end
+    if params.token ~= nil then BATTLE_REPORT_TOKEN = tostring(params.token) end
+    log("Battle report: mode=" .. BATTLE_REPORT_MODE .. " base=" ..
+        (BATTLE_REPORT_REMOTE_BASE ~= "" and BATTLE_REPORT_REMOTE_BASE or "(none)"))
 end
 
 
@@ -3236,6 +3514,8 @@ function onLoad(saved_data)
         packSelected = loaded_data.svPackSelected
         playerHudSettings = loaded_data.svPlayerHudSettings or playerHudSettings
         battleLog = restoreBattleLog(loaded_data.svBattleLog)
+        BATTLE_REPORT_MODE = loaded_data.svBattleReportMode or BATTLE_REPORT_MODE
+        BATTLE_REPORT_REMOTE_BASE = loaded_data.svBattleReportBase or BATTLE_REPORT_REMOTE_BASE
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         if packSelected then

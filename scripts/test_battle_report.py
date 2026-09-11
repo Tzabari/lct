@@ -656,6 +656,109 @@ class TestLuaWiringDeployment(unittest.TestCase):
         self.assertNotIn("~= table\n", body)
 
 
+class TestLuaWiringRemote(unittest.TestCase):
+    """The hosted path wired into global.ttslua: the compile-time marker,
+    the probe-then-post ladder, Steam-id headers, and -- the one that must
+    never regress -- that none of this ever fires before EXPORT is pressed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        cls.tools_src = TOOLS_LUA.read_text(encoding="utf-8", errors="replace")
+
+    @staticmethod
+    def _body(src, fn):
+        start = src.index(f"function {fn}(")
+        body = src[start:]
+        return body[:body.index("\nend")]
+
+    def test_report_url_matches_the_server_default_is_unaffected(self):
+        # Re-asserted here (it lives on TestLuaWiring) because it is the one
+        # invariant this whole feature must never disturb: the local loopback
+        # path is unchanged.
+        m = re.search(r'BATTLE_REPORT_URL\s*=\s*"([^"]+)"', self.src)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), f"http://127.0.0.1:{SRV.DEFAULT_PORT}{SRV.REPORT_PATH}")
+
+    def test_the_remote_base_marker_is_present_for_compile_py_to_bake(self):
+        self.assertIn("-- @@BATTLE_REPORT_REMOTE_BASE@@", self.src)
+        self.assertIn("-- @@BATTLE_REPORT_TOKEN@@", self.src)
+
+    def test_the_health_path_matches_the_server(self):
+        m = re.search(r'BATTLE_REPORT_HEALTH\s*=\s*"([^"]+)"', self.src)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), SRV.HEALTH_PATH)
+
+    def test_export_uses_the_backoff_ladder_and_a_busy_guard(self):
+        body = self._body(self.src, "exportBattleReport")
+        self.assertIn("battleExportBusy", body)
+        export_ladder = self._body(self.src, "battleExportLadder")
+        self.assertIn("BATTLE_EXPORT_BACKOFF", export_ladder)
+        self.assertIn("Wait.time", export_ladder)
+
+    def test_each_attempt_has_its_own_watchdog_not_a_shared_one(self):
+        # Never depend on TTS's undocumented WebRequest timeout -- each network
+        # attempt arms its own Wait.time so a slow/absent callback cannot hang
+        # the ladder.
+        for fn in ("battleProbeThenPost", "battlePostReport"):
+            body = self._body(self.src, fn)
+            self.assertIn("Wait.time", body)
+            self.assertIn("BATTLE_EXPORT_TIMEOUT", body)
+
+    def test_a_503_is_handled_distinctly_from_an_unreachable_server(self):
+        # The server being busy is not the same situation as the server being
+        # down; retrying immediately would only add to the load that caused it.
+        body = self._body(self.src, "battleHandlePostResult")
+        self.assertIn("503", body)
+        busy_branch = body[body.index("code == 503"):]
+        busy_branch = busy_branch[:busy_branch.index("return") + len("return")]
+        self.assertNotIn("battleExportLadder", busy_branch,
+                         "a 503 (busy) must not re-enter the retry ladder")
+
+    def test_the_result_reaches_chat_and_a_notebook_tab(self):
+        body = self._body(self.src, "battleDeliverReportUrl")
+        self.assertIn("printToAll", body)
+        self.assertIn("battleWriteNotebookTab", body)
+        notebook_body = self._body(self.src, "battleWriteNotebookTab")
+        self.assertIn("Notes.addNotebookTab", notebook_body)
+        self.assertIn("Notes.editNotebookTab", notebook_body)
+
+    def test_steam_id_is_sent_via_the_host_seat_not_the_clicker(self):
+        headers_body = self._body(self.src, "battleReportHeaders")
+        self.assertIn("X-LCT-Steam-Id", headers_body)
+        self.assertIn("battleHostSteamId", headers_body)
+        host_id_body = self._body(self.src, "battleHostSteamId")
+        self.assertIn(".host", host_id_body)
+        self.assertIn("Player.getPlayers", host_id_body)
+
+    def test_the_export_button_tooltip_mentions_the_hosted_path(self):
+        self.assertIn("hosted if configured", self.tools_src)
+
+    def test_the_mod_makes_no_background_requests(self):
+        """Pins "contact the server only on EXPORT" so a later edit cannot
+        quietly reintroduce a warm-up ping. This is the one that must never be
+        weakened -- see the plan's round-1 correction on this exact point."""
+        for fn in ("recordBattleSnapshot", "battleRegisterFromSelection",
+                  "battleClearArmy", "battleStartGame", "battleManualCapture"):
+            body = self._body(self.src, fn)
+            self.assertNotIn("WebRequest", body, f"{fn} must not call WebRequest")
+
+        # Every WebRequest call in the BATTLE LOG block lives in a function
+        # reachable only from exportBattleReport's own ladder.
+        allowed = {"battleProbeThenPost", "battlePostReport"}
+        for fn in allowed:
+            self.assertIn("WebRequest", self._body(self.src, fn))
+        section_start = self.src.index("function battleWebStatusCode(")
+        section_end = self.src.index("\nfunction battleSetReportMode(")
+        section = self.src[section_start:section_end]
+        # Every function in this section that calls WebRequest must be one of
+        # the allowed two -- a stray third call site would be a regression.
+        for fn_match in re.finditer(r"function (\w+)\(.*?\n(.*?)\nend", section, re.S):
+            name, body = fn_match.group(1), fn_match.group(2)
+            if "WebRequest" in body:
+                self.assertIn(name, allowed, f"unexpected WebRequest call in {name}")
+
+
 class TestReportServer(unittest.TestCase):
     """The server is left running for a whole game, and across edits to the
     renderer while the report is being worked on."""
