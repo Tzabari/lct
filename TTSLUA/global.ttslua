@@ -1363,12 +1363,15 @@ BATTLE_MAX_SNAPS  = 250
 BATTLE_MAX_NAMES  = 4000
 
 -- The local helper. Unchanged, and still the fast path: no cold start, and it
--- hot-reloads the renderer between exports.
+-- hot-reloads the renderer between exports. Lives in the separate
+-- lct-report-server repo (run its battle_report_server.py with no --mode
+-- flag) -- this mod has no Python server code of its own.
 BATTLE_REPORT_URL = "http://127.0.0.1:8787/report"
 
--- The hosted renderer (scripts/battle_report_server.py --mode hosted, deployed
--- via render.yaml). Baked at build time by scripts/compile.py; the empty
--- defaults keep an uncompiled source build valid and local-only.
+-- The hosted renderer -- same script as the local helper above, run with
+-- --mode hosted and deployed via lct-report-server's render.yaml. Baked at
+-- build time by scripts/compile.py; the empty defaults keep an uncompiled
+-- source build valid and local-only.
 BATTLE_REPORT_REMOTE_BASE = "" -- @@BATTLE_REPORT_REMOTE_BASE@@
 BATTLE_REPORT_TOKEN = "" -- @@BATTLE_REPORT_TOKEN@@
 
@@ -2452,10 +2455,11 @@ function battleManualCapture(playerColor)
 end
 
 -- TTS cannot write files or launch processes, so the in-game export POSTs the
--- log to a renderer instead: the local helper (scripts/battle_report_server.py)
--- when it is running, or the hosted one (Render, via BATTLE_REPORT_REMOTE_BASE)
--- otherwise. Failure -- neither reachable -- is expected and must stay a soft,
--- informative miss, same as before hosting existed.
+-- log to a renderer instead: the local helper (battle_report_server.py, from
+-- the separate lct-report-server repo) when it is running, or the hosted one
+-- (Render, via BATTLE_REPORT_REMOTE_BASE) otherwise. Failure -- neither
+-- reachable -- is expected and must stay a soft, informative miss, same as
+-- before hosting existed.
 --
 -- Mirrors battlemasterDynamicSpawner.ttslua's getWebStatusCode: a field TTS has
 -- renamed before, and a rename that turns success into nil must not silently

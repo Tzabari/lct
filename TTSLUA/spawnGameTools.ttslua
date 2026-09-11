@@ -74,13 +74,13 @@ local exportBtnR = {
     label=exportBtnLbl, click_function="exportReport", function_owner=self,
     position={XposHideArmy-2*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
     height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
-    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  python3 scripts/battle_report_server.py"
+    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  see the lct-report-server repo"
 }
 local exportBtnB = {
     label=exportBtnLbl, click_function="exportReport", function_owner=self,
     position={XposHideArmy+Xoffset-2*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
     height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
-    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  python3 scripts/battle_report_server.py"
+    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  see the lct-report-server repo"
 }
 
 local endGameBtnLbl = "END GAME\nopen rewind"

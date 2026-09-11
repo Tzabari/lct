@@ -11,7 +11,8 @@ It writes report/report.html (per-phase top-down boards) and report/snapshots.js
 (the full reconstruction, and the stable interface for any future in-game viewer).
 
 This path always works and needs nothing running. The in-game EXPORT REPORT button
-is the convenience alternative and uses battle_report_server.py instead.
+is the convenience alternative and uses battle_report_server.py instead -- that
+script lives in the separate lct-report-server repo, not here.
 """
 
 import argparse

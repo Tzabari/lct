@@ -70,9 +70,10 @@ BM_MAT_RANDOMIZER_ENABLED = False
 LCT_MAT_RANDOMIZER_ENABLED = False
 GLOBAL_LUA = "global.ttslua"
 
-# The hosted battle-report renderer (render.yaml). A --test build always bakes
-# "" instead (see bake_battle_report_endpoint) so local iteration never talks
-# to the real deployed service by accident.
+# The hosted battle-report renderer -- lives in the separate lct-report-server
+# repo (its render.yaml is what actually deploys it). A --test build always
+# bakes "" instead (see bake_battle_report_endpoint) so local iteration never
+# talks to the real deployed service by accident.
 BATTLE_REPORT_REMOTE_BASE = "https://lct-report.onrender.com"
 
 # The Battlemaster dynamic spawner bakes the canonical map-card machinery into
@@ -434,8 +435,9 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
 
     Set LCT_REPORT_BAKE_IN_TEST=1 to opt a --test build out of that and bake a
     real base/token anyway -- for rehearsing the hosted path (e.g. against a
-    LAN-bound `battle_report_server.py --mode hosted`) without needing the
-    in-game console. LCT_REPORT_REMOTE_BASE overrides BATTLE_REPORT_REMOTE_BASE
+    LAN-bound `battle_report_server.py --mode hosted`, run from the separate
+    lct-report-server repo) without needing the in-game console.
+    LCT_REPORT_REMOTE_BASE overrides BATTLE_REPORT_REMOTE_BASE
     above when set, so that rehearsal can point at a LAN address instead of the
     real deployed service. Neither variable does anything without the other:
     a plain --test build stays local-only by default.

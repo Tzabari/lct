@@ -5,8 +5,11 @@ The in-game Battle Log (see the BATTLE LOG section of TTSLUA/global.ttslua)
 accumulates one snapshot per phase into Global's saved state. This module turns
 that structure into a readable report and is shared by both front ends:
 
-  * export_battle_report.py  -- offline, reads an exported TTS save
-  * battle_report_server.py  -- localhost helper the in-game EXPORT button POSTs to
+  * export_battle_report.py  -- offline, reads an exported TTS save (this repo)
+  * battle_report_server.py  -- the in-game EXPORT button POSTs to this, run
+                                 locally or hosted -- lives in the separate
+                                 lct-report-server repo, which keeps its own
+                                 copy of this file
 
 Coordinates are TTS world units, which are inches on this table (1 unit = 1").
 The board is centred on the origin, so x spans [-w/2, +w/2] and z spans

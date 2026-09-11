@@ -56,16 +56,18 @@ The tooling is standard-library only. Create the environment once:
 uv venv .venv
 ```
 
-Then either leave the helper running while you play and use the in-game button
-(it re-reads the renderer on every export, so edits to `battle_report.py` take
-effect without restarting it):
+Then either leave the helper running while you play and use the in-game button —
+it's `battle_report_server.py` from the separate
+[`lct-report-server`](https://github.com/Tzabari/lct-report-server) repo (it re-reads
+the renderer on every export, so edits there take effect without restarting it):
 
 ```bash
 .venv/Scripts/python.exe scripts/battle_report_server.py     # Windows
 .venv/bin/python scripts/battle_report_server.py             # macOS / Linux
 ```
 
-...or skip the server entirely, save the game in TTS, and render the exported save:
+...or skip the server entirely, save the game in TTS, and render the exported save
+(this one script *does* live here — it needs no server, hosted or local, at all):
 
 ```bash
 .venv/Scripts/python.exe scripts/export_battle_report.py            # newest TTS save
@@ -153,44 +155,39 @@ count on an unscripted model (no datasheet popup) still comes back correctly. A
 model that is alive now but was already dead at the moment you rewind to goes back
 into the bag; rewinding forward past its death takes it back out.
 
-#### Hosting the report server (Render, free tier)
+#### Hosting the report server
 
-The local helper above only works for whoever is running it. `scripts/battle_report_server.py`
-also runs in a **hosted** mode (`--mode hosted`, or `$LCT_REPORT_MODE=hosted`) that binds every
-interface, writes nothing to disk, and answers with a short `/r/<id>` view link and a `/d/<id>`
-download link instead of a local file path — this is what `render.yaml` deploys to
-[Render](https://render.com)'s free tier.
+The server behind EXPORT REPORT — both the local helper above and the hosted, Render-deployed
+version — lives in its own repo, [`lct-report-server`](https://github.com/Tzabari/lct-report-server),
+not here. That split is deliberate: it lets Render deploy from a small, fast-cloning repo instead
+of this one's full history, and it keeps a public-facing service's code apart from everything else
+the mod ships. This repo has no Python HTTP server code of its own.
 
-- **No preemptive traffic.** The mod contacts the server only when EXPORT REPORT is pressed —
-  nothing during setup, registration or play. That costs nothing from Render's 750 free
-  instance-hours/month, but means the *first* export after 15 minutes idle pays Render's own
-  ~60-second container wake. The export button probes `GET /healthz` first and retries with
-  backoff (`BATTLE_EXPORT_BACKOFF` in `global.ttslua`) rather than trusting TTS's undocumented
-  `WebRequest` timeout.
-- **No persistent disk on the free tier**, so hosted reports live in memory
-  (`scripts/report_store.py`) behind a TTL — 15 minutes by default (`LCT_REPORT_TTL`), shortened
-  automatically once the store is busy, and capped to a minute after someone uses the download
-  link. A full store answers `503` rather than evicting anyone's live report. The **download**
-  link is what makes this acceptable: the page is fully self-contained, so a downloaded copy
-  keeps working offline, forever, after the ephemeral link dies.
-- **Runtime data is tiny.** The service only ever reads `data/terrain_cache.json` (1.04 MB) and
-  `data/plate_outlines.json` (7 KB) — never the 26 MB of raw payloads in `data/maps/`. Rebuild the
-  cache after touching a map's payload:
+What stays here, on the TTS side:
+
+- **The Lua wiring** (`TTSLUA/global.ttslua`) — `BATTLE_REPORT_URL` (the loopback default),
+  `BATTLE_REPORT_REMOTE_BASE`/`BATTLE_REPORT_TOKEN` (baked at build time, see below), the
+  probe-then-post retry ladder (`BATTLE_EXPORT_BACKOFF`), and delivery of the resulting links to
+  chat and a notebook tab.
+- **The compile-time bake** (`scripts/compile.py`'s `bake_battle_report_endpoint`) — writes the
+  hosted service's URL and a shared `LCT_REPORT_TOKEN` into the compiled mod. A `--test` build
+  bakes an empty base by default (local-only); set `LCT_REPORT_BAKE_IN_TEST=1` plus
+  `LCT_REPORT_REMOTE_BASE` to rehearse against a LAN-bound instance without the in-game console.
+- **The terrain cache** (`data/terrain_cache.json`, `scripts/bake_terrain_cache.py`) — this is the
+  one piece of data the server repo actually needs from here, since it's derived from
+  `data/maps/`'s raw payloads (26 MB, mod-only). Rebuild it after touching a map's payload:
   ```bash
   python3 scripts/bake_terrain_cache.py            # write data/terrain_cache.json
   python3 scripts/bake_terrain_cache.py --check    # exit 1 if stale (also run as a unit test)
   ```
-  `scripts/sync_battlemaster_maps.py` rebakes it automatically as a post-write check.
-- **Auth is a deterrent, not a boundary.** POST requires a shared token (`X-LCT-Token`, baked
-  into the mod at compile time by `LCT_REPORT_TOKEN`) and is rate-limited per client IP and,
-  when the mod sends `X-LCT-Steam-Id`, per the table host's Steam id as well — both budgets must
-  allow. All three signals are attacker-controlled (a publicly distributed mod, a rotatable IP),
-  so none of this is authentication; it raises the cost of casual abuse rather than claiming to
-  stop a targeted one. Reports are unlisted, not private — anyone with a link can view it.
+  `scripts/sync_battlemaster_maps.py` rebakes it automatically as a post-write check. Getting the
+  result into `lct-report-server` is a **manual copy**, done deliberately — see that repo's
+  README for the deploy-time steps and its own env-var/auth/TTL documentation.
 
-To run the LAN rehearsal that exercises this whole path with nothing deployed (Step 8 of the
-plan): run the server in hosted mode bound to your machine's LAN address, point the mod at it
-from the in-game console (`Global.setVar("BATTLE_REPORT_REMOTE_BASE", "http://<lan-ip>:<port>")`,
+To run the LAN rehearsal that exercises the whole path with nothing deployed to Render: clone
+`lct-report-server`, run its `battle_report_server.py` in hosted mode bound to your machine's LAN
+address, point this mod at it from the in-game console
+(`Global.setVar("BATTLE_REPORT_REMOTE_BASE", "http://<lan-ip>:<port>")`,
 `Global.setVar("BATTLE_REPORT_MODE", "remote")`), and export as normal.
 
 ### Validation
