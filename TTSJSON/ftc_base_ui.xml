@@ -405,9 +405,10 @@ rectAlignment="UpperRight" offsetXY="-167 0" color="rgba(0,0,0,0)" allowDragging
       <Button id="RedHud_RewindPhase5" text="Fight" fontSize="26" fontStyle="Bold" textColor="#FFFFFF" colors="#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55" preferredWidth="200" minWidth="200" roundEdges="true" outline="#2a2a4aCC" outlineSize="3" onClick="hudRewindPhase"/>
     </HorizontalLayout>
     <Text id="RedHud_RewindStatus" text="Pick a round, player and phase." fontSize="28" color="#FFFFFFAA" alignment="MiddleCenter" preferredHeight="60" flexibleHeight="0"/>
-    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="40" padding="120 120 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
-      <Button id="RedHud_RewindGo" text="REWIND" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
-      <Button id="RedHud_RewindEnd" text="RETURN TO END" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
+    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="26" padding="60 60 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
+      <Button id="RedHud_RewindGo" text="REWIND" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
+      <Button id="RedHud_RewindNext" text="NEXT PHASE" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#2A4A7AE6|#3F6FA5E6|#1D3356|#1A1A2A55" roundEdges="true" outline="#6FA8E0CC" outlineSize="3" onClick="hudRewindNext" tooltip="Step forward to the next recorded phase"/>
+      <Button id="RedHud_RewindEnd" text="RETURN TO END" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
     </HorizontalLayout>
   </VerticalLayout>
 </Panel>
@@ -438,9 +439,10 @@ rectAlignment="UpperRight" offsetXY="-167 0" color="rgba(0,0,0,0)" allowDragging
       <Button id="BlueHud_RewindPhase5" text="Fight" fontSize="26" fontStyle="Bold" textColor="#FFFFFF" colors="#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55" preferredWidth="200" minWidth="200" roundEdges="true" outline="#2a2a4aCC" outlineSize="3" onClick="hudRewindPhase"/>
     </HorizontalLayout>
     <Text id="BlueHud_RewindStatus" text="Pick a round, player and phase." fontSize="28" color="#FFFFFFAA" alignment="MiddleCenter" preferredHeight="60" flexibleHeight="0"/>
-    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="40" padding="120 120 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
-      <Button id="BlueHud_RewindGo" text="REWIND" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
-      <Button id="BlueHud_RewindEnd" text="RETURN TO END" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
+    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="26" padding="60 60 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
+      <Button id="BlueHud_RewindGo" text="REWIND" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
+      <Button id="BlueHud_RewindNext" text="NEXT PHASE" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#2A4A7AE6|#3F6FA5E6|#1D3356|#1A1A2A55" roundEdges="true" outline="#6FA8E0CC" outlineSize="3" onClick="hudRewindNext" tooltip="Step forward to the next recorded phase"/>
+      <Button id="BlueHud_RewindEnd" text="RETURN TO END" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
     </HorizontalLayout>
   </VerticalLayout>
 </Panel>
@@ -471,9 +473,10 @@ rectAlignment="UpperRight" offsetXY="-167 0" color="rgba(0,0,0,0)" allowDragging
       <Button id="GreyHud_RewindPhase5" text="Fight" fontSize="26" fontStyle="Bold" textColor="#FFFFFF" colors="#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55" preferredWidth="200" minWidth="200" roundEdges="true" outline="#2a2a4aCC" outlineSize="3" onClick="hudRewindPhase"/>
     </HorizontalLayout>
     <Text id="GreyHud_RewindStatus" text="Pick a round, player and phase." fontSize="28" color="#FFFFFFAA" alignment="MiddleCenter" preferredHeight="60" flexibleHeight="0"/>
-    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="40" padding="120 120 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
-      <Button id="GreyHud_RewindGo" text="REWIND" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
-      <Button id="GreyHud_RewindEnd" text="RETURN TO END" fontSize="38" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
+    <HorizontalLayout preferredHeight="110" flexibleHeight="0" spacing="26" padding="60 60 0 0" childForceExpandWidth="true" childForceExpandHeight="true">
+      <Button id="GreyHud_RewindGo" text="REWIND" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#1F7A32E6|#2FA54AE6|#14561F|#1A1A2A55" roundEdges="true" outline="#5FD47ECC" outlineSize="3" onClick="hudRewindGo" tooltip="Put the table back to the selected moment"/>
+      <Button id="GreyHud_RewindNext" text="NEXT PHASE" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#2A4A7AE6|#3F6FA5E6|#1D3356|#1A1A2A55" roundEdges="true" outline="#6FA8E0CC" outlineSize="3" onClick="hudRewindNext" tooltip="Step forward to the next recorded phase"/>
+      <Button id="GreyHud_RewindEnd" text="RETURN TO END" fontSize="32" fontStyle="Bold" textColor="#FFFFFF" colors="#7A5A14E6|#A5842FE6|#563E0D|#1A1A2A55" roundEdges="true" outline="#D4B060CC" outlineSize="3" onClick="hudRewindEnd" tooltip="Put the table back to the end of the game"/>
     </HorizontalLayout>
   </VerticalLayout>
 </Panel>

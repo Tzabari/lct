@@ -2929,6 +2929,40 @@ BATTLE_REWIND_OFF = "#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55"
 -- have a snapshot. A game that ended mid-round, or one where someone pressed
 -- CAPTURE by hand, leaves gaps -- greying them out is more honest than letting
 -- a player press a button that can only refuse.
+-- The round/turn/phase combination that comes after the current selection in
+-- play order (Round 1..5, Red then Blue each round, Phase 1..5), skipping any
+-- combination nothing was ever recorded for. Returns r, t, p, or nil if the
+-- selection is already at (or past) the last recorded moment. Pure query --
+-- callers decide whether to just look or to act on it.
+function battleRewindNextSelection()
+    local turns = {"Red", "Blue"}
+    local combos = {}
+    for r = 1, BATTLE_REWIND_ROUNDS do
+        for _, turn in ipairs(turns) do
+            for p = 1, BATTLE_REWIND_PHASES do
+                table.insert(combos, {r = r, t = turn, p = p})
+            end
+        end
+    end
+
+    local sel = battleRewindSel
+    local at = 0
+    for i, c in ipairs(combos) do
+        if c.r == sel.r and c.t == sel.t and c.p == sel.p then
+            at = i
+            break
+        end
+    end
+
+    for i = at + 1, #combos do
+        local c = combos[i]
+        if battleFindSnapshot(c.r, c.t, c.p) ~= nil then
+            return c.r, c.t, c.p
+        end
+    end
+    return nil
+end
+
 function battleRefreshRewindOverlay()
     local sel = battleRewindSel
 
@@ -2981,6 +3015,10 @@ function battleRefreshRewindOverlay()
     setHudAttribute({id = "RewindGo", attr = "interactable",
                      value = idx ~= nil and "true" or "false"})
 
+    local nextR = battleRewindNextSelection()
+    setHudAttribute({id = "RewindNext", attr = "interactable",
+                     value = nextR ~= nil and "true" or "false"})
+
     local status
     if idx == nil then
         status = "Nothing was recorded at that point."
@@ -3032,6 +3070,21 @@ end
 
 function hudRewindGo(player, value, id)
     battleRewindToSelection(getHudColorFromCallback(player, id))
+end
+
+-- Steps the selection forward to the next recorded phase and rewinds straight
+-- to it, so reviewing a game is a run of single clicks rather than re-picking
+-- round/player/phase by hand each time.
+function hudRewindNext(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local r, t, p = battleRewindNextSelection()
+    if r == nil then
+        printToColor("Already at the last recorded phase.", color, {1, 0.6, 0.2})
+        return
+    end
+    battleRewindSel.r, battleRewindSel.t, battleRewindSel.p = r, t, p
+    battleRefreshRewindOverlay()
+    battleRewindToSelection(color)
 end
 
 function hudRewindEnd(player, value, id)
