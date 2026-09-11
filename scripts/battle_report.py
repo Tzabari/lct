@@ -16,7 +16,13 @@ The board is centred on the origin, so x spans [-w/2, +w/2] and z spans
 import html
 import json
 import re
+import sys
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import map_terrain
 
 SCHEMA_VERSION = 1
 
@@ -30,74 +36,11 @@ DEAD_EDGE = "#6f6f78"
 # Terrain tags that describe the table surface rather than a piece of terrain.
 SURFACE_TAGS = {"battlemaster_battlemat"}
 
-# How the board is colour-coded, following the map's own scheme: grey outlines for
-# the terrain AREAS, yellow for light terrain, green for dense.
-#
-# The split is not guesswork and is deliberately not derived from the tag name.
-# Battlemaster writes each piece's material into its Description -- "Dense",
-# "Light", or the mixed "Tower = Dense / Walls = Light" -- in applyRuinPartMetadata
-# (TTSLUA/battlemasterDynamicSpawner.ttslua), and the names would mislead: Corner
-# and the barriers are Light while Generator and Pipes are Dense.
+# What the board view draws. Terrain AREAS -- the flat plates the ruins stand on --
+# are drawn as grey outlines; the ruins themselves are not drawn at all for now.
 KIND_SURFACE = "surface"
 KIND_AREA = "area"
-KIND_LIGHT = "light"
-KIND_DENSE = "dense"
 KIND_OBJECTIVE = "objective"
-
-# Terrain areas are outline meshes named battlemaster-rugged-NN-<shape>-5mm-border,
-# and captureBoard stores that <shape> word. They carry no material Description,
-# which is what separates an area from the terrain standing inside it.
-AREA_SHAPES = {"shortline", "smallrect", "longline", "bigrect", "triangle"}
-
-# Exact footprint of each terrain plate, in inches, relative to the object's own
-# origin -- so a piece draws as the shape the mission diagram prints rather than as
-# the box its bounds imply.
-#
-# Two things make the captured bounds the wrong thing to draw. The rugged meshes
-# bulge past their nominal footprint (the long line measures 3.63" deep against an
-# authored 2.5"), and the plate the maps call a "triangle" is really a right
-# trapezoid, which no bounding box describes at all.
-#
-# Derived offline from Battlemaster's own plate meshes at
-# https://assets.battlemaster.online/tts/terrain-plates/v1/
-# battlemaster-rugged-<plate>-5mm-border.obj, taking each authored width/height
-# from TERRAIN_ASSETS in scripts/battlemaster_reconstruct.py and expressing it
-# against the mesh bounding-box centre, which is where TTS puts the object origin.
-# The trapezoid's four corners were confirmed against real vertices in that mesh.
-PLATE_OUTLINES = {
-    "shortline": [(3.001, -1.075), (-3.002, -1.075), (-3.002, 0.928), (3.001, 0.928)],
-    "smallrect": [(2.745, -2.142), (-3.258, -2.142), (-3.258, 1.861), (2.745, 1.861)],
-    "longline": [(5.002, -1.263), (-5.001, -1.263), (-5.001, 1.24), (5.002, 1.24)],
-    "bigrect": [(5.752, -3.773), (-5.751, -3.773), (-5.751, 3.23), (5.752, 3.23)],
-    "triangle": [(5.932, -4.0), (5.932, -2.0), (-5.571, 4.003), (-5.571, -4.0)],
-}
-
-# What each plate mesh actually measures, from the same five meshes. This is for
-# logs recorded before the plate name was captured: the boxes are far enough apart
-# that one identifies its plate unambiguously, so an older log still draws real
-# footprints instead of these oversized boxes.
-PLATE_BOUNDS = {
-    "shortline": (6.000, 2.739),
-    "smallrect": (6.510, 4.284),
-    "longline": (10.000, 3.628),
-    "bigrect": (11.500, 7.542),
-    "triangle": (11.862, 8.000),
-}
-# Captured extents are rounded to 2dp, so this only has to absorb rounding; it is
-# an order of magnitude smaller than the closest gap between two plates.
-PLATE_BOUNDS_TOLERANCE = 0.15
-
-# Material by terrain tag, for logs recorded before captureBoard stored the
-# Description. Not guesswork either: this is the mapping every shipped map in
-# data/maps uses, and test_battle_report checks it against them. It is also the
-# clearest illustration of why the names cannot be reasoned about -- Corner and the
-# barriers are Light, while Generator and Pipes are Dense.
-LEGACY_TERRAIN_MATERIAL = {
-    "AB": KIND_DENSE, "CO": KIND_DENSE, "EF": KIND_DENSE, "GH": KIND_DENSE,
-    "Generator": KIND_DENSE, "Pipes": KIND_DENSE, "Tower": KIND_DENSE,
-    "Corner": KIND_LIGHT, "Long Barrier": KIND_LIGHT, "Short Barrier": KIND_LIGHT,
-    "Small L": KIND_LIGHT, "Small L flip": KIND_LIGHT,
-}
 
 # A piece covering this much of the board in both axes is the table itself. The
 # battlemat is not always tagged -- a good number of the shipped maps leave it
@@ -234,12 +177,12 @@ def board_size(log):
 
 
 def classify_terrain(piece, board=None):
-    """Which of the five kinds of board object a captured piece is.
+    """Which kind of board object a captured piece is.
 
-    Order matters. The material Description is the authority wherever it exists;
-    everything below it is a fallback for objects Battlemaster did not place, and
-    for logs recorded before the Description and mesh shape were captured -- those
-    still have to render, so nothing here depends on the newer fields.
+    Only two of these are drawn now. Terrain geometry comes from the map's shipped
+    payload (see map_terrain), not from the capture, so this no longer has to
+    identify plates or work out materials -- it only has to find the objective
+    markers and keep the table surface from being drawn as a board-sized slab.
     """
     tags = [str(t) for t in (piece.get("t") or [])]
     if any(t in SURFACE_TAGS for t in tags):
@@ -249,34 +192,12 @@ def classify_terrain(piece, board=None):
         if ((piece.get("bx") or 0) * 2 >= w * SURFACE_SPAN
                 and (piece.get("bz") or 0) * 2 >= h * SURFACE_SPAN):
             return KIND_SURFACE
-
-    desc = (piece.get("d") or "").lower()
-    # A mixed piece ("Tower = Dense, Walls = Light") reads as dense: the tower is
-    # the part that blocks, and that is the more useful thing to see on a board.
-    if "dense" in desc or "heavy" in desc:
-        return KIND_DENSE
-    if "light" in desc:
-        return KIND_LIGHT
-
-    if piece.get("sh") in AREA_SHAPES:
-        return KIND_AREA
-    # An obj_* tag marks the outline drawn around an objective, which is an area.
-    # The objective marker itself is a separate, untagged object that says so in
-    # its nickname ("Home Objective", "Center Objective").
-    if any(t.startswith("obj_") for t in tags):
-        return KIND_AREA
+    # The physical objective markers are spawned separately from the map payload,
+    # so the capture is the only place they exist. They say what they are in their
+    # nickname ("Home Objective", "Center Objective", "Expansion Objective").
     if "objective" in (piece.get("n") or "").lower():
         return KIND_OBJECTIVE
-    # A named terrain feature from a build that predates the Description capture:
-    # fall back to the material every shipped map gives that tag. A piece carrying
-    # both (the "Short Barrier, Tower" combo) reads dense, which is what its own
-    # Description says: "Tower = Dense / Walls = Light".
-    mats = {LEGACY_TERRAIN_MATERIAL[t] for t in tags if t in LEGACY_TERRAIN_MATERIAL}
-    if mats:
-        return KIND_DENSE if KIND_DENSE in mats else KIND_LIGHT
-    # Unknown terrain from some other source. Dense is the safer default: it reads
-    # as blocking, which is the assumption that loses the least on a battle map.
-    return KIND_DENSE if tags else KIND_AREA
+    return KIND_AREA
 
 
 def terrain_label(piece):
@@ -287,25 +208,10 @@ def terrain_label(piece):
     # ("Short Barrier, Tower"), and naming only the first hides why it is dense.
     name = " / ".join(str(t) for t in tags) if tags else (piece.get("n") or "").strip()
     if not name:
-        name = piece.get("sh") or "terrain area"
+        name = "terrain area"
     desc = " / ".join(part.strip() for part in (piece.get("d") or "").splitlines()
                       if part.strip())
     return f"{name} - {desc}" if desc else name
-
-
-def infer_plate(piece):
-    """Which terrain plate a captured bounding box belongs to, or None.
-
-    Only meaningful for pieces already known to be areas -- the plates are the
-    areas -- and only needed for logs that predate the plate name being captured.
-    """
-    box_w = (piece.get("bx") or 0) * 2
-    box_h = (piece.get("bz") or 0) * 2
-    for name, (plate_w, plate_h) in PLATE_BOUNDS.items():
-        if (abs(box_w - plate_w) <= PLATE_BOUNDS_TOLERANCE
-                and abs(box_h - plate_h) <= PLATE_BOUNDS_TOLERANCE):
-            return name
-    return None
 
 
 def _board_pieces(log, w, h):
@@ -321,10 +227,24 @@ def _board_pieces(log, w, h):
         entry = dict(piece)
         entry["kind"] = classify_terrain(piece, (w, h))
         entry["label"] = terrain_label(piece)
-        if entry["kind"] == KIND_AREA and not entry.get("sh"):
-            entry["sh"] = infer_plate(piece)
         out.append(entry)
     return out
+
+
+def map_plates(log):
+    """Exact terrain outlines for the map this log was recorded on, or None.
+
+    None means the map could not be resolved -- a Combat Patrol map, whose one-off
+    meshes are out of scope, or a log with no map recorded. The caller draws no
+    terrain in that case rather than falling back to boxes: a board missing some of
+    its terrain reads as a map with less terrain on it, which is worse than a board
+    that says it could not draw any.
+    """
+    guid = (log.get("game") or {}).get("mapGuid")
+    try:
+        return map_terrain.map_terrain(guid)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _objective_anchors(pieces):
@@ -476,11 +396,21 @@ def build_report(log):
         }
     game = log.get("game") or {}
     pieces = _board_pieces(log, w, h)
+    # Terrain comes from the map's shipped payload, which is exact; the capture is
+    # still what supplies the objective markers, which the payload does not hold.
+    resolved = map_plates(log)
+    if resolved is not None:
+        terrain = resolved["plates"]
+        if resolved["board"]:
+            w, h = resolved["board"]
+    else:
+        terrain = []
     return {
         "schema": SCHEMA_VERSION,
         "game": game,
         "deployment": game.get("deploy"),
-        "board": {"width": w, "height": h, "terrain": pieces,
+        "board": {"width": w, "height": h, "terrain": terrain,
+                  "terrain_known": resolved is not None,
                   "objectives": _objective_anchors(pieces)},
         "units": units,
         "roster": log.get("roster") or {},
@@ -569,13 +499,9 @@ ul.list li:last-child { border-bottom: 0; }
    font size below is an inch measurement, not pixels. A 32mm base is ~0.63in
    across, which is the scale these numbers are chosen against. */
 .mat { fill: #1d2434; stroke: #38455f; stroke-width: 0.18; }
-/* The map's own colour coding: grey outlines are the terrain AREAS, and the
-   pieces standing inside them are yellow when Light and green when Dense. Fills
-   stay near-transparent so overlapping pieces and the models on top of them all
-   stay readable. */
+/* Terrain areas, in the map's own grey. The fill stays near-transparent so
+   overlapping plates and the models standing on them all stay readable. */
 .t-area  { fill: #8e9bb114; stroke: #97a3b8; stroke-width: 0.08; }
-.t-light { fill: #e8c53a24; stroke: #e8c53a; stroke-width: 0.09; }
-.t-dense { fill: #4cc98722; stroke: #4cc987; stroke-width: 0.1; }
 .objective { fill: #d8b45a33; stroke: #d8b45a; stroke-width: 0.1; }
 .quarter { stroke: #ffffff; stroke-width: 0.07; opacity: .4; }
 .territory { stroke: #ffd479; stroke-width: 0.11; opacity: .85; }
@@ -598,14 +524,7 @@ ul.list li:last-child { border-bottom: 0; }
 .key i { width: 11px; height: 8px; border-radius: 2px; display: inline-block;
          border: 1px solid currentColor; }
 .key .area  { color: #97a3b8; background: #8e9bb133; }
-.key .light { color: #e8c53a; background: #e8c53a33; }
-.key .dense { color: #4cc987; background: #4cc98733; }
-
-/* The mission's layout-art card, shown as the deployment view. It is a diagram,
-   not a background: nothing is drawn over it, so it needs no crop or alignment. */
-.art { position: absolute; inset: 4px; display: none; }
-.art.on { display: block; }
-.art img { width: 100%; height: 100%; object-fit: contain; }
+.key .note { color: var(--dim); font-size: 11px; }
 """
 
 
@@ -621,9 +540,7 @@ def render_html(report, show_labels=True):
         "board": report["board"],
         "deployment": report.get("deployment"),
         "frames": report["frames"],
-        "game": {"map": game.get("map"), "red": red, "blue": blue,
-                 "art": game.get("art")},
-        "plates": PLATE_OUTLINES,
+        "game": {"map": game.get("map"), "red": red, "blue": blue},
         "showLabels": bool(show_labels),
     }, separators=(",", ":"))
     # Model names come from imported army lists, so treat them as hostile. Inside a
@@ -671,7 +588,6 @@ def render_html(report, show_labels=True):
   <main>
     <div class="stage">
       <svg id="board" class="board"></svg>
-      <div class="art" id="art"><img id="artImg" alt="Mission layout diagram"></div>
       <div class="hint" id="hint">scroll to zoom &middot; drag to pan</div>
     </div>
     <aside>
@@ -917,45 +833,18 @@ function drawObjectives(g) {
   }
 }
 
-// Areas draw first so the pieces standing inside them land on top of them.
-const TERRAIN_ORDER = ['area', 'light', 'dense'];
-const TERRAIN_CLASS = {area:'t-area', light:'t-light', dense:'t-dense'};
-
-// Screen-space points of a terrain plate's true footprint, or null if the piece is
-// not a plate this build knows the outline of. The outline is in the object's own
-// frame; the rotate() on the element applies its yaw, so only mirroring and scale
-// are handled here. Battlemaster mirrors a plate with a 180 about x or z, which
-// flips the local z or x axis respectively.
-function platePoints(t) {
-  const outline = (D.plates || {})[t.sh];
-  if (!outline) return null;
-  const cx = sx(t.x||0), cy = sz(t.z||0);
-  const kx = (t.sx || 1) * (t.rz === 180 ? -1 : 1);
-  const kz = (t.sz || 1) * (t.rx === 180 ? -1 : 1);
-  // -pz because sz() negates z, and these are offsets in the same flipped frame.
-  return outline.map(p => `${cx + p[0]*kx},${cy - p[1]*kz}`).join(' ');
-}
-
+// Terrain areas are the flat plates the ruins stand on. Their outlines arrive
+// already placed in board coordinates -- the exact mesh silhouette, positioned and
+// rotated when the report was built -- so there is nothing to transform here. The
+// ruins themselves are deliberately not drawn.
 function drawTerrain(g) {
-  for (const kind of TERRAIN_ORDER) {
-    for (const t of D.board.terrain) {
-      if (t.kind !== kind) continue;
-      const cx = sx(t.x||0), cy = sz(t.z||0);
-      const attrs = {class:TERRAIN_CLASS[kind],
-                     transform:`rotate(${t.ry||0} ${cx} ${cy})`};
-      const pts = platePoints(t);
-      let n;
-      if (pts) {
-        n = el('polygon', Object.assign({points:pts}, attrs), g);
-      } else {
-        // Anything that is not a known plate -- the terrain standing on them, and
-        // any piece from another source -- keeps its captured bounding box.
-        const bx = (t.bx||1)*2, bz = (t.bz||1)*2;
-        n = el('rect', Object.assign(
-          {x:cx-bx/2, y:cy-bz/2, width:bx, height:bz, rx:0.25}, attrs), g);
-      }
-      el('title', {}, n).textContent = t.label || 'terrain';
-    }
+  for (const t of D.board.terrain) {
+    const pts = (t.points || []).map(p => `${sx(p[0])},${sz(p[1])}`).join(' ');
+    if (!pts) continue;
+    const n = el('polygon', {points:pts, class:'t-area'}, g);
+    const tags = (t.tags || []).filter(s => s.indexOf('obj_') === 0);
+    el('title', {}, n).textContent =
+      tags.length ? `terrain area (${tags.join(', ')})` : 'terrain area';
   }
 }
 
@@ -1034,29 +923,8 @@ function drawTerritory(g) {
 
 // The deployment map deliberately replaces the battle view rather than layering
 // on it: it is the mission's setup diagram, not a moment in the game.
-// The mission's own layout diagram, when the log captured one: terrain, deployment
-// zones, objectives and the divider exactly as the mission prints them. It is shown
-// as a picture in its own view rather than used as a board background -- the art is
-// portrait, bordered, and differs by map creator, so cropping and rotating it to sit
-// under the models would need calibrating per art set. Nothing is drawn over it.
-const ART = (D.game && typeof D.game.art === 'string'
-             && /^https?:\/\//.test(D.game.art)) ? D.game.art : null;
-
-function showArt(on) {
-  const box = document.getElementById('art');
-  box.classList.toggle('on', on);
-  svg.style.visibility = on ? 'hidden' : '';
-  document.getElementById('hint').style.display = on ? 'none' : '';
-  if (on && !box.dataset.loaded) {          // fetch it once, on first look
-    document.getElementById('artImg').src = ART;
-    box.dataset.loaded = '1';
-  }
-}
-
 function renderDeployMap() {
   clear();
-  if (ART) { sidePanel(null); syncTabs(); return; }
-
   mat();
   drawTerrain(el('g', {}, svg));
   const g = el('g', {}, svg);
@@ -1132,7 +1000,6 @@ function renderFrame() {
 }
 
 function render() {
-  showArt(state.deployMap && !!ART);
   state.deployMap ? renderDeployMap() : renderFrame();
 }
 
@@ -1142,11 +1009,13 @@ function esc(s) {
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
 }
 
-// Colour key for the board, kept in the panel so it costs no board space.
-const TERRAIN_KEY = '<div class="key">' +
-  '<span><i class="area"></i>terrain area</span>' +
-  '<span><i class="light"></i>light</span>' +
-  '<span><i class="dense"></i>dense</span></div>';
+// Colour key for the board, kept in the panel so it costs no board space. Only
+// the flat terrain AREAS are drawn; the ruins standing on them are not, so there
+// is nothing else to key. A map whose terrain could not be resolved says so here
+// rather than silently showing an empty table.
+const TERRAIN_KEY = D.board.terrain_known
+  ? '<div class="key"><span><i class="area"></i>terrain area</span></div>'
+  : '<div class="key"><span class="note">No terrain outlines ship for this map.</span></div>';
 
 function setSplit(id, vp, pk, sk) {
   const e = document.getElementById(id);
@@ -1163,9 +1032,7 @@ function sidePanel(f) {
     document.getElementById('splitB').textContent = '';
     document.getElementById('cpR').textContent = '-';
     document.getElementById('cpB').textContent = '-';
-    if (ART) P.push('<h2>Mission layout</h2>' +
-      '<div class="fd">The mission\'s own diagram, as dealt with the map card.</div>');
-    else P.push('<h2>Terrain</h2>' + TERRAIN_KEY);
+    P.push('<h2>Terrain</h2>' + TERRAIN_KEY);
     P.push('<h2>Deployment</h2>');
     const dep = D.deployment;
     if (!dep) P.push('<div class="none">no deployment recorded</div>');
@@ -1354,31 +1221,17 @@ def render_board_svg(report, frame, show_labels=True):
         f'<rect x="{pad}" y="{pad}" width="{w:.1f}" height="{h:.1f}" class="mat"/>',
     ]
 
-    # Areas first, so the pieces standing inside them land on top of them.
-    kind_class = {KIND_AREA: "t-area", KIND_LIGHT: "t-light", KIND_DENSE: "t-dense"}
-    for kind in (KIND_AREA, KIND_LIGHT, KIND_DENSE):
-        for piece in report["board"]["terrain"]:
-            if piece.get("kind") != kind:
-                continue
-            cx, cy = sx(piece.get("x", 0)), sz(piece.get("z", 0))
-            rot = f'transform="rotate({piece.get("ry", 0):.0f} {cx:.1f} {cy:.1f})"'
-            title = f'<title>{html.escape(piece.get("label") or "terrain")}</title>'
-            outline = PLATE_OUTLINES.get(piece.get("sh"))
-            if outline:
-                kx = (piece.get("sx") or 1) * (-1 if piece.get("rz") == 180 else 1)
-                kz = (piece.get("sz") or 1) * (-1 if piece.get("rx") == 180 else 1)
-                pts = " ".join(f"{cx + px * kx:.2f},{cy - pz * kz:.2f}"
-                               for px, pz in outline)
-                parts.append(f'<polygon points="{pts}" class="{kind_class[kind]}" '
-                             f'{rot}>{title}</polygon>')
-                continue
-            rw = (piece.get("bx") or 1.0) * 2
-            rh = (piece.get("bz") or 1.0) * 2
-            parts.append(
-                f'<rect x="{cx - rw / 2:.1f}" y="{cy - rh / 2:.1f}" '
-                f'width="{rw:.1f}" height="{rh:.1f}" rx="0.25" '
-                f'class="{kind_class[kind]}" {rot}>{title}</rect>'
-            )
+    # Terrain areas arrive already placed in board coordinates, so there is nothing
+    # to rotate or mirror here. The ruins standing on them are not drawn.
+    for piece in report["board"]["terrain"]:
+        points = piece.get("points") or []
+        if len(points) < 3:
+            continue
+        pts = " ".join(f"{sx(px):.2f},{sz(pz):.2f}" for px, pz in points)
+        tags = [t for t in (piece.get("tags") or []) if str(t).startswith("obj_")]
+        label = f"terrain area ({', '.join(tags)})" if tags else "terrain area"
+        parts.append(f'<polygon points="{pts}" class="t-area">'
+                     f'<title>{html.escape(label)}</title></polygon>')
 
     for obj in report["board"].get("objectives") or []:
         parts.append(
