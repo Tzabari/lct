@@ -214,6 +214,18 @@ class TestReservesAndSecondaries(unittest.TestCase):
         self.assertTrue(frame["secondaries"]["Red"][1]["face_down"])
         self.assertNotIn("Blue", frame["secondaries"])
 
+    def test_a_full_slate_of_eight_secondaries_reaches_the_report(self):
+        """Nothing downstream of the capture caps the list -- the capture did."""
+        log = make_log()
+        log["snaps"][0]["sec"] = {
+            "Red":  [{"n": "Red %d" % i, "fd": False} for i in range(1, 9)],
+            "Blue": [{"n": "Blue %d" % i, "fd": False} for i in range(1, 9)],
+        }
+        frame = BR.build_frames(BR.load_log(log))[0]
+        self.assertEqual([s["name"] for s in frame["secondaries"]["Red"]],
+                         ["Red %d" % i for i in range(1, 9)])
+        self.assertEqual(len(frame["secondaries"]["Blue"]), 8)
+
     def test_untracked_secondaries_yield_nothing_rather_than_a_guess(self):
         frame = BR.build_frames(BR.load_log(make_log()))[0]
         self.assertEqual(frame["secondaries"], {})
@@ -820,12 +832,17 @@ class TestSecondaryScan(unittest.TestCase):
     """The secondaries scan reads the slots the way the rest of the mod does."""
 
     def setUp(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        start = source.index("function battleSecondaryState")
-        self.body = source[start:source.index("\nend", start)]
+        self.source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        start = self.source.index("function battleSecondaryState")
+        self.body = self.source[start:self.source.index("\nend", start)]
+
+    def block(self, header):
+        """The body of a top-level table literal, header line included."""
+        text = self.source[self.source.index(header):]
+        return text[:text.index("\n}")]
 
     def test_it_uses_the_mods_own_slot_helper(self):
-        self.assertIn("getCardsInSecondarySlot(zone)", self.body)
+        self.assertIn("getCardsInSecondarySlot(zone", self.body)
 
     def test_it_does_not_read_the_zone_directly(self):
         # zone.getObjects() came back empty with all four slots visibly filled: a
@@ -835,8 +852,39 @@ class TestSecondaryScan(unittest.TestCase):
         self.assertNotIn("zone.getObjects()", code)
 
     def test_the_helper_it_leans_on_still_exists(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        self.assertIn("function getCardsInSecondarySlot(zone)", source)
+        self.assertIn("function getCardsInSecondarySlot(zone", self.source)
+
+    def test_it_scans_every_slot_a_player_can_fill(self):
+        """A side holds eight secondaries, and the scan used to stop at two.
+
+        It stopped at two because BATTLE_SECONDARY_ZONES spelled out a pair of
+        GUIDs of its own instead of pointing at the slot lists that draw, sort,
+        discard and the scoreboard all share -- so filling slots 3 to 8 changed
+        the table and nothing else. Pinned as the wiring rather than as a count,
+        since a count here would just be the same copy made twice over.
+        """
+        zones = self.block("BATTLE_SECONDARY_ZONES = {")
+        self.assertIn("Red  = redSecondaryCardZone_GUIDs", zones)
+        self.assertIn("Blue = blueSecondaryCardZone_GUIDs", zones)
+        self.assertNotRegex(zones, r'"[0-9a-z]{6}"',
+                            "zone GUIDs copied in here again instead of referenced")
+        for name in ("redSecondaryCardZone_GUIDs", "blueSecondaryCardZone_GUIDs"):
+            slots = re.findall(r'"[0-9a-z]{6}"', self.block(name + " = {"))
+            self.assertEqual(len(slots), 8, name)
+
+    def test_the_slot_lists_are_in_place_before_the_battle_log_takes_them(self):
+        # Plain globals, assigned as the file loads: taking them earlier in the
+        # file than they are defined would quietly leave the table holding nil.
+        for name in ("redSecondaryCardZone_GUIDs = {", "blueSecondaryCardZone_GUIDs = {"):
+            self.assertLess(self.source.index(name),
+                            self.source.index("BATTLE_SECONDARY_ZONES = {"), name)
+
+    def test_it_walks_the_table_once_for_all_sixteen_slots(self):
+        # The helper's footprint sweep is a getAllObjects() pass per slot, which
+        # was cheap over four slots and wasteful over sixteen.
+        self.assertIn("local scene = getAllObjects()", self.body)
+        self.assertIn("getCardsInSecondarySlot(zone, scene)", self.body)
+        self.assertIn("ipairs(scene or getAllObjects())", self.source)
 
 
 class TestBoardCapture(unittest.TestCase):

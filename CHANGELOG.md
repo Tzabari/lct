@@ -35,6 +35,7 @@ then run `python3 compile.py --release`.
 - Bug fix: Report terrain was unreadable. The battlemat is untagged on many maps, so it was drawn as a board-sized slab of terrain covering everything; the outlines that mark terrain areas were drawn as if they were the terrain; and objective markers were drawn as terrain boxes while the outlines around them were drawn as the objectives.
 - Bug fix: The report's territory line was always the centre line. It is now derived from the deployment that was played, as the table derives it, so it tilts correctly for stepped and diagonal zones - and Combat Patrol's own declared divider is used where a mission has one.
 - Bug fix: Active secondaries never appeared in the report. The scan read each slot zone directly, and a card dropped into a slot is not registered as inside it until it settles; it now goes through the same slot helper the scoreboard uses.
+- Bug fix: The report listed only the first two of a player's secondaries. The battle log kept its own two-entry list of slot zones rather than using the mod's, so a card drawn into slots 3 to 8 was recorded nowhere; all eight slots a side are now read.
 - Bug fix: The report drew only five of the mod's eight deployment shapes, so Combat Patrol zones went missing, and a "No Deployment Zone" mission could blank the page.
 
 ## v1.11.3

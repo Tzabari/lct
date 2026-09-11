@@ -1815,12 +1815,15 @@ end
 -- board rectangle" test cannot tell reserves apart from a staging area.
 BATTLE_RESERVE_BOARDS = {Red = "fe7926", Blue = "85f0cf"}
 
--- Secondary objective card zones per side. LCT only tracks secondaries when a
--- mission pack is in play, so empty zones simply yield no entry and the report
--- leaves the panel out rather than inventing one.
+-- Secondary objective card zones per side, in slot order. This points at the mod's
+-- own slot lists rather than repeating them: each side has eight slots, and the
+-- two GUIDs that used to be written out here meant a report only ever showed the
+-- first two secondaries a player was holding, however full the board was.
+-- LCT only tracks secondaries when a mission pack is in play, so empty slots simply
+-- yield no entry and the report leaves the panel out rather than inventing one.
 BATTLE_SECONDARY_ZONES = {
-    Red  = {"c1e001", "c1e002"},
-    Blue = {"b1e001", "b1e002"},
+    Red  = redSecondaryCardZone_GUIDs,
+    Blue = blueSecondaryCardZone_GUIDs,
 }
 
 -- World bounds of each reserves board, ready for models to be tested against as
@@ -1851,18 +1854,21 @@ function battleReserveContains(entry, x, z)
        and math.abs(z - entry.z) <= entry.sz / 2
 end
 
--- Cards currently in each side's two secondary zones. Face-down state is kept so
--- a report can show which were still hidden at that point in the game.
+-- Cards currently in each side's secondary slots, in slot order. Face-down state
+-- is kept so a report can show which were still hidden at that point in the game.
 -- NOTE: this goes through getCardsInSecondarySlot rather than reading
 -- zone.getObjects() directly. A card dealt into a slot is often not registered as
 -- being "in" the zone -- it is dropped on top of it, and TTS only counts an object
 -- as inside once it has settled and reported in -- so the direct read came back
--- empty even with all four slots visibly filled. That helper is the mod's own
+-- empty even with all the slots visibly filled. That helper is the mod's own
 -- proven path: it takes the zone's contents AND sweeps every object sitting within
 -- the zone's footprint, and it accepts .type as well as .tag, which is the other
 -- half of why the direct read missed cards.
+-- The scene is fetched once and handed down: that footprint sweep walks every
+-- object on the table, and there are sixteen slots to check.
 function battleSecondaryState()
     local out = {}
+    local scene = getAllObjects()
     for color, guids in pairs(BATTLE_SECONDARY_ZONES) do
         local cards = {}
         for _, zguid in ipairs(guids) do
@@ -1874,7 +1880,7 @@ function battleSecondaryState()
                 -- one), and a deck's name is the deck's, not the secondary's.
                 pcall(function()
                     local fallback = nil
-                    for _, o in ipairs(getCardsInSecondarySlot(zone)) do
+                    for _, o in ipairs(getCardsInSecondarySlot(zone, scene)) do
                         local name = o.getName()
                         if name ~= nil and name ~= "" then
                             local entry = {n = name, fd = o.is_face_down == true}
@@ -2738,7 +2744,9 @@ end
 -- then locked, especially during/after smooth movement. Combine the zone query
 -- with a positional scan (same approach as the mission primary slots) so
 -- occupancy, labels, discard and recycle all see cards that are visibly there.
-function getCardsInSecondarySlot(zone)
+-- `scene` is an optional pre-fetched getAllObjects() list, for callers that check
+-- several slots at once and should not walk the whole table once per slot.
+function getCardsInSecondarySlot(zone, scene)
     if not zone then
         return {}
     end
@@ -2760,7 +2768,7 @@ function getCardsInSecondarySlot(zone)
     local center = bounds.center
     local halfX = bounds.size.x / 2
     local halfZ = bounds.size.z / 2
-    for _, obj in ipairs(getAllObjects()) do
+    for _, obj in ipairs(scene or getAllObjects()) do
         local pos = obj.getPosition()
         if math.abs(pos.x - center.x) <= halfX and
            math.abs(pos.z - center.z) <= halfZ and
