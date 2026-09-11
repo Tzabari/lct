@@ -83,10 +83,8 @@ local exportBtnB = {
     tooltip="Render the battle report and open it in your browser.\nNeeds the local helper running:  python3 scripts/battle_report_server.py"
 }
 
-local endGameBtnLbl = "END GAME
-open rewind"
-local endGameTip = "Record the final state, close the battle log, and open the rewind selector.
-Press again later to reopen the selector."
+local endGameBtnLbl = "END GAME\nopen rewind"
+local endGameTip = "Record the final state, close the battle log, and open the rewind selector.\nPress again later to reopen the selector."
 local endGameBtnR = {
     label=endGameBtnLbl, click_function="endGame", function_owner=self,
     position={XposHideArmy-3*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},

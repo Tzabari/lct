@@ -28,7 +28,7 @@ TOOLS_LUA = ROOT / "TTSLUA" / "spawnGameTools.ttslua"
 def make_log(**overrides):
     """A minimal but complete two-model, two-snapshot log."""
     log = {
-        "v": 1,
+        "v": 2,
         "game": {
             "started": 1788013636,
             "map": "Sweeping Engagement",
@@ -57,14 +57,24 @@ def make_log(**overrides):
                        "w": 1, "b": [0.5, 0.5], "tags": ["uuid:u-blue-1"]},
         },
         "dead": {},
+        # Distinct nicknames seen this game, verbatim -- wound prefix and colour
+        # markup included, exactly as recordBattleSnapshot interns them. A
+        # snapshot's model row carries an index into this pool rather than the
+        # string itself (1-based, matching battleAddName).
+        "names": [
+            "[00ff16]2/2[-] Intercessor Sergeant",   # 1: aaa111 at full health
+            "[ffff00]1/1[-] Hormagaunt",              # 2: bbb222 before it dies
+            "[ff0000]1/2[-] Intercessor Sergeant",    # 3: aaa111 after a wound
+        ],
         "snaps": [
             {"r": 1, "t": "Red", "p": 1, "lbl": "Round 1, Red Turn 1 - Command Phase",
              "why": "deploy", "ts": 1, "vp": {"r": 0, "b": 0}, "cp": {"r": 1, "b": 1},
-             "m": {"aaa111": [-10.0, -5.0, 90, 2], "bbb222": [12.0, 6.0, 270, 1]},
+             "m": {"aaa111": [-10.0, 0.0, -5.0, 90, 1],
+                   "bbb222": [12.0, 0.0, 6.0, 270, 2]},
              "dead": []},
             {"r": 1, "t": "Red", "p": 2, "lbl": "Round 1, Red Turn 1 - Movement Phase",
              "why": "phase", "ts": 2, "vp": {"r": 5, "b": 0}, "cp": {"r": 2, "b": 1},
-             "m": {"aaa111": [-4.0, -2.0, 90, 1]},
+             "m": {"aaa111": [-4.0, 0.0, -2.0, 90, 3]},
              "dead": ["bbb222"]},
         ],
     }
@@ -176,7 +186,7 @@ class TestFrames(unittest.TestCase):
 
     def test_models_parked_off_board_are_flagged_as_reserve(self):
         log = make_log()
-        log["snaps"][0]["m"]["aaa111"] = [0.0, 74.25, 0, 2]
+        log["snaps"][0]["m"]["aaa111"] = [0.0, 0.0, 74.25, 0, 1]
         frames = BR.build_frames(BR.load_log(log))
         red = next(m for m in frames[0]["models"] if m["guid"] == "aaa111")
         self.assertTrue(red["reserve"])
@@ -247,7 +257,10 @@ class TestReservesAndSecondaries(unittest.TestCase):
 class TestTolerance(unittest.TestCase):
     def test_model_row_without_wounds_is_accepted(self):
         log = make_log()
-        log["snaps"][0]["m"]["aaa111"] = [1.0, 2.0, 90]
+        # nameIndex 0 is out of range (the pool is 1-based), so the name -- and
+        # with it the wounds parsed out of it -- resolves to blank rather than
+        # erroring.
+        log["snaps"][0]["m"]["aaa111"] = [1.0, 0.0, 2.0, 90, 0]
         frames = BR.build_frames(BR.load_log(log))
         red = next(m for m in frames[0]["models"] if m["guid"] == "aaa111")
         self.assertIsNone(red["wounds"])
@@ -260,7 +273,7 @@ class TestTolerance(unittest.TestCase):
 
     def test_model_missing_from_the_roster_still_renders(self):
         log = make_log()
-        log["snaps"][0]["m"]["zzz999"] = [1.0, 2.0, 0, 1]
+        log["snaps"][0]["m"]["zzz999"] = [1.0, 0.0, 2.0, 0, 0]
         frames = BR.build_frames(BR.load_log(log))
         stray = next(m for m in frames[0]["models"] if m["guid"] == "zzz999")
         self.assertEqual(stray["name"], "zzz999")
@@ -269,6 +282,82 @@ class TestTolerance(unittest.TestCase):
         log = make_log()
         log["game"].pop("board")
         self.assertEqual(BR.board_size(log), (60.0, 44.0))
+
+
+class TestSchema2ModelRows(unittest.TestCase):
+    """The v2 row shape: [x, y, z, rotY, nameIndex] plus an optional [rx, rz]
+    tilt pair, with the model's displayed name (and wounds) resolved through
+    the log's names pool rather than carried as a bare number."""
+
+    def test_model_entry_resolves_the_name_pool(self):
+        entry = BR._model_entry([1.0, 2.0, 3.0, 90, 2],
+                                 ["[00ff16]2/2[-] Alpha", "[ff0000]1/3[-] Bravo"])
+        self.assertEqual(entry["name"], "Bravo")
+        self.assertEqual((entry["w"], entry["mw"]), (1, 3))
+
+    def test_model_entry_carries_y_through(self):
+        # Y is what puts a model back on a ruin's upper floor on rewind; the
+        # report draws nothing with it, but it must round-trip all the same.
+        entry = BR._model_entry([1.0, 4.5, 3.0, 90, 0], [])
+        self.assertEqual(entry["y"], 4.5)
+
+    def test_model_entry_reads_the_optional_tilt_pair(self):
+        entry = BR._model_entry([1.0, 0.0, 3.0, 90, 0, 12.0, -6.0], [])
+        self.assertEqual((entry["rx"], entry["rz"]), (12.0, -6.0))
+
+    def test_model_entry_defaults_tilt_to_zero(self):
+        entry = BR._model_entry([1.0, 0.0, 3.0, 90, 0], [])
+        self.assertEqual((entry["rx"], entry["rz"]), (0.0, 0.0))
+
+    def test_model_entry_out_of_range_index_is_a_blank_name(self):
+        entry = BR._model_entry([1.0, 0.0, 3.0, 90, 99], ["Only One"])
+        self.assertEqual(entry["name"], "")
+
+    def test_a_v1_shaped_row_is_now_too_short_to_read(self):
+        # The old [x, z, rotY, w] tuple is one element short of v2's
+        # [x, y, z, rotY, nameIndex] and must be skipped, not misread as if its
+        # trailing wound count were a name index.
+        self.assertIsNone(BR._model_entry([1.0, 2.0, 90, 2], []))
+
+    def test_frame_carries_y_from_the_snapshot(self):
+        log = make_log()
+        log["snaps"][0]["m"]["aaa111"] = [-10.0, 6.5, -5.0, 90, 1]
+        frame = BR.build_frames(BR.load_log(log))[0]
+        red = next(m for m in frame["models"] if m["guid"] == "aaa111")
+        self.assertEqual(red["y"], 6.5)
+
+    def test_frame_name_prefers_the_live_nickname_over_registration(self):
+        # A unit renamed mid-game (or simply wounded, changing its bracket
+        # colour) must read back as it was AT THAT MOMENT, not as registered.
+        log = make_log()
+        frame = BR.build_frames(BR.load_log(log))[1]
+        red = next(m for m in frame["models"] if m["guid"] == "aaa111")
+        self.assertEqual(red["name"], "Intercessor Sergeant")
+        self.assertEqual(red["wounds"], 1)
+
+
+class TestSchema2Secondaries(unittest.TestCase):
+    """table.insert on the Lua side used to lose an empty slot's position;
+    schema 2 records the slot index explicitly and the report must sort by it
+    rather than trust encounter order."""
+
+    def test_secondaries_render_in_slot_order_not_discovery_order(self):
+        log = make_log()
+        log["snaps"][0]["sec"] = {
+            "Red": [{"i": 3, "n": "Third slot"}, {"i": 1, "n": "First slot"}],
+        }
+        frame = BR.build_frames(BR.load_log(log))[0]
+        self.assertEqual([c["name"] for c in frame["secondaries"]["Red"]],
+                         ["First slot", "Third slot"])
+
+    def test_a_card_with_no_recorded_slot_sorts_after_slotted_ones(self):
+        log = make_log()
+        log["snaps"][0]["sec"] = {
+            "Red": [{"n": "No slot"}, {"i": 2, "n": "Second slot"}],
+        }
+        frame = BR.build_frames(BR.load_log(log))[0]
+        self.assertEqual([c["name"] for c in frame["secondaries"]["Red"]],
+                         ["Second slot", "No slot"])
 
 
 class TestRendering(unittest.TestCase):
@@ -341,15 +430,17 @@ class TestRendering(unittest.TestCase):
         return json.loads(m.group(1))
 
     def test_a_hostile_model_name_cannot_break_out_of_the_script_block(self):
-        # "</script>" ends a script element whatever the JSON quoting, so a nickname
-        # from an imported army list must not be able to reach the page as markup.
+        # "</script>" ends a script element whatever the JSON quoting, so a
+        # model's live nickname -- fully player-controlled TTS text, pooled and
+        # indexed by the snapshot -- must not be able to reach the page as markup.
         log = make_log()
-        log["roster"]["aaa111"]["n"] = "</script><img src=x onerror=alert(1)>"
+        hostile = "</script><img src=x onerror=alert(1)>"
+        log["names"][0] = hostile  # index 1: what aaa111 resolves to in frame 0
         page = BR.render_html(BR.build_report(BR.load_log(log)))
         self.assertNotIn("</script><img", page)
         self.assertEqual(page.count("<script"), page.count("</script>"))
         names = [m["name"] for m in self._payload(page)["frames"][0]["models"]]
-        self.assertIn("</script><img src=x onerror=alert(1)>", names)
+        self.assertIn(hostile, names)
 
     def test_model_names_are_rendered_as_labels(self):
         page = BR.render_html(self.report)
@@ -368,7 +459,7 @@ class TestRendering(unittest.TestCase):
 
     def test_reserve_models_are_not_drawn_on_the_board(self):
         log = make_log()
-        log["snaps"][0]["m"]["aaa111"] = [0.0, 74.25, 0, 2]
+        log["snaps"][0]["m"]["aaa111"] = [0.0, 0.0, 74.25, 0, 1]
         report = BR.build_report(BR.load_log(log))
         svg = BR.render_board_svg(report, report["frames"][0])
         self.assertNotIn("Intercessor Sergeant", svg)
@@ -388,8 +479,12 @@ class TestRendering(unittest.TestCase):
             self.assertEqual(len(data["frames"]), 2)
 
     def test_html_escapes_model_names(self):
+        # Covers the fallback path: a model whose own nickname doesn't resolve
+        # from the pool falls back to its roster registration name, which must
+        # be escaped exactly like the pooled-name path above.
         log = make_log()
         log["roster"]["aaa111"]["n"] = "<script>alert(1)</script>"
+        log["snaps"][0]["m"]["aaa111"][4] = 0  # invalid index -> falls back
         report = BR.build_report(BR.load_log(log))
         page = BR.render_html(report)
         self.assertNotIn("<script>alert(1)</script>", page)

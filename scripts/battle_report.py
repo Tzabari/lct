@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import map_terrain
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Board colours. Red/Blue match the table's own player colours closely enough to
 # be recognisable without being so saturated that overlapping bases turn to mud.
@@ -135,6 +135,7 @@ def load_log(raw):
         "units": raw.get("units") or {},
         "roster": raw.get("roster") or {},
         "dead": raw.get("dead") or {},
+        "names": raw.get("names") or [],
         "snaps": raw.get("snaps") or [],
     }
     if not log["snaps"]:
@@ -265,19 +266,38 @@ def _objective_anchors(pieces):
             for p in marks]
 
 
-def _model_entry(values):
-    """A snapshot model row is [x, z, rotY] with an optional 4th wounds value."""
-    if not isinstance(values, (list, tuple)) or len(values) < 3:
+def _model_entry(values, names):
+    """A schema 2 snapshot model row.
+
+    ``[x, y, z, rotY, nameIndex]``, with ``[rx, rz]`` appended together when
+    either is non-zero -- the same shape captureBoard uses for tilted board
+    pieces. Y is what puts a model back on a ruin's upper floor rather than on
+    the ground, and it is drawn nowhere in the report; it is carried anyway so
+    the report and the in-game rewind read the same rows.
+
+    ``nameIndex`` points into the log's ``names`` pool: the model's nickname as
+    it was DISPLAYED at that moment, wound prefix and colour markup included.
+    That replaced schema 1's bare trailing wound count, so the wounds here are
+    parsed back out of the name.
+    """
+    if not isinstance(values, (list, tuple)) or len(values) < 5:
         return None
-    entry = {
+    idx = values[4]
+    raw_name = ""
+    if isinstance(idx, int) and 1 <= idx <= len(names):
+        raw_name = names[idx - 1] or ""
+    name, cur, mx = parse_model_name(raw_name)
+    return {
         "x": float(values[0]),
-        "z": float(values[1]),
-        "ry": float(values[2]),
-        "w": None,
+        "y": float(values[1]),
+        "z": float(values[2]),
+        "ry": float(values[3]),
+        "rx": float(values[5]) if len(values) > 5 and values[5] is not None else 0.0,
+        "rz": float(values[6]) if len(values) > 6 and values[6] is not None else 0.0,
+        "name": name,
+        "w": cur,
+        "mw": mx,
     }
-    if len(values) > 3 and values[3] is not None:
-        entry["w"] = values[3]
-    return entry
 
 
 def build_frames(log):
@@ -288,6 +308,7 @@ def build_frames(log):
     """
     w, h = board_size(log)
     roster = log["roster"]
+    names = log.get("names") or []
     frames = []
     dead = set()
 
@@ -295,22 +316,28 @@ def build_frames(log):
         dead.update(snap.get("dead") or [])
         models = []
         for guid, values in (snap.get("m") or {}).items():
-            entry = _model_entry(values)
+            entry = _model_entry(values, names)
             if entry is None:
                 continue
             rec = roster.get(guid) or {}
             base = rec.get("b") or [0.63, 0.63]
-            name, _, _ = parse_model_name(rec.get("n") or "")
+            # The snapshot's own nickname wins over the registration name: it is
+            # what the model was actually called at that moment, so a unit
+            # renamed mid-game reads correctly frame by frame. The registration
+            # name is the fallback for a model whose nickname did not intern
+            # (the pool is capped).
+            reg_name, _, reg_max = parse_model_name(rec.get("n") or "")
             models.append({
                 "guid": guid,
-                "name": name or rec.get("n") or guid,
+                "name": entry["name"] or reg_name or rec.get("n") or guid,
                 "color": rec.get("c") or "Red",
                 "unit": rec.get("u"),
                 "x": entry["x"],
+                "y": entry["y"],
                 "z": entry["z"],
                 "ry": entry["ry"],
                 "wounds": entry["w"],
-                "max_wounds": rec.get("w"),
+                "max_wounds": entry["mw"] if entry["mw"] is not None else (rec.get("w") or reg_max),
                 "bx": float(base[0]) if len(base) > 0 else 0.63,
                 "bz": float(base[1]) if len(base) > 1 else 0.63,
                 "reserve": abs(entry["x"]) > w / 2 or abs(entry["z"]) > h / 2,
@@ -378,11 +405,20 @@ def _frame_secondaries(snap):
     for color, cards in (snap.get("sec") or {}).items():
         if not cards:
             continue
-        out[color] = [
-            {"name": c.get("n") or "Unnamed secondary", "face_down": bool(c.get("fd"))}
+        # Schema 2 records which of the eight slots each card sat in. Sorting by
+        # it makes the report's list match the board's top-to-bottom order rather
+        # than whatever order the zone sweep happened to return.
+        entries = [
+            {
+                "slot": c.get("i"),
+                "name": c.get("n") or "Unnamed secondary",
+                "face_down": bool(c.get("fd")),
+            }
             for c in cards
             if isinstance(c, dict)
         ]
+        entries.sort(key=lambda e: (e["slot"] is None, e["slot"] or 0))
+        out[color] = entries
     return out
 
 
