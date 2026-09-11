@@ -567,7 +567,7 @@ ul.list li:last-child { border-bottom: 0; }
 """
 
 
-def render_html(report, show_labels=True):
+def render_html(report, show_labels=True, script_nonce=None):
     # Stamped into the header. The in-game button renders through a long-running
     # server, so "am I looking at a fresh page or a stale one?" is a real question
     # and the answer belongs on the page itself.
@@ -590,6 +590,12 @@ def render_html(report, show_labels=True):
     payload = (payload.replace("&", "\\u0026")
                       .replace("<", "\\u003c")
                       .replace(">", "\\u003e"))
+
+    # Only the hosted server has a CSP strict enough to need this (script-src
+    # 'nonce-...'); the local file:// output has no CSP at all, and passing
+    # None here (write_report's default) must leave that output byte-identical
+    # to before this parameter existed.
+    nonce_attr = f' nonce="{html.escape(script_nonce)}"' if script_nonce else ""
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -641,8 +647,8 @@ def render_html(report, show_labels=True):
     </aside>
   </main>
 </div>
-<script type="application/json" id="data">{payload}</script>
-<script>{VIEWER_JS}</script>
+<script type="application/json" id="data"{nonce_attr}>{payload}</script>
+<script{nonce_attr}>{VIEWER_JS}</script>
 </body></html>"""
 
 

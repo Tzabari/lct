@@ -493,6 +493,40 @@ class TestRendering(unittest.TestCase):
         self.assertNotIn("<script>alert(1)</script>", page)
 
 
+class TestRenderNonce(unittest.TestCase):
+    """render_html(script_nonce=...) is what makes a real CSP possible hosted --
+    see scripts/battle_report_server.py's script-src 'nonce-...' header."""
+
+    def setUp(self):
+        self.report = BR.build_report(BR.load_log(make_log()))
+
+    def test_a_nonce_appears_on_exactly_both_script_tags(self):
+        page = BR.render_html(self.report, script_nonce="abc123")
+        self.assertEqual(page.count('nonce="abc123"'), 2)
+
+    def test_the_default_render_has_no_nonce_attribute(self):
+        page = BR.render_html(self.report)
+        self.assertNotIn("nonce=", page)
+
+    def test_none_leaves_output_byte_identical_to_omitting_the_argument(self):
+        self.assertEqual(BR.render_html(self.report),
+                         BR.render_html(self.report, script_nonce=None))
+
+    def test_the_page_loads_nothing_from_the_network(self):
+        """Pins the property a `default-src 'none'` CSP depends on.
+
+        Worth having regardless of hosting: a report that ever grew an <img
+        src=...>, an external stylesheet, or a CSS @import would silently break
+        offline viewing of a downloaded copy, which is the whole point of the
+        report being self-contained.
+        """
+        page = BR.render_html(self.report)
+        # The SVG namespace URLs are the only "http" strings this page has.
+        page_without_svg_ns = page.replace("http://www.w3.org/2000/svg", "")
+        for hook in ("src=", "href=", "@import", "url(http"):
+            self.assertNotIn(hook, page_without_svg_ns)
+
+
 class TestLuaWiring(unittest.TestCase):
     """Lock the Lua-side contracts this pipeline depends on."""
 
