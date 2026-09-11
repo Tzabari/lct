@@ -202,13 +202,16 @@ def classify_terrain(piece, board=None):
 
 def terrain_label(piece):
     """Tooltip text: what the piece is, plus its material where one was recorded."""
-    tags = [t for t in (piece.get("t") or [])
-            if t not in SURFACE_TAGS and not str(t).startswith("obj_")]
+    all_tags = [str(t) for t in (piece.get("t") or []) if t not in SURFACE_TAGS]
+    tags = [t for t in all_tags if not t.startswith("obj_")]
     # Some pieces carry two tags because they are two things bolted together
     # ("Short Barrier, Tower"), and naming only the first hides why it is dense.
-    name = " / ".join(str(t) for t in tags) if tags else (piece.get("n") or "").strip()
+    name = " / ".join(tags) if tags else (piece.get("n") or "").strip()
     if not name:
-        name = "terrain area"
+        # An obj_*-tagged area stands in for an objective when no physical marker
+        # was captured, so it should say which objective rather than "terrain".
+        objectives = [t for t in all_tags if t.startswith("obj_")]
+        name = " / ".join(objectives) if objectives else "terrain area"
     desc = " / ".join(part.strip() for part in (piece.get("d") or "").splitlines()
                       if part.strip())
     return f"{name} - {desc}" if desc else name

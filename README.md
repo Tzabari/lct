@@ -87,19 +87,22 @@ on drag, and resets on double-click, the `0` key or the Reset view button.
 The board is drawn looking down on the table the way you sit at it: +z is the far
 edge, at the top of the picture.
 
-Terrain areas are drawn as their real footprints, taken from Battlemaster's own
-plate meshes rather than from the bounding box the table reports - those boxes are
-up to an inch too deep, and the plate the maps call a "triangle" is really a right
-trapezoid that no box describes. Logs recorded before the plate name was captured
-still get real footprints, because the five plates are identifiable by size.
+Terrain areas - the flat plates the ruins stand on - are drawn as their exact
+outlines, and none of it is inferred from the capture. The log records which map
+card was loaded, and that card's own spawn payload (`data/maps/<card_guid>.lua`)
+already holds every plate's position, rotation and mesh, so the report reads the
+geometry rather than guessing it: measured against a real recorded game, all 41
+objects matched by GUID to within 0.006", which is the capture's own rounding.
 
-Terrain follows the map's own colour coding - grey outlines for the terrain
-**areas**, yellow for **light** terrain and green for **dense**. That split is not
-inferred from the piece's name, which would get it wrong (Corner and the barriers
-are light; Generator and Pipes are dense): Battlemaster writes each piece's
-material into its Description, and the log captures it. Logs recorded before that
-was captured still colour correctly, from a per-tag table checked against every
-shipped map. Hovering a piece names it and its material.
+Each plate's true silhouette lives in `data/plate_outlines.json`, traced from the
+real meshes by `scripts/extract_plate_outlines.py`. Eleven shapes cover all 3586
+plates of all 225 shipped maps, so nothing falls back to a box - and the plate the
+maps call a "triangle" draws as the right trapezoid it actually is, facing the
+right way. A test places every plate of every map and fails if any of them lands
+off the table, which is what pins the mirroring down.
+
+The ruins standing on those plates are not drawn for now, so the board stays
+readable under the models. Hovering an area names the objective it surrounds.
 
 A side panel carries VP/CP with each side's primary/secondary split, both
 Reinforcements and Reserves boards, the
@@ -110,15 +113,13 @@ strategic reserves inset, and the 3"/6" centre rings. The territory line is
 derived from the deployment that was played, exactly as the table derives it, so
 it tilts with a stepped zone instead of sitting on the centre line.
 
-**Deployment map** is a separate view, off by default. Where the log captured the
-mission's layout-art card it shows that diagram itself - terrain, zones,
-objectives and the divider as the mission prints them. It is shown as a picture in
-its own view rather than used as a background under the models: the art is
-portrait, bordered, and differs by map creator, so cropping and rotating it to
-line up with the board would need calibrating per art set. Without that card the
-view falls back to a drawn diagram - terrain, deployment zones drawn heavier and
-labelled by colour, quarters, divider and objectives. Either way the round, player
-and phase tabs park until you turn it off. Board markings are drawn in inches at
+**Deployment map** is a separate view, off by default: the mission's setup as a
+drawn diagram - terrain, deployment zones drawn heavier and labelled by colour,
+quarters, divider and objectives - with the round, player and phase tabs parked
+until you turn it off. The mission's own layout-art card is deliberately not used
+here: one art card serves three different terrain layouts (the three Battlemaster
+packs, LCT Pack 1 and T5S2 all share a mission name but not a layout), so it would
+be wrong for two maps in three. Board markings are drawn in inches at
 true table scale, so a name label or a zone line stays in proportion to a 32mm base
 however far you zoom.
 

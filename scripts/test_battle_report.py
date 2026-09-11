@@ -16,6 +16,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import battle_report as BR
+import map_payloads as MP
+import map_terrain as MT
 
 ROOT = SCRIPT_DIR.parent
 GLOBAL_LUA = ROOT / "TTSLUA" / "global.ttslua"
@@ -312,7 +314,7 @@ class TestRendering(unittest.TestCase):
         # would swamp a 0.63in base.
         page = BR.render_html(self.report)
         css = page[page.index("<style>"):page.index("</style>")]
-        for cls in (".t-area", ".t-light", ".t-dense", ".quarter", ".dz",
+        for cls in (".t-area", ".quarter", ".dz",
                     ".mlabel", ".objective", ".territory"):
             block = css[css.index(cls):css.index(cls) + 200]
             for m in re.finditer(r"(?:stroke-width|font-size):\s*([0-9.]+)", block):
@@ -343,8 +345,10 @@ class TestRendering(unittest.TestCase):
 
     def test_the_battlemat_surface_is_not_drawn_as_terrain(self):
         svg = BR.render_board_svg(self.report, self.report["frames"][0])
-        self.assertIn("Tower", svg)
         self.assertNotIn("battlemaster_battlemat", svg)
+        # The mat is a board-sized rectangle; drawn as terrain it would cover the
+        # whole picture, so only the one .mat backdrop rect may be that big.
+        self.assertEqual(svg.count("class=\"mat\""), 1)
 
     def test_objective_markers_are_drawn_distinctly(self):
         svg = BR.render_board_svg(self.report, self.report["frames"][0])
@@ -698,7 +702,7 @@ class TestLuaStringLiterals(unittest.TestCase):
 
 
 class TestTerrainClassification(unittest.TestCase):
-    """The board is coloured by the map's own scheme, not by guessing from names."""
+    """What the capture still has to identify now that terrain comes from the map."""
 
     @staticmethod
     def piece(**kw):
@@ -707,100 +711,27 @@ class TestTerrainClassification(unittest.TestCase):
         base.update(kw)
         return base
 
-    def test_the_material_description_decides_light_or_dense(self):
-        self.assertEqual(BR.classify_terrain(self.piece(t=["Tower"], d="Dense")),
-                         BR.KIND_DENSE)
-        self.assertEqual(BR.classify_terrain(self.piece(t=["Corner"], d="Light")),
-                         BR.KIND_LIGHT)
-
-    def test_the_description_beats_the_tag_name(self):
-        # The whole point of capturing it: a name that reads "light" is not it.
-        self.assertEqual(
-            BR.classify_terrain(self.piece(t=["Short Barrier"], d="Dense")),
-            BR.KIND_DENSE)
-
-    def test_a_mixed_piece_reads_as_dense(self):
-        mixed = self.piece(t=["Short Barrier", "Tower"],
-                           d="Tower = Dense\nWalls = Light")
-        self.assertEqual(BR.classify_terrain(mixed), BR.KIND_DENSE)
-
-    def test_area_outlines_are_areas_not_terrain_features(self):
-        for shape in sorted(BR.AREA_SHAPES):
-            self.assertEqual(BR.classify_terrain(self.piece(sh=shape)), BR.KIND_AREA,
-                             shape)
-
-    def test_an_obj_tagged_outline_is_an_area_not_a_marker(self):
-        # obj_* marks the outline drawn AROUND an objective; the marker itself is a
-        # separate object. Drawing the outline as a small circle lost the area and
-        # put the objective an inch off at the same time.
-        self.assertEqual(
-            BR.classify_terrain(self.piece(t=["obj_home_red"], sh="bigrect")),
-            BR.KIND_AREA)
-
     def test_an_untagged_battlemat_is_not_drawn_as_terrain(self):
         # A good number of shipped maps leave the mat untagged. Classified as
         # terrain it becomes a board-sized slab covering the entire report.
         mat = self.piece(bx=29.99, bz=21.97)
         self.assertEqual(BR.classify_terrain(mat, (59.79, 43.71)), BR.KIND_SURFACE)
-        # ... but a genuinely large piece of terrain is still terrain.
-        big = self.piece(t=["Tower"], d="Dense", bx=6.0, bz=4.0)
-        self.assertEqual(BR.classify_terrain(big, (59.79, 43.71)), BR.KIND_DENSE)
+
+    def test_a_tagged_battlemat_is_a_surface(self):
+        mat = self.piece(t=["battlemaster_battlemat"], bx=2.0, bz=2.0)
+        self.assertEqual(BR.classify_terrain(mat, (60.0, 44.0)), BR.KIND_SURFACE)
 
     def test_a_physical_marker_is_recognised_by_its_nickname(self):
+        # The objective markers are spawned separately from the map payload, so
+        # the capture is the only place they exist.
         for nick in ("Home Objective", "Center Objective", "Expansion Objective"):
             self.assertEqual(BR.classify_terrain(self.piece(n=nick, bx=1.0, bz=1.0)),
                              BR.KIND_OBJECTIVE, nick)
-
-    def test_a_log_without_the_material_falls_back_to_the_tag(self):
-        # Logs recorded before captureBoard stored the Description still have to
-        # colour correctly, which is what LEGACY_TERRAIN_MATERIAL is for.
-        self.assertEqual(BR.classify_terrain(self.piece(t=["Corner"])), BR.KIND_LIGHT)
-        self.assertEqual(BR.classify_terrain(self.piece(t=["Pipes"])), BR.KIND_DENSE)
-
-    def test_the_legacy_material_table_matches_every_shipped_map(self):
-        """LEGACY_TERRAIN_MATERIAL must stay true to data/maps, or it is a lie."""
-        maps = sorted((ROOT / "data" / "maps").glob("*.lua"))
-        self.assertTrue(maps, "no map payloads to check against")
-        found = {}
-        for path in maps:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for blob in re.findall(r"\[\[(\{.*?\})\]\]", text, re.S):
-                try:
-                    obj = json.loads(blob)
-                except ValueError:
-                    continue
-                desc = (obj.get("Description") or "").strip().lower()
-                if not desc:
-                    continue
-                # Combined pieces name both materials; they are covered by the
-                # mixed-piece rule, not by a per-tag entry.
-                if "dense" in desc and "light" in desc:
-                    continue
-                if "dense" in desc:
-                    kind = BR.KIND_DENSE
-                elif "light" in desc:
-                    kind = BR.KIND_LIGHT
-                else:
-                    continue
-                for tag in (obj.get("Tags") or []):
-                    found.setdefault(tag, set()).add(kind)
-        self.assertTrue(found, "no materials found in the map payloads")
-        for tag, kinds in sorted(found.items()):
-            self.assertEqual(len(kinds), 1, f"{tag} is both {sorted(kinds)}")
-            self.assertEqual(BR.LEGACY_TERRAIN_MATERIAL.get(tag), next(iter(kinds)),
-                             f"{tag} is {next(iter(kinds))} in data/maps")
 
     def test_a_combo_piece_is_labelled_with_both_of_its_names(self):
         label = BR.terrain_label(self.piece(t=["Short Barrier", "Tower"], d="Dense"))
         self.assertIn("Short Barrier", label)
         self.assertIn("Tower", label)
-
-    def test_every_piece_carries_a_kind_into_the_report(self):
-        report = BR.build_report(make_log())
-        for piece in report["board"]["terrain"]:
-            self.assertIn(piece["kind"],
-                          {BR.KIND_SURFACE, BR.KIND_AREA, BR.KIND_LIGHT,
-                           BR.KIND_DENSE, BR.KIND_OBJECTIVE})
 
     def test_objective_markers_are_preferred_over_the_outlines(self):
         pieces = [
@@ -816,6 +747,12 @@ class TestTerrainClassification(unittest.TestCase):
         pieces = [{"kind": BR.KIND_AREA, "x": 1.2, "z": 2.2, "label": "bigrect",
                    "t": ["obj_home_red"]}]
         self.assertEqual(len(BR._objective_anchors(pieces)), 1)
+
+    def test_an_objective_area_is_labelled_with_its_objective(self):
+        # This label ends up on the marker when no physical one was captured, so
+        # "terrain area" on an objective would be actively misleading.
+        self.assertEqual(BR.terrain_label(self.piece(t=["obj_home_red"])),
+                         "obj_home_red")
 
 
 class TestBoardOrientation(unittest.TestCase):
@@ -919,176 +856,189 @@ class TestBoardCapture(unittest.TestCase):
         source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
         self.assertRegex(source, r"BATTLE_BOARD_DESC_MAX = \d+")
 
-    def test_it_records_the_area_outline_shape(self):
-        self.assertIn("5mm%-border", self.body)
-        self.assertIn("sh = sh,", self.body)
+    def test_it_no_longer_sniffs_the_mesh_for_a_plate_shape(self):
+        # Terrain geometry comes from the map's shipped payload now, so the
+        # capture has no reason to open getCustomObject(). Leaving the sniff in
+        # would invite the old bounds-guessing path back.
+        self.assertNotIn("5mm%-border", self.body)
+        self.assertNotIn("sh = sh,", self.body)
 
-    def test_the_shape_pattern_matches_the_meshes_the_maps_actually_use(self):
-        # The Lua pattern and AREA_SHAPES have to agree, or every area is
-        # misclassified as a terrain feature.
-        pattern = re.compile(r"-([a-z]+)-5mm-border")
-        maps = sorted((ROOT / "data" / "maps").glob("*.lua"))
-        found = set()
-        for path in maps[:40]:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            found.update(pattern.findall(text))
-        self.assertTrue(found, "no area outline meshes found in the map payloads")
-        self.assertTrue(found <= BR.AREA_SHAPES,
-                        f"unknown area shapes: {sorted(found - BR.AREA_SHAPES)}")
+    def test_it_records_the_mirror_rotations(self):
+        # Battlemaster mirrors a plate with a 180 on x or z rather than a negative
+        # scale, and the payload reader relies on those being real rotations.
+        self.assertIn("rx = rx,", self.body)
+        self.assertIn("rz = rz,", self.body)
 
 
-class TestPlateFootprints(unittest.TestCase):
-    """Terrain areas draw their real footprint, not the box their bounds imply."""
+class TestPlateOutlines(unittest.TestCase):
+    """Terrain areas draw their real footprint, taken from the map's own payload.
 
-    # Authored plate sizes, from TERRAIN_ASSETS in battlemaster_reconstruct.py.
-    AUTHORED = {
-        "shortline": (6.003, 2.003), "smallrect": (6.003, 4.003),
-        "longline": (10.003, 2.503), "bigrect": (11.503, 7.003),
-        "triangle": (11.503, 8.003),
-    }
+    These are the tests that pin the placement convention. Sixteen combinations of
+    axis flips and yaw sign were plausible; exactly one puts every plate of every
+    shipped map on the board, and the runner-up misses by 1152 square inches. Any
+    of the others reads as "mostly fine" by eye while mirroring the trapezoid, so
+    the invariant below is what actually keeps this honest.
+    """
 
-    def test_an_outline_is_known_for_every_area_shape(self):
-        self.assertEqual(set(BR.PLATE_OUTLINES), BR.AREA_SHAPES)
-        self.assertEqual(set(BR.PLATE_BOUNDS), BR.AREA_SHAPES)
+    @staticmethod
+    def ring_area(points):
+        n = len(points)
+        return abs(sum(points[i][0] * points[(i + 1) % n][1]
+                       - points[(i + 1) % n][0] * points[i][1]
+                       for i in range(n))) / 2
 
-    def test_each_outline_spans_its_authored_size(self):
-        for shape, (width, height) in self.AUTHORED.items():
-            pts = BR.PLATE_OUTLINES[shape]
-            span_x = max(p[0] for p in pts) - min(p[0] for p in pts)
-            span_z = max(p[1] for p in pts) - min(p[1] for p in pts)
-            self.assertAlmostEqual(span_x, width, places=2, msg=shape)
-            self.assertAlmostEqual(span_z, height, places=2, msg=shape)
+    @classmethod
+    def clip_to_board(cls, poly, half_w, half_h):
+        """Sutherland-Hodgman. Exact, and fast enough to run over every map."""
+        edges = (
+            (lambda p: p[0] >= -half_w,
+             lambda a, b: (-half_w, a[1] + (b[1] - a[1]) * (-half_w - a[0]) / (b[0] - a[0]))),
+            (lambda p: p[0] <= half_w,
+             lambda a, b: (half_w, a[1] + (b[1] - a[1]) * (half_w - a[0]) / (b[0] - a[0]))),
+            (lambda p: p[1] >= -half_h,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (-half_h - a[1]) / (b[1] - a[1]), -half_h)),
+            (lambda p: p[1] <= half_h,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (half_h - a[1]) / (b[1] - a[1]), half_h)),
+        )
+        for inside, cross in edges:
+            out = []
+            for i in range(len(poly)):
+                a, b = poly[i - 1], poly[i]
+                if inside(b):
+                    if not inside(a):
+                        out.append(cross(a, b))
+                    out.append(b)
+                elif inside(a):
+                    out.append(cross(a, b))
+            poly = out
+            if not poly:
+                return []
+        return poly
 
-    def test_the_authored_sizes_still_match_the_reconstructor(self):
-        """If Battlemaster reshapes a plate, these outlines go stale silently."""
-        source = (ROOT / "scripts" / "battlemaster_reconstruct.py").read_text(
-            encoding="utf-8", errors="replace")
-        block = source[source.index("TERRAIN_ASSETS = ("):]
-        block = block[:block.index("\n)\n")]
-        found = {}
-        for entry in re.finditer(
-                r'"plate":\s*"\d+-(\w+)".*?"width":\s*([\d.]+),\s*"height":\s*([\d.]+)',
-                block, re.S):
-            found[entry.group(1)] = (float(entry.group(2)), float(entry.group(3)))
-        self.assertEqual(set(found), set(self.AUTHORED),
-                         "the reconstructor's plate list changed")
-        for shape, size in found.items():
-            self.assertEqual(size, self.AUTHORED[shape], f"{shape} was resized")
+    def test_every_plate_of_every_shipped_map_has_a_known_outline(self):
+        """A gap here means some map silently loses all of its terrain."""
+        guids = sorted(MP.manifest_card_guids())
+        self.assertTrue(guids, "no map cards in the manifest")
+        unresolved = [g for g in guids if MT.map_terrain(g) is None]
+        self.assertEqual(unresolved, [],
+                         f"{len(unresolved)} manifest maps have an unknown plate mesh")
 
-    def test_the_triangle_plate_is_a_trapezoid(self):
-        # It is named "triangle" but has four corners, two of them a short edge.
-        # Drawing it as a triangle -- or as a box -- is wrong either way.
-        pts = BR.PLATE_OUTLINES["triangle"]
-        self.assertEqual(len(pts), 4)
-        short_edge = [p for p in pts if abs(p[0] - 5.932) < 0.001]
-        self.assertEqual(len(short_edge), 2)
-        self.assertAlmostEqual(abs(short_edge[0][1] - short_edge[1][1]), 2.0, places=2)
+    def test_no_plate_hangs_off_the_board(self):
+        """The invariant that identifies the one correct placement convention.
 
-    def test_no_two_plates_can_be_confused_by_their_bounds(self):
-        # The bounds inference below is only sound while the boxes stay apart.
-        names = sorted(BR.PLATE_BOUNDS)
-        for i, a in enumerate(names):
-            for b in names[i + 1:]:
-                gap = max(abs(BR.PLATE_BOUNDS[a][0] - BR.PLATE_BOUNDS[b][0]),
-                          abs(BR.PLATE_BOUNDS[a][1] - BR.PLATE_BOUNDS[b][1]))
-                self.assertGreater(gap, 2 * BR.PLATE_BOUNDS_TOLERANCE,
-                                   f"{a} and {b} are within tolerance of each other")
+        A plate is part of a designed layout; none of them overhang the table. So
+        any flip or sign error shows up here as area outside the board rectangle,
+        and the correct convention scores exactly zero.
+        """
+        total_outside = 0.0
+        hanging = []
+        plates = 0
+        for guid in sorted(MP.manifest_card_guids()):
+            terrain = MT.map_terrain(guid)
+            self.assertIsNotNone(terrain, guid)
+            width, height = terrain["board"] or (60.0, 44.0)
+            for plate in terrain["plates"]:
+                points = [tuple(pt) for pt in plate["points"]]
+                plates += 1
+                inside = self.clip_to_board(points, width / 2, height / 2)
+                outside = self.ring_area(points) - (
+                    self.ring_area(inside) if len(inside) >= 3 else 0.0)
+                if outside > 0.05:
+                    hanging.append((guid, plate["shape"], round(outside, 2)))
+                total_outside += max(0.0, outside)
+        self.assertGreater(plates, 3000, "expected thousands of plates to check")
+        self.assertEqual(hanging, [], f"{len(hanging)} plates hang off the board")
+        self.assertAlmostEqual(total_outside, 0.0, places=3)
 
-    def test_a_captured_box_identifies_its_plate(self):
-        for shape, (width, height) in BR.PLATE_BOUNDS.items():
-            piece = {"bx": width / 2, "bz": height / 2}
-            self.assertEqual(BR.infer_plate(piece), shape)
+    def test_the_mesh_x_axis_is_negated(self):
+        """.obj is right-handed and TTS is left-handed.
 
-    def test_something_that_is_not_a_plate_is_not_guessed_at(self):
-        self.assertIsNone(BR.infer_plate({"bx": 1.0, "bz": 1.0}))
+        Dropping this flip mirrors every asymmetric plate -- which looks fine for
+        the rectangles, and put the trapezoid the wrong way round.
+        """
+        ring = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0)]
+        placed = MT.place_ring(ring, {"posX": 0, "posZ": 0, "rotY": 0})
+        self.assertEqual([p[0] for p in placed], [0.0, -2.0, -2.0])
+        self.assertEqual([p[1] for p in placed], [0.0, 0.0, 1.0])
 
-    def test_an_old_log_still_gets_real_footprints(self):
-        # No sh field, only bounds -- which is every log recorded before the plate
-        # name was captured.
+    def test_a_180_about_z_mirrors_the_x_axis_back(self):
+        ring = [(0.0, 0.0), (2.0, 0.0)]
+        placed = MT.place_ring(ring, {"posX": 0, "posZ": 0, "rotY": 0, "rotZ": 180})
+        self.assertEqual([p[0] for p in placed], [0.0, 2.0])
+
+    def test_a_180_about_x_mirrors_the_z_axis(self):
+        ring = [(0.0, 0.0), (0.0, 3.0)]
+        placed = MT.place_ring(ring, {"posX": 0, "posZ": 0, "rotY": 0, "rotX": 180})
+        self.assertEqual([p[1] for p in placed], [0.0, -3.0])
+
+    def test_a_yaw_rotates_the_outline(self):
+        # 90 degrees of TTS yaw takes local +x to board -z.
+        placed = MT.place_ring([(1.0, 0.0)], {"posX": 0, "posZ": 0, "rotY": 90})
+        self.assertAlmostEqual(placed[0][0], 0.0, places=6)
+        self.assertAlmostEqual(placed[0][1], 1.0, places=6)
+
+    def test_the_trapezoid_keeps_its_handedness(self):
+        """The plate the maps call a triangle is really a right trapezoid.
+
+        Negating one axis flips a ring's signed area, so this is exactly the
+        quantity the mirroring bug changed. Pinned so the x flip above cannot be
+        quietly dropped again.
+        """
+        shapes, _ = MT.load_outlines()
+        placed = MT.place_ring(shapes["triangle"], {"posX": 0, "posZ": 0, "rotY": 0})
+        n = len(placed)
+        signed = sum(placed[i][0] * placed[(i + 1) % n][1]
+                     - placed[(i + 1) % n][0] * placed[i][1] for i in range(n)) / 2
+        self.assertGreater(abs(signed), 40, "not the trapezoid we think it is")
+        self.assertLess(signed, 0, "the trapezoid came out mirrored")
+
+    def test_a_symmetric_map_places_its_objective_plates_symmetrically(self):
+        """End to end on a real map, with the layout's own symmetry as the check.
+
+        Tipping Point is 180-degree rotationally symmetric, so every objective
+        plate must have a partner that is its exact point reflection. A mirror or
+        sign error breaks that pairing without moving anything off the board.
+        """
+        terrain = MT.map_terrain("ff5fec")   # PtF vs Dis 2 - Tipping Point - T5S2
+        self.assertIsNotNone(terrain)
+        tagged = [p for p in terrain["plates"] if p["tags"]]
+        self.assertEqual(len(tagged), 6)
+        for plate in tagged:
+            reflected = sorted((-x, -z) for x, z in plate["points"])
+            self.assertTrue(
+                any(self._rings_match(reflected, sorted(map(tuple, other["points"])))
+                    for other in tagged),
+                f"{plate['tags']} has no symmetric partner")
+
+    @staticmethod
+    def _rings_match(a, b, tol=0.01):
+        return len(a) == len(b) and all(
+            abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol for p, q in zip(a, b))
+
+    def test_a_map_with_no_payload_reports_terrain_as_unknown(self):
         log = make_log()
-        log["board"] = [{"g": "p1", "n": "", "t": [], "x": 0.0, "z": 0.0, "ry": 0,
-                         "sx": 1, "sz": 1, "bx": 5.0, "bz": 1.814}]
-        piece = BR.build_report(log)["board"]["terrain"][0]
-        self.assertEqual(piece["kind"], BR.KIND_AREA)
-        self.assertEqual(piece["sh"], "longline")
+        log["game"]["mapGuid"] = "zzzzzz"
+        report = BR.build_report(log)
+        self.assertFalse(report["board"]["terrain_known"])
+        self.assertEqual(report["board"]["terrain"], [])
 
-    def test_the_outlines_reach_the_page(self):
-        page = BR.render_html(BR.build_report(make_log()))
-        self.assertIn("platePoints", page)
-        self.assertIn('"plates":', page.replace(" ", ""))
-
-    def test_a_plate_renders_as_a_polygon_and_other_terrain_as_a_box(self):
+    def test_a_real_map_fills_the_board_terrain(self):
         log = make_log()
-        log["board"] = [
-            {"g": "p1", "n": "", "t": [], "sh": "bigrect", "x": 0.0, "z": 0.0,
-             "ry": 0, "sx": 1, "sz": 1, "bx": 5.75, "bz": 3.771},
-            {"g": "p2", "n": "", "t": ["Tower"], "d": "Dense", "x": 4.0, "z": 2.0,
-             "ry": 0, "sx": 1, "sz": 1, "bx": 1.2, "bz": 1.2},
-        ]
+        log["game"]["mapGuid"] = "ff5fec"
+        report = BR.build_report(log)
+        self.assertTrue(report["board"]["terrain_known"])
+        self.assertEqual(len(report["board"]["terrain"]), 16)
+        for plate in report["board"]["terrain"]:
+            self.assertGreaterEqual(len(plate["points"]), 3)
+
+    def test_the_renderer_draws_areas_and_nothing_else(self):
+        log = make_log()
+        log["game"]["mapGuid"] = "ff5fec"
         report = BR.build_report(log)
         svg = BR.render_board_svg(report, report["frames"][0])
-        self.assertEqual(svg.count("<polygon"), 1)
-        self.assertEqual(len(re.findall(r'<rect[^>]*class="t-', svg)), 1)
-
-    def test_a_mirrored_plate_is_flipped_not_just_rotated(self):
-        # Battlemaster mirrors with an extra 180 about x or z; without honouring it
-        # the trapezoid faces the wrong way.
-        log = make_log()
-        base = {"g": "p1", "n": "", "t": [], "sh": "triangle", "x": 0.0, "z": 0.0,
-                "ry": 0, "sx": 1, "sz": 1, "bx": 5.931, "bz": 4.0}
-        plain = BR.build_report(dict(log, board=[dict(base)]))
-        flipped = BR.build_report(dict(log, board=[dict(base, rz=180)]))
-        a = BR.render_board_svg(plain, plain["frames"][0])
-        b = BR.render_board_svg(flipped, flipped["frames"][0])
-        self.assertIn("<polygon", a)
-        self.assertNotEqual(re.search(r'<polygon points="([^"]+)"', a).group(1),
-                            re.search(r'<polygon points="([^"]+)"', b).group(1))
-
-    def test_the_mod_records_the_mirror_rotations(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        start = source.index("function captureBoard")
-        body = source[start:source.index("\nend", source.index("Wait.frames", start))]
-        self.assertIn("rx = rx,", body)
-        self.assertIn("rz = rz,", body)
-        # stored only when set, so a normal piece costs nothing
-        self.assertIn("if rx == 0 then rx = nil end", body)
-
-
-class TestLayoutArt(unittest.TestCase):
-    """The mission's layout diagram is shown as the deployment view."""
-
-    def test_the_url_crosses_the_script_boundary_as_a_string(self):
-        # Same rule as selectedDeploymentJSON: a card table owned by startMenu must
-        # not be read from Global.
-        menu = START_MENU_LUA.read_text(encoding="utf-8", errors="replace")
-        self.assertIn("function loadedLayoutArtURL()", menu)
-        glob_src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        body = glob_src[glob_src.index("function battleLayoutArtURL"):]
-        body = body[:body.index("\nend")]
-        self.assertIn('sm.call("loadedLayoutArtURL")', body)
-        self.assertIn('type(raw) ~= "string"', body)
-
-    def test_it_is_looked_up_once_per_game(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        self.assertIn("_battleArtTried", source)
-        # and cleared when a new game starts, or the next game inherits the miss
-        reset = source[source.index("function resetBattleLog"):]
-        self.assertIn("_battleArtTried = false", reset[:reset.index("\nend")])
-
-    def test_the_viewer_only_loads_it_over_http(self):
-        self.assertIn("/^https?:", BR.VIEWER_JS)
-
-    def test_the_page_carries_the_art_url_when_the_log_has_one(self):
-        log = make_log()
-        log["game"]["art"] = "https://example.invalid/layout.jpg"
-        page = BR.render_html(BR.build_report(log))
-        self.assertIn("example.invalid/layout.jpg", page)
-        self.assertIn('id="artImg"', page)
-
-    def test_a_log_without_art_still_renders_the_vector_deployment_map(self):
-        page = BR.render_html(BR.build_report(make_log()))
-        self.assertIn("renderDeployMap", page)
-        self.assertIn('"art":null', page.replace(" ", ""))
+        self.assertEqual(svg.count("t-area"), 16)
+        self.assertNotIn("t-light", svg)
+        self.assertNotIn("t-dense", svg)
 
 
 if __name__ == "__main__":

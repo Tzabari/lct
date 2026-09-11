@@ -2516,34 +2516,6 @@ function returnLoadedLayoutArtCardToDeck()
     end
 end
 
--- Image URL of the mission's layout-art card -- the diagram that shows terrain,
--- deployment zones, objectives and the territory divider on one page. The battle
--- report uses it as its deployment view, where it beats any reconstruction.
---
--- Resolved here rather than in Global on purpose: the guid lives in this script's
--- state, and a bare string crosses the script boundary safely where the card's own
--- table would not (see selectedDeploymentJSON for the same reason).
-function loadedLayoutArtURL()
-    local card = nil
-    if loadedLayoutArtCardGuid then
-        card = getObjectFromGUID(loadedLayoutArtCardGuid)
-    end
-    if card == nil then
-        -- Joining a game already in progress leaves this script with no guid, but
-        -- the card itself is still parked on the table wearing its tag.
-        for _, obj in ipairs(getAllObjects()) do
-            if obj.hasTag ~= nil and obj.hasTag(layoutArtCardTag) then
-                card = obj
-                break
-            end
-        end
-    end
-    if card == nil then return "" end
-    local custom = card.getCustomObject()
-    if type(custom) ~= "table" or type(custom.face) ~= "string" then return "" end
-    return custom.face
-end
-
 function placeLoadedLayoutArtCard(mapName)
     local card = findLooseLayoutArtCard(mapName)
     returnLayoutCardsToDeck(card)

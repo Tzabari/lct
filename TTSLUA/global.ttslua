@@ -1379,7 +1379,6 @@ end
 
 battleLog = battleLog or defaultBattleLog()
 _battleDeployTried = _battleDeployTried or false
-_battleArtTried = _battleArtTried or false
 _battleCaptureGuard = false
 _battleCapWarned = false
 
@@ -1779,25 +1778,10 @@ function captureBoard(done)
                     elseif #desc > BATTLE_BOARD_DESC_MAX then
                         desc = string.sub(desc, 1, BATTLE_BOARD_DESC_MAX)
                     end
-                    -- Terrain AREAS are outline meshes named
-                    -- battlemaster-rugged-NN-<shape>-5mm-border.obj, and they carry
-                    -- no Description at all. That shape word is what separates an
-                    -- area from the terrain standing inside it, and it names the
-                    -- real footprint -- a triangle's bounding box looks nothing
-                    -- like the triangle.
-                    local sh = nil
-                    pcall(function()
-                        local custom = o.getCustomObject()
-                        if type(custom) == "table" and type(custom.mesh) == "string" then
-                            sh = string.match(custom.mesh, "%-(%a+)%-5mm%-border")
-                        end
-                    end)
                     -- Battlemaster mirrors a terrain plate with an extra 180 on x
                     -- or z rather than by negating a scale (see _build_terrain_plate
-                    -- in scripts/battlemaster_reconstruct.py). The rectangular
-                    -- plates do not care, but the trapezoid faces the wrong way
-                    -- without this. Stored only when actually set, which is a
-                    -- handful of objects per map.
+                    -- in scripts/battlemaster_reconstruct.py). Stored only when
+                    -- actually set, which is a handful of objects per map.
                     local rx = math.floor((r.x or 0) + 0.5) % 360
                     local rz = math.floor((r.z or 0) + 0.5) % 360
                     if rx == 0 then rx = nil end
@@ -1816,7 +1800,6 @@ function captureBoard(done)
                         bx = bx,
                         bz = bz,
                         d  = desc,
-                        sh = sh,
                     })
                 end
             end
@@ -1932,12 +1915,6 @@ function battleEnsureGameContext()
             _battleDeployTried = true
             g.deploy = battleDeploymentSpec(sm)
         end
-        -- Same one-shot treatment: a mission with no paired layout art yields an
-        -- empty string forever, so there is nothing to gain by asking again.
-        if g.art == nil and not _battleArtTried then
-            _battleArtTried = true
-            g.art = battleLayoutArtURL(sm)
-        end
     end
     -- Seats can fill after the game starts, so a name is taken the first time it
     -- is actually available rather than only at game start.
@@ -2052,7 +2029,6 @@ function resetBattleLog(keepRoster)
     battleLog.units  = units
     _battleCapWarned = false
     _battleDeployTried = false
-    _battleArtTried = false
 end
 
 -- The chosen deployment as data, not geometry. LCT destroys the drawn deployment
@@ -2080,20 +2056,6 @@ function battleDeploymentSpec(sm)
     end)
     if not ok then return nil end
     return spec
-end
-
--- Image URL of the mission's layout-art diagram, which the report shows as its
--- deployment view. The lookup itself lives in startMenu (loadedLayoutArtURL); all
--- that crosses the boundary here is a string, for the reason spelled out above.
-function battleLayoutArtURL(sm)
-    if sm == nil then return nil end
-    local ok, url = pcall(function()
-        local raw = sm.call("loadedLayoutArtURL")
-        if type(raw) ~= "string" or raw == "" then return nil end
-        return raw
-    end)
-    if not ok then return nil end
-    return url
 end
 
 -- Called by startMenu.startGame: one log per game, seeded with a deployment
