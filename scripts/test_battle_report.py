@@ -1317,15 +1317,54 @@ class TestReportStore(unittest.TestCase):
         store.put("<html></html>")
         self.assertIsNone(store.get("nosuchid"))
 
+    def test_put_accepts_a_caller_supplied_id(self):
+        store = RS.ReportStore()
+        report_id = store.put("<html></html>", report_id="my-custom-id")
+        self.assertEqual(report_id, "my-custom-id")
+        self.assertIsNotNone(store.get("my-custom-id"))
+
+    def test_put_rejects_a_caller_supplied_id_that_collides(self):
+        store = RS.ReportStore()
+        store.put("<html>1</html>", report_id="dupe-id")
+        with self.assertRaises(ValueError):
+            store.put("<html>2</html>", report_id="dupe-id")
+
+    def test_put_rejects_an_invalid_caller_supplied_id(self):
+        store = RS.ReportStore()
+        with self.assertRaises(ValueError):
+            store.put("<html></html>", report_id="../escape")
+
+    def test_status_distinguishes_missing_from_expired(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(ttl_seconds=10, now=clock)
+        report_id = store.put("<html></html>")
+        self.assertEqual(store.status(report_id), "ok")
+        self.assertEqual(store.status("nosuchid"), "missing")
+        clock.advance(11)
+        self.assertEqual(store.status(report_id), "expired")
+
+    def test_status_does_not_discard_an_expired_entry(self):
+        """A peek, not a side effect -- get()/prune() still own eviction."""
+        clock = _FakeClock()
+        store = RS.ReportStore(ttl_seconds=10, now=clock)
+        report_id = store.put("<html></html>")
+        clock.advance(11)
+        store.status(report_id)
+        self.assertEqual(len(store), 1, "status() must not have evicted the entry")
+
     def test_ids_do_not_escape_the_store_dir(self):
         """The traversal guard. This test must never be skipped or weakened."""
         with tempfile.TemporaryDirectory() as tmp:
             store = RS.ReportStore(directory=tmp)
             store.put("<html></html>")
             before = sorted(Path(tmp).iterdir())
-            for hostile in ("../../etc/passwd", "a/b", "", "..", ".", "/etc/passwd",
-                            "a" * 200, "valid-but-unknown-id"):
+            malformed = ("../../etc/passwd", "a/b", "", "..", ".", "/etc/passwd", "a" * 200)
+            for hostile in malformed + ("valid-but-unknown-id",):
                 self.assertIsNone(store.get(hostile), repr(hostile))
+                self.assertEqual(store.status(hostile), "missing", repr(hostile))
+            for hostile in malformed:
+                with self.assertRaises(ValueError, msg=repr(hostile)):
+                    store.put("<html></html>", report_id=hostile)
             # No file was read or written anywhere as a side effect of the lookups.
             self.assertEqual(sorted(Path(tmp).iterdir()), before)
 

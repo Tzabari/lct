@@ -93,12 +93,20 @@ class ReportStore:
 
     # -- writing ----------------------------------------------------------
 
-    def put(self, html, nonce="", meta=None):
+    def put(self, html, nonce="", meta=None, report_id=None):
         """Store a rendered report and return its id.
 
         Raises StoreFull when the store is at capacity after pruning expired
         entries -- it is the caller's job to turn that into a 503, not this
         method's job to evict a live report to make room.
+
+        `report_id`, when given, is used instead of generating one. This is for
+        the hosted server: it needs the id to build the download link it bakes
+        into the report's own banner *before* the content it hashes/stores is
+        final, so it mints the id itself and hands it in rather than learning it
+        from the return value. Raises ValueError for a caller-supplied id that
+        is malformed or already in use -- a real bug, not something to paper
+        over silently.
         """
         gz = gzip.compress(html.encode("utf-8"))
         size = len(gz)
@@ -111,13 +119,20 @@ class ReportStore:
                     f"store full ({len(self._entries)}/{self.max_reports} reports, "
                     f"{self._total_bytes + size}/{self.max_bytes} bytes)")
 
+            if report_id is not None:
+                if not _VALID_ID.match(report_id):
+                    raise ValueError(f"invalid report_id: {report_id!r}")
+                if report_id in self._entries:
+                    raise ValueError(f"report_id already in use: {report_id!r}")
+            else:
+                report_id = self._new_id_locked()
+
             # Decided once, here, from how full the store already is -- an
             # existing entry's promised TTL never changes because of a later put.
             ttl = self.ttl_seconds
             if self._occupancy_locked() >= self.high_watermark:
                 ttl = min(self.ttl_seconds, self.ttl_under_load)
 
-            report_id = self._new_id_locked()
             entry = Entry(gz=gz, nonce=nonce, created=now, expires=now + ttl,
                            meta=dict(meta or {}))
             self._entries[report_id] = entry
@@ -156,6 +171,26 @@ class ReportStore:
                 self._discard_locked(report_id)
                 return None
             return entry
+
+    def status(self, report_id):
+        """"ok", "expired", or "missing" for report_id -- a non-mutating peek.
+
+        Lets a caller (the server's 404 body) say a link *expired* instead of a
+        generic *not found*: a stale link explaining itself beats one that
+        reads like a typo. Unlike get(), an expired entry found here is left in
+        place rather than discarded -- the next get() or prune() still cleans
+        it up; this is a read, not a side effect.
+        """
+        if not _VALID_ID.match(report_id or ""):
+            return "missing"
+        now = self._now()
+        with self._lock:
+            entry = self._entries.get(report_id)
+            if entry is None and self.directory:
+                entry = self._read_through_locked(report_id)
+            if entry is None:
+                return "missing"
+            return "expired" if entry.expires <= now else "ok"
 
     def mark_downloaded(self, report_id):
         """Cap report_id's remaining life to download_grace from now.
