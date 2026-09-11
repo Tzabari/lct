@@ -6,6 +6,7 @@ format, casualty accumulation, reserve detection from the board rectangle, and
 tolerance of logs that are partly malformed (a report should still render).
 """
 
+import gzip
 import json
 import re
 import sys
@@ -19,6 +20,7 @@ import bake_terrain_cache as BTC
 import battle_report as BR
 import map_payloads as MP
 import map_terrain as MT
+import report_store as RS
 
 ROOT = SCRIPT_DIR.parent
 GLOBAL_LUA = ROOT / "TTSLUA" / "global.ttslua"
@@ -1240,6 +1242,186 @@ class TestTerrainCache(unittest.TestCase):
                 self.assertEqual(MT.load_cache(Path(tmp) / "missing.json"), {})
         finally:
             MT._cache = original
+
+
+class _FakeClock:
+    """An injectable now() for report_store tests -- no real sleeping needed."""
+
+    def __init__(self, start=1_000_000.0):
+        self.value = start
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class TestReportStore(unittest.TestCase):
+    """report_store.ReportStore, exercised with no HTTP involved."""
+
+    def test_ids_are_short_urlsafe_and_unique(self):
+        store = RS.ReportStore(max_reports=50)
+        ids = {store.put("<html>x</html>") for _ in range(50)}
+        self.assertEqual(len(ids), 50, "collision, or an id was reused")
+        for report_id in ids:
+            self.assertRegex(report_id, r"\A[A-Za-z0-9_-]{6,64}\Z")
+
+    def test_put_get_round_trip(self):
+        store = RS.ReportStore()
+        report_id = store.put("<html>hello</html>", nonce="abc123",
+                               meta={"map": "Tipping Point"})
+        entry = store.get(report_id)
+        self.assertIsNotNone(entry)
+        self.assertEqual(gzip.decompress(entry.gz).decode("utf-8"),
+                         "<html>hello</html>")
+        self.assertEqual(entry.nonce, "abc123")
+        self.assertEqual(entry.meta, {"map": "Tipping Point"})
+
+    def test_unknown_id_is_a_miss(self):
+        store = RS.ReportStore()
+        store.put("<html></html>")
+        self.assertIsNone(store.get("nosuchid"))
+
+    def test_ids_do_not_escape_the_store_dir(self):
+        """The traversal guard. This test must never be skipped or weakened."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RS.ReportStore(directory=tmp)
+            store.put("<html></html>")
+            before = sorted(Path(tmp).iterdir())
+            for hostile in ("../../etc/passwd", "a/b", "", "..", ".", "/etc/passwd",
+                            "a" * 200, "valid-but-unknown-id"):
+                self.assertIsNone(store.get(hostile), repr(hostile))
+            # No file was read or written anywhere as a side effect of the lookups.
+            self.assertEqual(sorted(Path(tmp).iterdir()), before)
+
+    def test_put_raises_storefull_at_the_count_cap(self):
+        store = RS.ReportStore(max_reports=2)
+        store.put("<html>1</html>")
+        store.put("<html>2</html>")
+        with self.assertRaises(RS.StoreFull):
+            store.put("<html>3</html>")
+        self.assertEqual(len(store), 2)
+
+    def test_put_raises_storefull_at_the_byte_cap(self):
+        store = RS.ReportStore(max_reports=1000, max_bytes=1)
+        with self.assertRaises(RS.StoreFull):
+            store.put("<html>" + "x" * 1000 + "</html>")
+
+    def test_a_full_store_does_not_evict_a_live_entry_to_make_room(self):
+        store = RS.ReportStore(max_reports=1)
+        kept_id = store.put("<html>keep me</html>")
+        with self.assertRaises(RS.StoreFull):
+            store.put("<html>should not fit</html>")
+        entry = store.get(kept_id)
+        self.assertIsNotNone(entry, "the live entry was evicted instead of refused")
+        self.assertEqual(gzip.decompress(entry.gz).decode("utf-8"), "<html>keep me</html>")
+
+    def test_an_expired_entry_reads_as_a_miss_and_prune_frees_its_slot(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(max_reports=1, ttl_seconds=10, now=clock)
+        first_id = store.put("<html>1</html>")
+        clock.advance(11)
+        self.assertIsNone(store.get(first_id), "an expired entry must read as a miss")
+        # The slot was not freed by get() alone -- a fresh put still has to prune.
+        second_id = store.put("<html>2</html>")  # would raise StoreFull if still full
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(len(store), 1)
+
+    def test_prune_returns_the_count_it_removed(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(max_reports=10, ttl_seconds=10, now=clock)
+        store.put("<html>1</html>")
+        store.put("<html>2</html>")
+        clock.advance(11)
+        self.assertEqual(store.prune(), 2)
+        self.assertEqual(len(store), 0)
+
+    def test_disk_backed_store_survives_a_rebuild(self):
+        """Simulates a process restart: a fresh ReportStore over the same dir."""
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as tmp:
+            store_a = RS.ReportStore(directory=tmp, ttl_seconds=900, now=clock)
+            report_id = store_a.put("<html>durable</html>", nonce="n1",
+                                    meta={"map": "Test Map"})
+
+            store_b = RS.ReportStore(directory=tmp, ttl_seconds=900, now=clock)
+            entry = store_b.get(report_id)   # memory miss on store_b -> reads through
+            self.assertIsNotNone(entry)
+            self.assertEqual(gzip.decompress(entry.gz).decode("utf-8"), "<html>durable</html>")
+            self.assertEqual(entry.nonce, "n1")
+            self.assertEqual(entry.meta, {"map": "Test Map"})
+
+    def test_disk_backed_store_does_not_resurrect_an_expired_entry(self):
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as tmp:
+            store_a = RS.ReportStore(directory=tmp, ttl_seconds=10, now=clock)
+            report_id = store_a.put("<html>gone soon</html>")
+            clock.advance(11)
+
+            store_b = RS.ReportStore(directory=tmp, ttl_seconds=10, now=clock)
+            self.assertIsNone(store_b.get(report_id))
+
+
+class TestReportStoreTTLPolicy(unittest.TestCase):
+    """The three TTL mechanisms: base, load-shortened, and post-download."""
+
+    def test_put_below_the_high_watermark_gets_the_full_ttl(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(max_reports=5, ttl_seconds=900, ttl_under_load=120,
+                                high_watermark=0.8, now=clock)
+        report_id = store.put("<html></html>")
+        entry = store.get(report_id)
+        self.assertEqual(entry.expires - entry.created, 900)
+
+    def test_put_at_or_above_the_high_watermark_gets_the_shortened_ttl(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(max_reports=5, ttl_seconds=900, ttl_under_load=120,
+                                high_watermark=0.8, now=clock)
+        for _ in range(4):
+            store.put("<html></html>")   # occupancy before each: 0, .2, .4, .6 -> full TTL
+        fifth = store.put("<html></html>")   # occupancy before this one: 4/5 = .8 -> shortened
+        entry = store.get(fifth)
+        self.assertEqual(entry.expires - entry.created, 120)
+
+    def test_an_existing_entrys_ttl_does_not_change_when_later_puts_raise_the_load(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(max_reports=5, ttl_seconds=900, ttl_under_load=120,
+                                high_watermark=0.8, now=clock)
+        first = store.put("<html></html>")
+        original_expiry = store.get(first).expires
+        for _ in range(3):
+            store.put("<html></html>")
+        self.assertEqual(store.get(first).expires, original_expiry)
+
+    def test_mark_downloaded_shortens_expires_when_sooner_than_the_current_deadline(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(ttl_seconds=900, download_grace=60, now=clock)
+        report_id = store.put("<html></html>")
+        store.mark_downloaded(report_id)
+        entry = store.get(report_id)
+        self.assertEqual(entry.expires, clock() + 60)
+
+    def test_mark_downloaded_never_extends_a_deadline(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(ttl_seconds=2, download_grace=1000, now=clock)
+        report_id = store.put("<html></html>")
+        original_expiry = store.get(report_id).expires
+        store.mark_downloaded(report_id)
+        self.assertEqual(store.get(report_id).expires, original_expiry)
+
+    def test_mark_downloaded_on_an_unknown_id_is_a_silent_no_op(self):
+        store = RS.ReportStore()
+        store.mark_downloaded("doesnotexist")   # must not raise
+
+    def test_mark_downloaded_on_a_pruned_id_is_a_silent_no_op(self):
+        clock = _FakeClock()
+        store = RS.ReportStore(ttl_seconds=10, now=clock)
+        report_id = store.put("<html></html>")
+        clock.advance(11)
+        store.prune()
+        store.mark_downloaded(report_id)   # must not raise, must not resurrect it
+        self.assertIsNone(store.get(report_id))
 
 
 if __name__ == "__main__":
