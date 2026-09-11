@@ -2598,6 +2598,11 @@ end
 --
 -- The scene is swept once and handed down: getCardsInSecondarySlot falls back to
 -- its own getAllObjects when given nil, and there are sixteen slots to check.
+-- Every candidate is kept (not just the first found per name): Red and Blue draw
+-- secondaries from separate decks that can hold identically-named cards -- the
+-- same mission secondary offered to both sides -- so a flat one-per-name map
+-- silently handed one color's card to the other whenever both held a card with
+-- the same name. battleTakeNearestSecondaryCandidate below picks among them.
 function battleCollectSecondaryCandidates(scene)
     local byName = {}
     for _, o in ipairs(scene) do
@@ -2609,25 +2614,53 @@ function battleCollectSecondaryCandidates(scene)
                 -- contents by name and GUID without taking anything out, and
                 -- takeObject can then pull the one card by GUID.
                 pcall(function()
+                    local deckPos = o.getPosition()
                     for _, entry in ipairs(o.getObjects()) do
                         local n = entry.name
-                        if n ~= nil and n ~= "" and byName[n] == nil then
-                            byName[n] = {deck = o, guid = entry.guid}
+                        if n ~= nil and n ~= "" then
+                            byName[n] = byName[n] or {}
+                            table.insert(byName[n], {deck = o, guid = entry.guid, pos = deckPos})
                         end
                     end
                 end)
             else
                 local n = o.getName()
-                -- A loose card outranks one still in a deck: the deck entry was
-                -- only ever a fallback, and it is not the object the players are
-                -- looking at.
-                if n ~= nil and n ~= "" and (byName[n] == nil or byName[n].obj == nil) then
-                    byName[n] = {obj = o}
+                if n ~= nil and n ~= "" then
+                    byName[n] = byName[n] or {}
+                    table.insert(byName[n], {obj = o, pos = o.getPosition()})
                 end
             end
         end
     end
     return byName
+end
+
+-- Picks the same-named candidate physically closest to `near` (the slot being
+-- filled) and removes it from the pool, so neither the other color nor a later
+-- slot of this same color can also claim it. Every path that puts a secondary
+-- down -- drawing, discarding, locking into a slot -- leaves it on its own
+-- side of the table, which is what makes position a reliable tiebreaker where
+-- the name alone is not. Loose cards are preferred over ones still in a deck at
+-- an equal distance, matching the original single-candidate rule.
+function battleTakeNearestSecondaryCandidate(candidates, name, near)
+    local list = candidates[name]
+    if type(list) ~= "table" or #list == 0 then return nil end
+
+    local bestIdx, bestScore = nil, nil
+    for i, cand in ipairs(list) do
+        local p = cand.pos or near
+        local dx = (p.x or 0) - (near.x or 0)
+        local dz = (p.z or 0) - (near.z or 0)
+        local score = dx * dx + dz * dz
+        if cand.deck ~= nil then score = score + 1e6 end
+        if bestScore == nil or score < bestScore then
+            bestScore, bestIdx = score, i
+        end
+    end
+
+    local chosen = table.remove(list, bestIdx)
+    if #list == 0 then candidates[name] = nil end
+    return chosen
 end
 
 -- Puts the recorded secondary cards back in their slots.
@@ -2670,10 +2703,17 @@ function battleRestoreSecondaries(snap)
                     end
                     clearSecondarySlotAssignment(color, slotIndex)
                 else
-                    local hit = candidates[entry.n]
-                    -- 270/180 is the mod's own slot orientation, set when a card is
-                    -- drawn; z flips it face up or face down.
-                    local rot = {x = 0, y = 270, z = (entry.fd == true) and 0 or 180}
+                    -- Nearest-by-position, not first-by-name: Red and Blue can
+                    -- each hold a card with the same name, and this is what keeps
+                    -- one color's card from being handed to the other's slot.
+                    local hit = battleTakeNearestSecondaryCandidate(candidates, entry.n, target)
+                    -- The mod's own convention (see missionManager.ttslua's
+                    -- fixedSecondaryBoardRotation / moveFixedSecondaryToSlot): a
+                    -- card's slot rotation is always this fixed constant, and face
+                    -- up/down is controlled separately below via is_face_down/flip,
+                    -- never by encoding it into the rotation itself.
+                    local rot = {x = 0, y = 270, z = 0}
+                    local wantFaceDown = (entry.fd == true)
                     local keepGuid = (hit ~= nil and hit.obj ~= nil)
                                      and hit.obj.getGUID() or nil
 
@@ -2701,9 +2741,16 @@ function battleRestoreSecondaries(snap)
                             found.setRotation(rot)
                         end)
                         assignSecondarySlotCard(color, slotIndex, found)
+                        -- Give the rotation a moment to settle before reading
+                        -- is_face_down, same delay missionManager.ttslua uses.
                         Wait.frames(function()
-                            pcall(function() found.locked = true end)
-                        end, 2)
+                            pcall(function()
+                                if found.is_face_down ~= wantFaceDown then
+                                    found.flip()
+                                end
+                                found.locked = true
+                            end)
+                        end, 20)
                     else
                         local idx = slotIndex
                         pcall(function()
@@ -2716,13 +2763,16 @@ function battleRestoreSecondaries(snap)
                                     if card == nil then return end
                                     assignSecondarySlotCard(color, idx, card)
                                     Wait.frames(function()
-                                        pcall(function() card.locked = true end)
-                                    end, 2)
+                                        pcall(function()
+                                            if card.is_face_down ~= wantFaceDown then
+                                                card.flip()
+                                            end
+                                            card.locked = true
+                                        end)
+                                    end, 20)
                                 end,
                             })
                         end)
-                        -- Taken out, so it must not be handed to a second slot.
-                        candidates[entry.n] = nil
                     end
                 end
             end
@@ -2955,6 +3005,19 @@ function battleEndGame(player)
                        #battleLog.snaps .. " snapshot(s) recorded. " ..
                        "Pick a round, player and phase to rewind to.",
                        {0.4, 1, 0.4})
+
+        -- An army that was never registered was never captured, so its models
+        -- silently sit out every rewind -- this is the single most common way
+        -- a rewind looks like it "only moves one side". Warn here, at the one
+        -- moment it can still be fixed by registering and ending again.
+        local redCount, blueCount = battleRosterCount("Red"), battleRosterCount("Blue")
+        if redCount == 0 or blueCount == 0 then
+            local who = (redCount == 0 and blueCount == 0) and "Red and Blue have"
+                        or ((redCount == 0) and "Red has" or "Blue has")
+            broadcastToAll(who .. " no models registered, so rewind can never move " ..
+                           "that side. Select its models and press its REGISTER ARMY " ..
+                           "button, then press END GAME again.", {1, 0.6, 0.2})
+        end
 
         local last = battleLog.snaps[#battleLog.snaps]
         if last ~= nil then
