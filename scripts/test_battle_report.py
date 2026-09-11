@@ -684,6 +684,22 @@ class TestLuaWiringRemote(unittest.TestCase):
         self.assertIn("-- @@BATTLE_REPORT_REMOTE_BASE@@", self.src)
         self.assertIn("-- @@BATTLE_REPORT_TOKEN@@", self.src)
 
+    def test_compile_py_bakes_the_same_markers(self):
+        # The drift that would otherwise ship a mod pointing nowhere: the
+        # marker exists in the Lua source, but nothing writes to it.
+        compile_src = (SCRIPT_DIR / "compile.py").read_text(encoding="utf-8")
+        self.assertIn("def bake_battle_report_endpoint(", compile_src)
+        self.assertIn("@@BATTLE_REPORT_REMOTE_BASE@@", compile_src)
+        self.assertIn("@@BATTLE_REPORT_TOKEN@@", compile_src)
+        self.assertIn("bake_battle_report_endpoint(global_text", compile_src,
+                     "bake_battle_report_endpoint is defined but never called")
+
+    def test_a_test_build_bakes_an_empty_base_not_the_real_service(self):
+        import compile as C
+        out = C.bake_battle_report_endpoint(self.src, is_test=True)
+        self.assertIn('BATTLE_REPORT_REMOTE_BASE = ""', out)
+        self.assertIn('BATTLE_REPORT_TOKEN = ""', out)
+
     def test_the_health_path_matches_the_server(self):
         m = re.search(r'BATTLE_REPORT_HEALTH\s*=\s*"([^"]+)"', self.src)
         self.assertIsNotNone(m)
