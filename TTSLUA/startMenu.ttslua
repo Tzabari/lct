@@ -5732,6 +5732,32 @@ function jumpToPhase(idx)
     updateGameStateHUD()
 end
 
+-- Battle rewind: put the turn and phase back to a recorded moment.
+--
+-- Deliberately not jumpToPhase: this must not run gameNotStartedGuard (a rewind
+-- happens after END GAME, when the game is over) and must not record a snapshot
+-- (a review that rewrote the log it was reviewing would be worse than useless).
+-- It also sets currentTurn, which no phase jump does.
+--
+-- Called from Global via Object.call, so it takes one params table.
+function battleSetTurnState(params)
+    if type(params) ~= "table" then return false end
+
+    local turn = params.turn
+    if turn == "Red" or turn == "Blue" then
+        currentTurn = turn
+    end
+
+    local idx = tonumber(params.phase)
+    if idx ~= nil and phases[idx] ~= nil then
+        currentPhase = idx
+    end
+
+    writeMenus()
+    updateGameStateHUD()
+    return true
+end
+
 function updateGameStateHUD()
     local roundObj = getObjectFromGUID("ee92cf")
     local round = counterValue(roundObj)

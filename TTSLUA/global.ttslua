@@ -56,7 +56,7 @@ playerHudSettings = {
 }
 
 function getDefaultHudSettings()
-    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"}
+    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, rewindOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"}
 end
 
 function ensureHudSettings(color)
@@ -275,6 +275,7 @@ function applyHudPreferencesForColor(color)
     local overlayActive = settings.hudVisible and "true" or "false"
     local scoringOverlayActive = settings.scoringOverlayOpen and "true" or "false"
     local scoringMinimalist = settings.scoringOverlayMinimalist
+    local rewindOverlayActive = settings.rewindOverlayOpen and "true" or "false"
     local clockActive = not settings.clockHidden
 
     setHudAttributeForColor(color, {id = "HelpOverlay", attr = "active", value = helpOverlayActive})
@@ -290,6 +291,7 @@ function applyHudPreferencesForColor(color)
         setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "PrimaryMission", attr = "active", value = scoringMinimalist and "false" or "true"})
         setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "Extras", attr = "active", value = scoringMinimalist and "false" or "true"})
     end
+    setHudAttributeForColor(color, {id = "RewindOverlay", attr = "active", value = rewindOverlayActive})
     setHudAttributeForColor(color, {id = "LockBtn", attr = "color", value = "#FFFFFF"})
     setHudAttributeForColor(color, {id = "ClockBtn", attr = "color", value = "#FFFFFF"})
 
@@ -310,6 +312,7 @@ function hudToggleHelp(player, value, id)
     settings.helpOverlayOpen = not settings.helpOverlayOpen
     if settings.helpOverlayOpen then
         settings.scoringOverlayOpen = false
+        settings.rewindOverlayOpen = false
     end
     applyHudPreferencesForColor(color)
 end
@@ -327,6 +330,7 @@ function hudToggleLock(player, value, id)
     settings.scoringOverlayOpen = not settings.scoringOverlayOpen
     if settings.scoringOverlayOpen then
         settings.helpOverlayOpen = false
+        settings.rewindOverlayOpen = false
         -- The freshly-opened board renders from XML defaults, so drop the cache to
         -- force a full repaint (cached values would otherwise be skipped as "current").
         invalidateScoringCache()
@@ -2403,6 +2407,574 @@ function exportBattleReport(playerColor)
                 printToColor("Battle report opened in your browser.", playerColor, {0.4, 1, 0.4})
             end
         end)
+end
+
+
+--[[ ================= BATTLE LOG: REWIND ================================
+Rewind is REVIEW, not undo. The log is never truncated: pressing END GAME closes
+it to further recording, and from then on the table can be scrubbed to any
+recorded moment and back to the end as many times as the players like. Nothing is
+destroyed by looking, which is what makes it safe to offer at all.
+
+What a rewind writes: model positions, rotations and nicknames (which carry the
+wounds), CP, the round and turn counters, the turn/phase state, the scoresheet
+grid, and the secondary cards in their slots.
+======================================================================= ]]
+
+-- Models restored per frame. A 400-model army moved in a single frame stalls TTS
+-- visibly; at 25 the largest legal army takes about a quarter of a second.
+BATTLE_REWIND_BATCH = 25
+
+_battleRewindBusy = false
+-- The selector's current Round / Player / Phase, shared by every HUD panel: one
+-- player choosing a moment to look at is showing it to the table, not to himself.
+battleRewindSel = battleRewindSel or {r = 1, t = "Red", p = 1}
+
+-- Index of the snapshot for a round/turn/phase, or nil.
+--
+-- Searches backwards so that when the same phase was recorded more than once --
+-- a manual CAPTURE on top of the automatic one -- the LAST state of that phase
+-- wins, which is what someone asking for "round 2, Red, shooting" means.
+function battleFindSnapshot(round, turn, phase)
+    if battleLog == nil or type(battleLog.snaps) ~= "table" then return nil end
+    round = tonumber(round)
+    phase = tonumber(phase)
+    for i = #battleLog.snaps, 1, -1 do
+        local s = battleLog.snaps[i]
+        if s ~= nil and tonumber(s.r) == round and s.t == turn
+           and tonumber(s.p) == phase then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Restores a model's displayed name, which is where its wounds live.
+--
+-- setName is the whole story here. The datasheet script's changeModelWoundCount
+-- re-reads the current wound count out of the nickname on every call and keeps no
+-- counter of its own, so the next wound a player applies steps correctly from the
+-- restored value. That also makes this the one path that works for unscripted
+-- models -- four of the ten in a live save carry a wound-prefixed name with an
+-- empty LuaScript -- and it brings the colour markup, which encodes the health
+-- bracket, back character for character instead of reconstructing it.
+--
+-- The one thing it cannot reach is updateBracketCharacteristics, which repaints
+-- the datasheet popup's profile row for wound-tracked units (Knights and the
+-- like). That lives behind a five-argument function inside the model's own script
+-- and Object.call passes exactly one argument, so it is out of reach from here --
+-- but it re-syncs by itself the next time the model's wounds change, since
+-- changeModelWoundCount recomputes the bracket from the name it is given.
+function battleRestoreModelName(o, name)
+    if o == nil or type(name) ~= "string" or name == "" then return end
+    pcall(function()
+        if o.getName() ~= name then o.setName(name) end
+    end)
+end
+
+-- Puts one model where the snapshot says it was, resurrecting it if need be.
+function battleRestoreModel(guid, tuple)
+    if type(tuple) ~= "table" then return end
+    local pos = {x = tuple[1] or 0, y = tuple[2] or 0, z = tuple[3] or 0}
+    local rot = {x = tuple[6] or 0, y = tuple[4] or 0, z = tuple[7] or 0}
+    local name = nil
+    if battleLog.names ~= nil and tuple[5] ~= nil then
+        name = battleLog.names[tuple[5]]
+    end
+
+    local o = battleModelObject(guid)
+    if o ~= nil then
+        pcall(function()
+            -- Locked for the teleport so the physics engine never wakes and
+            -- bounces the model off whatever it lands on, then put back as it was.
+            local wasLocked = o.getLock()
+            o.setLock(true)
+            o.setPosition(pos)
+            o.setRotation(rot)
+            if not wasLocked then
+                Wait.frames(function()
+                    if o ~= nil then pcall(function() o.setLock(false) end) end
+                end, 2)
+            end
+        end)
+        battleRestoreModelName(o, name)
+        return
+    end
+
+    -- Dead at this moment in the game but alive at the one being left: out of the
+    -- graveyard it comes, under its original GUID.
+    battleExhumeModel(guid, pos, rot, function(obj)
+        pcall(function() obj.setLock(false) end)
+        battleRestoreModelName(obj, name)
+    end)
+end
+
+-- Restores every model in the snapshot, then buries the ones that were dead at
+-- that moment, spreading the work across frames.
+--
+-- Burying is the half that makes rewinding FORWARD work: a model killed in round
+-- one is on the table while reviewing round one and must not linger there when the
+-- players jump back to round three.
+function battleRestoreModels(snap, done)
+    local work = {}
+    local alive = {}
+    if type(snap.m) == "table" then
+        for guid, tuple in pairs(snap.m) do
+            table.insert(work, {guid = guid, tuple = tuple})
+            alive[guid] = true
+        end
+    end
+
+    local bury = {}
+    if type(battleLog.roster) == "table" then
+        for guid, _ in pairs(battleLog.roster) do
+            if not alive[guid] and battleModelObject(guid) ~= nil then
+                table.insert(bury, guid)
+            end
+        end
+    end
+
+    local i = 1
+    local function step()
+        local stop = math.min(i + BATTLE_REWIND_BATCH - 1, #work)
+        while i <= stop do
+            battleRestoreModel(work[i].guid, work[i].tuple)
+            i = i + 1
+        end
+        if i <= #work then
+            Wait.frames(step, 1)
+            return
+        end
+        for _, guid in ipairs(bury) do
+            pcall(function() battleBuryModel(guid) end)
+        end
+        if done ~= nil then done(#work, #bury) end
+    end
+    step()
+end
+
+-- Counters, turn/phase state and the scoresheet. Everything here already had a
+-- setter; the rewind only has to call them in the right order.
+function battleRestoreState(snap)
+    local function setCounter(guid, value)
+        local o = getObjectFromGUID(guid or "")
+        if o == nil or value == nil then return end
+        pcall(function() o.call("setValue", tonumber(value) or 0) end)
+    end
+
+    if type(snap.cp) == "table" then
+        setCounter(redCPCounter_GUID, snap.cp.r)
+        setCounter(blueCPCounter_GUID, snap.cp.b)
+    end
+    setCounter(gameTurnCounter_GUID, snap.r)
+    if type(snap.tc) == "table" then
+        setCounter(redTurnCounter_GUID, snap.tc.r)
+        setCounter(blueTurnCounter_GUID, snap.tc.b)
+    end
+
+    -- Turn and phase. A freshly built table crossing into another script is the
+    -- safe direction (it is reading a table this script owns that raises), which
+    -- is how every other Global -> startMenu call in the mod already works.
+    local sm = getObjectFromGUID(startMenu_GUID)
+    if sm ~= nil then
+        pcall(function()
+            sm.call("battleSetTurnState", {turn = snap.t, phase = snap.p})
+        end)
+    end
+
+    -- Scoresheet. Crosses as a JSON string for the reason getScoreGridJSON spells
+    -- out; the totals in snap.vp are the report's, not a second source of truth.
+    if type(snap.vp) == "table" and type(snap.vp.grid) == "table" then
+        local sheet = getObjectFromGUID(scoresheet_GUID)
+        if sheet ~= nil then
+            pcall(function()
+                sheet.call("setScoreGrid", JSON.encode(snap.vp.grid))
+            end)
+        end
+    end
+end
+
+-- Index every card and deck on the table by name.
+--
+-- The scene is swept once and handed down: getCardsInSecondarySlot falls back to
+-- its own getAllObjects when given nil, and there are sixteen slots to check.
+function battleCollectSecondaryCandidates(scene)
+    local byName = {}
+    for _, o in ipairs(scene) do
+        if isSecondaryCardObject(o) then
+            local isDeck = (o.tag == "Deck" or o.type == "Deck")
+            if isDeck then
+                -- A card the players discarded is back inside a deck, where
+                -- getObjectFromGUID cannot see it. getObjects() lists a container's
+                -- contents by name and GUID without taking anything out, and
+                -- takeObject can then pull the one card by GUID.
+                pcall(function()
+                    for _, entry in ipairs(o.getObjects()) do
+                        local n = entry.name
+                        if n ~= nil and n ~= "" and byName[n] == nil then
+                            byName[n] = {deck = o, guid = entry.guid}
+                        end
+                    end
+                end)
+            else
+                local n = o.getName()
+                -- A loose card outranks one still in a deck: the deck entry was
+                -- only ever a fallback, and it is not the object the players are
+                -- looking at.
+                if n ~= nil and n ~= "" and (byName[n] == nil or byName[n].obj == nil) then
+                    byName[n] = {obj = o}
+                end
+            end
+        end
+    end
+    return byName
+end
+
+-- Puts the recorded secondary cards back in their slots.
+--
+-- The least deterministic step in the whole rewind: a card the players physically
+-- removed from the game may simply not be findable. It therefore reports what it
+-- could not place and carries on, rather than failing the rewind around it.
+function battleRestoreSecondaries(snap)
+    local missing = {}
+    if type(snap.sec) ~= "table" then return missing end
+    local scene = getAllObjects()
+    local candidates = battleCollectSecondaryCandidates(scene)
+
+    for color, cards in pairs(snap.sec) do
+        local wanted = {}
+        for _, entry in ipairs(cards) do
+            local slotIndex = tonumber(entry.i)
+            -- Schema 1 logs had no slot index and are discarded before they reach
+            -- here, so a missing i means a hand-edited log; skip rather than guess.
+            if slotIndex ~= nil and type(entry.n) == "string" then
+                wanted[slotIndex] = entry
+            end
+        end
+
+        local zoneGuids = BATTLE_SECONDARY_ZONES[color] or {}
+        for slotIndex = 1, #zoneGuids do
+            local zone = getObjectFromGUID(zoneGuids[slotIndex])
+            local entry = wanted[slotIndex]
+            if zone ~= nil then
+                local target = getSecondarySlotCardPosition(zone)
+                local occupants = getCardsInSecondarySlot(zone, scene)
+
+                if entry == nil then
+                    -- No card here at that moment: clear the slot to the discard.
+                    for _, o in ipairs(occupants) do
+                        pcall(function()
+                            o.locked = false
+                            o.setPositionSmooth(getSecondaryDiscardPosition(color))
+                        end)
+                    end
+                    clearSecondarySlotAssignment(color, slotIndex)
+                else
+                    local hit = candidates[entry.n]
+                    -- 270/180 is the mod's own slot orientation, set when a card is
+                    -- drawn; z flips it face up or face down.
+                    local rot = {x = 0, y = 270, z = (entry.fd == true) and 0 or 180}
+                    local keepGuid = (hit ~= nil and hit.obj ~= nil)
+                                     and hit.obj.getGUID() or nil
+
+                    -- Anything else sitting in this slot goes to the discard first,
+                    -- or two cards end up stacked in the same place.
+                    if hit ~= nil then
+                        for _, o in ipairs(occupants) do
+                            if o.getGUID() ~= keepGuid then
+                                pcall(function()
+                                    o.locked = false
+                                    o.setPositionSmooth(getSecondaryDiscardPosition(color))
+                                end)
+                            end
+                        end
+                    end
+
+                    if hit == nil then
+                        table.insert(missing, color .. " slot " .. slotIndex ..
+                                              ": " .. entry.n)
+                    elseif hit.obj ~= nil then
+                        local found = hit.obj
+                        pcall(function()
+                            found.locked = false
+                            found.setPosition(target)
+                            found.setRotation(rot)
+                        end)
+                        assignSecondarySlotCard(color, slotIndex, found)
+                        Wait.frames(function()
+                            pcall(function() found.locked = true end)
+                        end, 2)
+                    else
+                        local idx = slotIndex
+                        pcall(function()
+                            hit.deck.takeObject({
+                                guid = hit.guid,
+                                position = target,
+                                rotation = rot,
+                                smooth = false,
+                                callback_function = function(card)
+                                    if card == nil then return end
+                                    assignSecondarySlotCard(color, idx, card)
+                                    Wait.frames(function()
+                                        pcall(function() card.locked = true end)
+                                    end, 2)
+                                end,
+                            })
+                        end)
+                        -- Taken out, so it must not be handed to a second slot.
+                        candidates[entry.n] = nil
+                    end
+                end
+            end
+        end
+        pcall(function() refreshSecondaryNamesForColor(color) end)
+    end
+    return missing
+end
+
+-- The rewind itself.
+function battleRewindTo(index, playerColor)
+    if battleLog == nil or type(battleLog.snaps) ~= "table" then return false end
+    local snap = battleLog.snaps[tonumber(index) or 0]
+    if snap == nil then
+        printToColor("Nothing was recorded at that point in the game.",
+                     playerColor, {1, 0.6, 0.2})
+        return false
+    end
+    if _battleRewindBusy then
+        printToColor("Rewind already in progress.", playerColor, {1, 0.6, 0.2})
+        return false
+    end
+
+    _battleRewindBusy = true
+    -- Belt and braces: battleLog.ended already stops recording, but a rewind run
+    -- before END GAME (or after a hand-edited log) must not log itself either.
+    _battleCaptureGuard = true
+
+    battleRestoreState(snap)
+    local missing = battleRestoreSecondaries(snap)
+
+    battleRestoreModels(snap, function(moved, buried)
+        _battleRewindBusy = false
+        -- Released a few frames later so the deferred unlocks and takeObject
+        -- callbacks above have all landed first.
+        Wait.frames(function() _battleCaptureGuard = false end, 3)
+
+        broadcastToAll("Rewound to " .. tostring(snap.lbl) .. "  (" .. moved ..
+                       " model(s) placed, " .. buried .. " returned to the " ..
+                       "graveyard)", {0.4, 1, 0.4})
+        if #missing > 0 then
+            broadcastToAll("Could not find " .. #missing .. " secondary card(s): " ..
+                           table.concat(missing, ", "), {1, 0.6, 0.2})
+        end
+        battleRefreshRewindOverlay()
+    end)
+    return true
+end
+
+-- REWIND button: rewind to the currently selected Round / Player / Phase.
+function battleRewindToSelection(playerColor)
+    local idx = battleFindSnapshot(battleRewindSel.r, battleRewindSel.t,
+                                   battleRewindSel.p)
+    if idx == nil then
+        printToColor("No snapshot was recorded for that round, player and phase.",
+                     playerColor, {1, 0.6, 0.2})
+        return false
+    end
+    return battleRewindTo(idx, playerColor)
+end
+
+-- RETURN TO END: the last snapshot is the end state, because END GAME recorded it
+-- and closed the log, so nothing can have been appended since.
+function battleReturnToEnd(playerColor)
+    if battleLog == nil or type(battleLog.snaps) ~= "table" or #battleLog.snaps == 0 then
+        printToColor("Battle log is empty - nothing to return to.",
+                     playerColor, {1, 0.6, 0.2})
+        return false
+    end
+    return battleRewindTo(#battleLog.snaps, playerColor)
+end
+
+
+--[[ ================= BATTLE LOG: END GAME AND THE REWIND OVERLAY =======
+The overlay is a fixed grid, because the mission structure is fixed: five
+scoresheet rounds and the five phases in startMenu's `phases`. Selecting a
+round/player/phase is a shared act rather than a per-player one -- one player
+picking a moment is showing it to the table -- so battleRewindSel is global while
+only whether the panel is OPEN is per-player, like every other HUD overlay.
+
+Buttons carry their argument in their own element id ("RedHud_RewindRound3"),
+which the handler parses back out. That is how getHudColorFromCallback already
+reads the panel prefix, and it avoids depending on TTS's onClick="f(arg)" form,
+which nothing else in this HUD uses.
+======================================================================= ]]
+
+BATTLE_REWIND_ROUNDS = 5
+BATTLE_REWIND_PHASES = 5
+-- Slot colours for the selector, matching the HUD's existing red/blue/idle set.
+BATTLE_REWIND_ON  = "#B52020E6|#D46060E6|#8E1818|#B52020E6"
+BATTLE_REWIND_OFF = "#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55"
+
+-- Repaints the selector: which cell is chosen, and which combinations actually
+-- have a snapshot. A game that ended mid-round, or one where someone pressed
+-- CAPTURE by hand, leaves gaps -- greying them out is more honest than letting
+-- a player press a button that can only refuse.
+function battleRefreshRewindOverlay()
+    local sel = battleRewindSel
+
+    -- Counter values arrive as numbers and phase indices as numbers, but both have
+    -- been through JSON on a reloaded save; flooring them keeps 2 and 2.0 from
+    -- hashing to two different cells.
+    local function key(r, t, p)
+        return math.floor(tonumber(r) or 0) .. "/" .. tostring(t) ..
+               "/" .. math.floor(tonumber(p) or 0)
+    end
+
+    local has = {}
+    if battleLog ~= nil and type(battleLog.snaps) == "table" then
+        for _, s in ipairs(battleLog.snaps) do
+            has[key(s.r, s.t, s.p)] = true
+        end
+    end
+
+    local function paint(id, chosen, enabled)
+        setHudAttribute({id = id, attr = "colors",
+                         value = chosen and BATTLE_REWIND_ON or BATTLE_REWIND_OFF})
+        setHudAttribute({id = id, attr = "interactable",
+                         value = enabled and "true" or "false"})
+    end
+
+    -- A round is reachable if any phase of it was recorded for the chosen player,
+    -- and so on around the three axes: each is judged against the other two, so
+    -- the grid always offers at least one live path.
+    for r = 1, BATTLE_REWIND_ROUNDS do
+        local live = false
+        for p = 1, BATTLE_REWIND_PHASES do
+            if has[key(r, sel.t, p)] then live = true; break end
+        end
+        paint("RewindRound" .. r, sel.r == r, live)
+    end
+
+    for _, turn in ipairs({"Red", "Blue"}) do
+        local live = false
+        for p = 1, BATTLE_REWIND_PHASES do
+            if has[key(sel.r, turn, p)] then live = true; break end
+        end
+        paint("RewindTurn" .. turn, sel.t == turn, live)
+    end
+
+    for p = 1, BATTLE_REWIND_PHASES do
+        paint("RewindPhase" .. p, sel.p == p, has[key(sel.r, sel.t, p)] == true)
+    end
+
+    local idx = battleFindSnapshot(sel.r, sel.t, sel.p)
+    setHudAttribute({id = "RewindGo", attr = "interactable",
+                     value = idx ~= nil and "true" or "false"})
+
+    local status
+    if idx == nil then
+        status = "Nothing was recorded at that point."
+    else
+        status = battleLog.snaps[idx].lbl or ""
+    end
+    if battleLog ~= nil and type(battleLog.snaps) == "table" then
+        status = status .. "          " .. #battleLog.snaps .. " snapshot(s) recorded"
+    end
+    setHudValue({id = "RewindStatus", value = status})
+end
+
+function battleOpenRewindOverlay(color)
+    local settings = ensureHudSettings(color)
+    settings.rewindOverlayOpen = true
+    settings.helpOverlayOpen = false
+    settings.scoringOverlayOpen = false
+    applyHudPreferencesForColor(color)
+    battleRefreshRewindOverlay()
+end
+
+function hudToggleRewind(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local settings = ensureHudSettings(color)
+    if settings.rewindOverlayOpen then
+        settings.rewindOverlayOpen = false
+        applyHudPreferencesForColor(color)
+    else
+        battleOpenRewindOverlay(color)
+    end
+end
+
+function hudCloseRewind(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local settings = ensureHudSettings(color)
+    settings.rewindOverlayOpen = false
+    applyHudPreferencesForColor(color)
+end
+
+function hudRewindRound(player, value, id)
+    local n = tonumber(string.match(tostring(id or ""), "RewindRound(%d+)$"))
+    if n == nil then return end
+    battleRewindSel.r = n
+    battleRefreshRewindOverlay()
+end
+
+function hudRewindTurn(player, value, id)
+    local t = string.match(tostring(id or ""), "RewindTurn(%a+)$")
+    if t ~= "Red" and t ~= "Blue" then return end
+    battleRewindSel.t = t
+    battleRefreshRewindOverlay()
+end
+
+function hudRewindPhase(player, value, id)
+    local n = tonumber(string.match(tostring(id or ""), "RewindPhase(%d+)$"))
+    if n == nil then return end
+    battleRewindSel.p = n
+    battleRefreshRewindOverlay()
+end
+
+function hudRewindGo(player, value, id)
+    battleRewindToSelection(getHudColorFromCallback(player, id))
+end
+
+function hudRewindEnd(player, value, id)
+    battleReturnToEnd(getHudColorFromCallback(player, id))
+end
+
+-- END GAME: capture the final state, close the log, open the selector.
+--
+-- Closing the log is what makes rewinding safe: from here on recordBattleSnapshot
+-- refuses, so moving models and setting counters during a review cannot rewrite
+-- the history being reviewed. battleStartGame reopens it for the next game.
+function battleEndGame(player)
+    local playerColor = (type(player) == "table" and player.color) or player
+
+    if battleLog == nil or type(battleLog.snaps) ~= "table" or #battleLog.snaps == 0 then
+        printToColor("Battle log is empty - start a game and play a round first.",
+                     playerColor, {1, 0.6, 0.2})
+        return
+    end
+
+    if battleLog.ended == true then
+        -- Already ended: this is someone reopening the selector, not ending twice.
+        battleOpenRewindOverlay(getHudColorFromCallback(player, nil))
+        return
+    end
+
+    captureBoard(function()
+        recordBattleSnapshot("end")
+        battleLog.ended = true
+        broadcastToAll("Game ended. The battle log is closed - " ..
+                       #battleLog.snaps .. " snapshot(s) recorded. " ..
+                       "Pick a round, player and phase to rewind to.",
+                       {0.4, 1, 0.4})
+
+        local last = battleLog.snaps[#battleLog.snaps]
+        if last ~= nil then
+            battleRewindSel.r = tonumber(last.r) or 1
+            battleRewindSel.t = last.t or "Red"
+            battleRewindSel.p = tonumber(last.p) or 1
+        end
+        battleOpenRewindOverlay(getHudColorFromCallback(player, nil))
+    end)
 end
 
 function restoreBattleLog(raw)
