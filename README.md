@@ -52,11 +52,7 @@ HIDE / SHOW ARMY pair, one row further in:
 - **CAPTURE** — record an extra snapshot mid-phase.
 
 This repo has no report-rendering code and no networking of any kind — no export
-button, no server, no `WebRequest` calls anywhere in the mod. Rendering a report is
-entirely the separate [`lct-report-server`](https://github.com/Tzabari/lct-report-server)
-repo's job: it's a standalone desktop app that opens a TTS save file you point it at,
-lets you pick which recorded game to view, and builds the HTML report from the
-`svBattleLog` it finds inside. See that repo's README for how to run it.
+button, no server, no `WebRequest` calls anywhere in the mod.
 
 Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model's
 `uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
@@ -64,8 +60,8 @@ so models imported by other means still record position but report no wounds.
 
 ### In-game rewind
 
-The same log the report is built from can put the table itself back to any
-recorded moment, in TTS, with no export step.
+The same battle log can put the table itself back to any recorded moment, in
+TTS, with no export step.
 
 **END GAME** sits next to CAPTURE. Pressing it records one last snapshot, closes the
 log to further recording (so a rewind can never overwrite the game it is reviewing),
