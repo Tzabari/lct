@@ -1993,6 +1993,39 @@ function hudRewindEnd(player, value, id)
     end
 end
 
+-- A save-file name component with characters Windows/TTS don't accept in a
+-- filename stripped out, collapsed to single spaces, and capped to a sane
+-- length -- map/player names are host-entered text, not something to trust
+-- verbatim in a path.
+local function battleSafeNamePart(s)
+    s = tostring(s or ""):gsub('[\\/:%*%?"<>|]', "")
+    s = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    return s:sub(1, 40)
+end
+
+-- "LCT End Game - <map> - <red> vs <blue> - <epoch>", skipping any part the
+-- game context does not have yet. "End Game" (matching the button's own name)
+-- is what lets battle_report_browser.py tell an END-GAME save apart from an
+-- autosave or a mid-game save at a glance in the Saves folder -- though it
+-- reads battleLog.ended for that, not this text; see save_scan.py. The
+-- trailing epoch (os.time(), already used elsewhere in this file -- see
+-- battleEnsureGameContext) guarantees a unique file name even across two
+-- games with the same map and players in the same session, without depending
+-- on any date/time formatting call.
+local function battleEndGameSaveName()
+    local g = battleLog.game or {}
+    local map = battleSafeNamePart(g.map)
+    local red = battleSafeNamePart(g.red)
+    local blue = battleSafeNamePart(g.blue)
+    local parts = {"LCT End Game"}
+    if map ~= "" then table.insert(parts, map) end
+    if red ~= "" or blue ~= "" then
+        table.insert(parts, (red ~= "" and red or "Red") .. " vs " .. (blue ~= "" and blue or "Blue"))
+    end
+    table.insert(parts, tostring(os.time()))
+    return table.concat(parts, " - ")
+end
+
 -- END GAME: capture the final state, close the log, open the selector.
 --
 -- Closing the log is what makes rewinding safe: from here on recordBattleSnapshot
@@ -2031,6 +2064,24 @@ function battleEndGame(player)
                        #battleLog.snaps .. " snapshot(s) recorded. " ..
                        "Pick a round, player and phase to rewind to.",
                        {0.4, 1, 0.4})
+
+        -- Writes the closed battle log to disk now, so the standalone report
+        -- browser (lct-report-server) has something to find even if the host
+        -- never presses TTS's own Save afterwards. A new file, not an
+        -- overwrite of whatever the table was loaded from -- this never
+        -- clobbers a save the host is managing themselves. saveGame() is not
+        -- exercised by this repo's own tests (nothing here runs inside TTS),
+        -- so a missing/renamed API is caught by pcall rather than breaking
+        -- END GAME's other effects.
+        local saveName = battleEndGameSaveName()
+        local saveOk, saveResult = pcall(saveGame, saveName)
+        if saveOk and saveResult then
+            broadcastToAll('Saved as "' .. saveName .. '".', {0.4, 1, 0.4})
+        else
+            broadcastToAll("Could not auto-save (" ..
+                           tostring(not saveOk and saveResult or "saveGame() returned false") ..
+                           "). Save manually to keep this battle log.", {1, 0.6, 0.2})
+        end
 
         -- An army that was never registered was never captured, so its models
         -- silently sit out every rewind -- this is the single most common way

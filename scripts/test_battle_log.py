@@ -81,6 +81,43 @@ class TestLuaWiring(unittest.TestCase):
         self.assertIn("battleClearArmy", text)
 
 
+class TestEndGameAutoSave(unittest.TestCase):
+    """END GAME writes a new save so the log reaches disk without the host
+    needing to remember to press TTS's own Save."""
+
+    def setUp(self):
+        text = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
+        start = text.find("function battleEndGame(")
+        self.assertNotEqual(start, -1)
+        self.body = text[start:text.find("\nend", start)]
+
+    def test_end_game_calls_savegame_through_pcall(self):
+        # A wrong/missing saveGame() must not break END GAME's other effects
+        # (closing the log, opening the rewind selector) -- pcall is what
+        # keeps a bad API call from propagating.
+        self.assertIn("pcall(saveGame, saveName)", self.body)
+
+    def test_the_save_name_marks_it_as_an_end_game_save(self):
+        self.assertIn('local parts = {"LCT End Game"}', BATTLE_REWIND_LUA.read_text(
+            encoding="utf-8", errors="replace"))
+
+    def test_the_saved_file_is_new_not_an_overwrite(self):
+        # The mod must never silently clobber whatever save the table was
+        # loaded from; saveGame(customName) always writes a new file, never a
+        # bare saveGame() call (which would resave over the loaded file).
+        self.assertIn("battleEndGameSaveName()", self.body)
+        self.assertNotIn("pcall(saveGame)", self.body)
+        self.assertNotIn("saveGame()\n", self.body)
+
+    def test_ended_flag_is_the_authoritative_signal_not_the_filename(self):
+        text = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("battleLog.ended = true", self.body)
+        # The filename marker is a convenience for a human browsing the Saves
+        # folder; battle_report_browser.py must key off the log data instead,
+        # which survives a rename and needs no string-matching.
+        self.assertIn("reads battleLog.ended for that, not this text", text)
+
+
 class TestLuaWiringDeployment(unittest.TestCase):
     def test_type_is_compared_against_a_string_not_the_stdlib_table(self):
         # type() returns a string, so comparing it to the bare word `table` (the
