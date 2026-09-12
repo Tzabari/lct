@@ -1066,8 +1066,12 @@ battleRewindSel = battleRewindSel or {r = 1, t = "Red", p = 1}
 -- and including the one for the call that crashed will already have been
 -- written -- the last line printed names the exact operation in progress when
 -- the crash happened, even though the exception itself was never caught.
+-- Gated on DEBUG (true only for --test builds, see its declaration in
+-- global.ttslua) so a --release build's host console stays quiet.
 function battleRewindLog(msg)
-    log("[BattleRewind] " .. tostring(msg))
+    if DEBUG then
+        log("[BattleRewind] " .. tostring(msg))
+    end
 end
 
 -- Index of the snapshot for a round/turn/phase, or nil.
