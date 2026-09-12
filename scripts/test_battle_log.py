@@ -20,8 +20,17 @@ sys.path.insert(0, str(SCRIPT_DIR))  # allow sibling imports (compile, lua_strin
 
 ROOT = SCRIPT_DIR.parent
 GLOBAL_LUA = ROOT / "TTSLUA" / "global.ttslua"
+BATTLE_REWIND_LUA = ROOT / "TTSLUA" / "battle_rewind.ttslua"
 START_MENU_LUA = ROOT / "TTSLUA" / "startMenu.ttslua"
 TOOLS_LUA = ROOT / "TTSLUA" / "spawnGameTools.ttslua"
+
+
+def combined_global_text():
+    """global.ttslua + battle_rewind.ttslua, in the same order compile.py
+    concatenates them before injecting Global's script -- use this for any
+    check that shouldn't care which of the two files a symbol lives in."""
+    return (GLOBAL_LUA.read_text(encoding="utf-8", errors="replace") + "\n\n"
+            + BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace"))
 
 
 class TestLuaWiring(unittest.TestCase):
@@ -46,7 +55,7 @@ class TestLuaWiring(unittest.TestCase):
         self.assertIn('Global.call("battleStartGame")', text)
 
     def test_registration_permits_standing_in_for_an_empty_seat(self):
-        text = GLOBAL_LUA.read_text(encoding="utf-8")
+        text = BATTLE_REWIND_LUA.read_text(encoding="utf-8")
         start = text.find("function canRegisterFor(")
         self.assertNotEqual(start, -1)
         body = text[start:text.find("\nend", start)]
@@ -56,7 +65,7 @@ class TestLuaWiring(unittest.TestCase):
         self.assertIn("p.seated", body)
 
     def test_solo_mode_uses_the_singles_flag_not_just_simulation(self):
-        text = GLOBAL_LUA.read_text(encoding="utf-8")
+        text = BATTLE_REWIND_LUA.read_text(encoding="utf-8")
         start = text.find("function battleSoloModeActive(")
         self.assertNotEqual(start, -1)
         body = text[start:text.find("\nend", start)]
@@ -76,7 +85,7 @@ class TestLuaWiringDeployment(unittest.TestCase):
     def test_type_is_compared_against_a_string_not_the_stdlib_table(self):
         # type() returns a string, so comparing it to the bare word `table` (the
         # stdlib table) is always true and would silently drop every deployment.
-        src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        src = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
         body = src[src.index("function battleDeploymentSpec"):]
         body = body[:body.index("\nend")]
         self.assertIn('~= "table"', body)
@@ -91,10 +100,12 @@ class TestNoServerCommunication(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        cls.battle_rewind_src = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
         cls.tools_src = TOOLS_LUA.read_text(encoding="utf-8", errors="replace")
 
     def test_no_web_request_anywhere_in_the_mod(self):
         self.assertNotIn("WebRequest", self.src)
+        self.assertNotIn("WebRequest", self.battle_rewind_src)
 
     def test_no_export_button_or_report_wiring_left(self):
         for name in ("exportReport", "exportBattleReport", "battleReportEndpoints",
@@ -102,6 +113,7 @@ class TestNoServerCommunication(unittest.TestCase):
                      "battleSetReportMode", "BATTLE_REPORT_URL", "BATTLE_REPORT_REMOTE_BASE",
                      "BATTLE_REPORT_TOKEN", "BATTLE_REPORT_MODE"):
             self.assertNotIn(name, self.src, f"{name} should have been removed with the export path")
+            self.assertNotIn(name, self.battle_rewind_src, f"{name} should have been removed with the export path")
             self.assertNotIn(name, self.tools_src, f"{name} should have been removed with the export path")
 
 
@@ -112,7 +124,7 @@ class TestCrossScriptTableSafety(unittest.TestCase):
     Every such read must therefore sit INSIDE its pcall, not after it."""
 
     def setUp(self):
-        self.src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        self.src = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
 
     def _body(self, fn):
         body = self.src[self.src.index("function " + fn):]
@@ -154,7 +166,7 @@ class TestLuaScoreAndContext(unittest.TestCase):
         # Object.call passes its params table as the SINGLE argument, so
         # call("playerSum", {1}) hands playerSum the table {1} and it errors
         # indexing scores[pId]. getMatchSummary is the supported entry point.
-        src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        src = combined_global_text()
         # Comments explain the trap by name, so only real code is searched.
         code = "\n".join(ln for ln in src.splitlines()
                          if not ln.lstrip().startswith("--"))
@@ -165,7 +177,7 @@ class TestLuaScoreAndContext(unittest.TestCase):
         # battleStartGame only fires when someone presses Start Game with this
         # build loaded; joining a game in progress must still get a map name and
         # deployment, or the report has no header and an empty deployment map.
-        src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        src = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
         self.assertIn("function battleEnsureGameContext", src)
         body = src[src.index("function recordBattleSnapshot"):]
         body = body[:body.index("\nend")]
@@ -173,7 +185,7 @@ class TestLuaScoreAndContext(unittest.TestCase):
         self.assertIn("pcall(battleEnsureGameContext)", body)
 
     def test_backfill_never_overwrites_what_start_game_recorded(self):
-        src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        src = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
         body = src[src.index("function battleEnsureGameContext"):]
         body = body[:body.index("\nend\n\nfunction")]
         for field in ("started", "map", "mapGuid", "deploy", "red", "blue"):
@@ -215,7 +227,7 @@ class TestSecondaryScan(unittest.TestCase):
     """The secondaries scan reads the slots the way the rest of the mod does."""
 
     def setUp(self):
-        self.source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        self.source = combined_global_text()
         start = self.source.index("function battleSecondaryState")
         self.body = self.source[start:self.source.index("\nend", start)]
 
@@ -279,7 +291,7 @@ class TestBoardCapture(unittest.TestCase):
     coming back."""
 
     def setUp(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
+        source = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
         start = source.index("function captureBoard")
         self.body = source[start:source.index("\nend", source.index("Wait.frames", start))]
 
@@ -305,8 +317,7 @@ class TestBoardCapture(unittest.TestCase):
         self.assertNotIn("sh = sh,", self.body)
 
     def test_battle_board_desc_max_is_gone_not_just_unused_here(self):
-        source = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
-        self.assertNotIn("BATTLE_BOARD_DESC_MAX", source)
+        self.assertNotIn("BATTLE_BOARD_DESC_MAX", combined_global_text())
 
 
 if __name__ == "__main__":

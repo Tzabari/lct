@@ -9,6 +9,8 @@ Run the compiler from the `scripts` folder:
 ```bash
 python3 compile.py             # prompt for a version, write the compiled JSON
 python3 compile.py --test      # tag as "test", copy to your TTS saves folder
+python3 compile.py --test --branch # tag as "test-<branch>" instead, so two branches
+                                    # building at once don't clobber each other's copy
 python3 compile.py --release   # version + patch notes from CHANGELOG.md, then copy
 python3 compile.py --no-validate   # skip the map-card validation gate
 ```
