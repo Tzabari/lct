@@ -422,7 +422,7 @@ def bake_map_index(lua_text: str) -> str:
     return lua_text
 
 
-def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
+def bake_battle_report_endpoint(lua_text: str, is_test: bool, is_release: bool = False) -> str:
     """Replace the @@BATTLE_REPORT_REMOTE_BASE@@ / @@BATTLE_REPORT_TOKEN@@
     markers in global.ttslua with the hosted renderer's URL and shared token,
     so a compiled build knows where to send EXPORT REPORT when the local
@@ -446,7 +446,17 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
     warns, never fails -- a build without the secret still produces a working,
     local-only mod; the hosted path simply never gets tried (BATTLE_REPORT_MODE
     "auto" falls through to it only when a base is configured at all).
+
+    A missing *marker*, unlike a missing token, means the comment anchor
+    bake_map_index/this function rewrite has been stripped from global.ttslua --
+    the line still parses and runs, just with whatever base/token the source
+    happens to have, so a build succeeds looking complete while the hosted
+    export path is silently disabled. That is fine for --test, but fail() on a
+    --release build rather than let it ship unnoticed (see PROJECT_CONTEXT.md's
+    preserved-markers list).
     """
+    marker_missing = fail if is_release else warn
+
     bake_anyway = is_test and os.environ.get("LCT_REPORT_BAKE_IN_TEST", "") not in ("", "0", "false", "False")
     skip = is_test and not bake_anyway
     base = "" if skip else os.environ.get("LCT_REPORT_REMOTE_BASE", BATTLE_REPORT_REMOTE_BASE)
@@ -454,8 +464,8 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
     lua_text, count = re.subn(r"^.*--\s*@@BATTLE_REPORT_REMOTE_BASE@@.*$", base_literal,
                               lua_text, count=1, flags=re.M)
     if count != 1:
-        warn("marker @@BATTLE_REPORT_REMOTE_BASE@@ not found in global.ttslua — "
-             "hosted report endpoint not baked.")
+        marker_missing("marker @@BATTLE_REPORT_REMOTE_BASE@@ not found in global.ttslua — "
+                        "hosted report endpoint not baked.")
 
     token = "" if skip else os.environ.get("LCT_REPORT_TOKEN", "")
     if base and not token:
@@ -466,7 +476,7 @@ def bake_battle_report_endpoint(lua_text: str, is_test: bool) -> str:
     lua_text, count = re.subn(r"^.*--\s*@@BATTLE_REPORT_TOKEN@@.*$", token_literal,
                               lua_text, count=1, flags=re.M)
     if count != 1:
-        warn("marker @@BATTLE_REPORT_TOKEN@@ not found in global.ttslua — token not injected.")
+        marker_missing("marker @@BATTLE_REPORT_TOKEN@@ not found in global.ttslua — token not injected.")
 
     print(f"  Baked battle-report endpoint ({base or '(local-only)'}).")
     return lua_text
@@ -721,7 +731,7 @@ def main():
         lua_files[0].read_text(encoding="utf-8"), version, patch, changelog_notes, debug_enabled
     )
     global_text = bake_map_index(global_text)
-    global_text = bake_battle_report_endpoint(global_text, is_test=debug_enabled)
+    global_text = bake_battle_report_endpoint(global_text, is_test=debug_enabled, is_release=args.release)
     inject_lua_into_line(json_lines, json_lua_line_idxs[0], global_text)
     print(term.green("Done."))
 

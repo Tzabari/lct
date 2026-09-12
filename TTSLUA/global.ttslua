@@ -1342,7 +1342,8 @@ end
 -- spawn-game-tools object). From then on every phase/turn transition records
 -- where every registered model stands, alongside round/VP/CP context and the
 -- terrain layout, so a finished game can be rendered into a battle report by
--- scripts/export_battle_report.py (or, live, by the local report server).
+-- the separate lct-report-server repo's export_battle_report.py (offline, from
+-- an exported save) or its battle_report_server.py (live, via EXPORT REPORT).
 --
 -- Size discipline (compare the onSave note in startMenu.ttslua): a full 5-round
 -- game with two ~100-model armies encodes to roughly 400 KB, about 10x under the
@@ -1383,10 +1384,17 @@ BATTLE_REPORT_TOKEN = "" -- @@BATTLE_REPORT_TOKEN@@
 BATTLE_REPORT_MODE = BATTLE_REPORT_MODE or "auto"
 BATTLE_REPORT_HEALTH = "/healthz"
 
--- Per-attempt watchdog: exportBattleReport never depends on TTS's undocumented
+-- Per-attempt watchdogs: exportBattleReport never depends on TTS's undocumented
 -- WebRequest timeout, since that could turn out to be shorter than a hosted
--- server's wake time (see exportBattleReport's comment).
-BATTLE_EXPORT_TIMEOUT = 20
+-- server's wake time (see exportBattleReport's comment). Split in two because
+-- a probe and a POST have opposite needs: /healthz is tens of bytes and either
+-- answers in well under a second or the server isn't there, so it should fail
+-- fast; the report body can be a few MB (see the plan's payload-size table)
+-- and a slow-but-progressing upload must not be mistaken for a hung one --
+-- WebRequests can't be cancelled, so firing the ladder while the previous
+-- POST is still in flight would send the whole body again.
+BATTLE_EXPORT_PROBE_TIMEOUT = 8
+BATTLE_EXPORT_POST_TIMEOUT = 90
 -- Roughly 120s of probing across all six steps -- about double Render's own
 -- documented ~60s free-tier wake, in visible steps so the wait never looks
 -- dead. Tune against the real service once it is deployed.
@@ -1408,11 +1416,6 @@ BATTLE_EXCLUDED_GMNOTES = {
 
 -- The physical table mats. They sit inside the play zone but are not terrain.
 BATTLE_BOARD_SKIP_GUIDS = {["28865a"] = true, ["4ee1f2"] = true}
-
--- Terrain descriptions are one word ("Dense" / "Light"); this only has to be long
--- enough for the mixed "Tower = Dense / Walls = Light" case without letting some
--- unrelated object's description into the log.
-BATTLE_BOARD_DESC_MAX = 64
 
 function defaultBattleLog()
     return {
@@ -1472,7 +1475,21 @@ function battleAddName(raw)
     end
     local hit = _battleNameIndex[raw]
     if hit ~= nil then return hit end
-    if #battleLog.names >= BATTLE_MAX_NAMES then return nil end
+    if #battleLog.names >= BATTLE_MAX_NAMES then
+        -- Callers coerce this nil to 0 (see recordBattleSnapshot), and
+        -- battleLog.names[0] is nil in Lua's 1-indexed arrays -- so a model
+        -- whose nickname changes after the pool fills keeps silently failing
+        -- to restore its wound-prefix nickname on rewind. Not fixable cheaply
+        -- (raising BATTLE_MAX_NAMES just moves the wall), so at least surface
+        -- it once instead of failing silently for the rest of the game.
+        if not _battleNameCapWarned then
+            _battleNameCapWarned = true
+            broadcastToAll("Battle log name pool is full (" .. BATTLE_MAX_NAMES ..
+                           " distinct nicknames) -- further nickname/wound changes " ..
+                           "won't be restored correctly on rewind.", {1, 0.6, 0.2})
+        end
+        return nil
+    end
     table.insert(battleLog.names, raw)
     local idx = #battleLog.names
     _battleNameIndex[raw] = idx
@@ -1802,6 +1819,12 @@ function registerArmy(color, objs, mode)
                     pcall(function() o.removeTag(color == "Red" and "lct_army_red" or "lct_army_blue") end)
                 end
                 battleLog.roster[guid] = nil
+                -- A model destroyed earlier this game can't be in the new
+                -- box-selection, so it would otherwise be de-rostered with its
+                -- dead flag still set -- and every earlier snapshot's `dead`
+                -- array still names it, so the report would show a casualty
+                -- titled with a raw GUID once its roster record is gone.
+                battleLog.dead[guid] = nil
             end
         end
         for uuid, u in pairs(battleLog.units) do
@@ -2011,10 +2034,22 @@ function battleScores()
     return out
 end
 
--- Snapshot the terrain/objective layout by sweeping a play-zone trigger sized from
--- the table mat, the same relation extractTerrain uses. Asynchronous: zone
--- population is not immediate, so the sweep runs a few frames after the spawn, and
--- the zone is destroyed afterwards (extractTerrain leaks its own; do not copy that).
+-- Snapshot the board's fixed size and its physical objective markers by sweeping
+-- a play-zone trigger sized from the table mat, the same relation extractTerrain
+-- uses. Asynchronous: zone population is not immediate, so the sweep runs a few
+-- frames after the spawn, and the zone is destroyed afterwards (extractTerrain
+-- leaks its own; do not copy that).
+--
+-- This used to record every non-roster object in the zone -- terrain plates,
+-- ruins, the lot -- but map_terrain.py has read terrain straight from the map's
+-- own shipped payload since it was proven exact (see the mod repo's README), and
+-- nothing has read the capture's own terrain fields since. Measured on a real
+-- game: of 47 captured entries only the handful of physical objective markers
+-- were ever used, cutting battleLog.board from ~5 KB to a few hundred bytes and
+-- this sweep's per-press object walk down to just the markers it keeps.
+-- battle_report.map_plates falls back to the payload's own obj_*-tagged plates
+-- when no marker was captured at all (an older log, or a game with none),
+-- rather than needing this capture to supply that case too.
 function captureBoard(done)
     if battleLog == nil then battleLog = defaultBattleLog() end
     local mat = getObjectFromGUID(mat_GUID)
@@ -2046,53 +2081,15 @@ function captureBoard(done)
                 if guid ~= nil and o ~= zone
                    and not BATTLE_BOARD_SKIP_GUIDS[guid]
                    and battleLog.roster[guid] == nil then
-                    local p = o.getPosition()
-                    local r = o.getRotation()
-                    local s = o.getScale()
-                    local bx, bz = nil, nil
-                    pcall(function()
-                        local size = o.getBoundsNormalized().size
-                        bx = battleRound(size.x / 2)
-                        bz = battleRound(size.z / 2)
-                    end)
-                    -- Battlemaster stamps each terrain piece's material into its
-                    -- Description -- "Dense", "Light", or the mixed
-                    -- "Tower = Dense / Walls = Light" -- in applyRuinPartMetadata
-                    -- (battlemasterDynamicSpawner.ttslua). That is the authority the
-                    -- report colours by. The tag name is NOT a usable proxy for it:
-                    -- Corner and the barriers are Light while Generator and Pipes
-                    -- are Dense, which no amount of guessing from name or size gets
-                    -- right. Capped because this is the one free-text field on the
-                    -- board and a non-terrain object could carry an essay.
-                    local desc = o.getDescription()
-                    if type(desc) ~= "string" or desc == "" then
-                        desc = nil
-                    elseif #desc > BATTLE_BOARD_DESC_MAX then
-                        desc = string.sub(desc, 1, BATTLE_BOARD_DESC_MAX)
+                    -- The physical objective markers say what they are in their
+                    -- own nickname ("Home Objective", "Center Objective",
+                    -- "Expansion Objective") -- the same substring check
+                    -- battle_report._objective_anchors makes on its side.
+                    local name = o.getName()
+                    if type(name) == "string" and string.find(string.lower(name), "objective", 1, true) then
+                        local p = o.getPosition()
+                        table.insert(board, {n = name, x = battleRound(p.x), z = battleRound(p.z)})
                     end
-                    -- Battlemaster mirrors a terrain plate with an extra 180 on x
-                    -- or z rather than by negating a scale (see _build_terrain_plate
-                    -- in scripts/battlemaster_reconstruct.py). Stored only when
-                    -- actually set, which is a handful of objects per map.
-                    local rx = math.floor((r.x or 0) + 0.5) % 360
-                    local rz = math.floor((r.z or 0) + 0.5) % 360
-                    if rx == 0 then rx = nil end
-                    if rz == 0 then rz = nil end
-                    table.insert(board, {
-                        g  = guid,
-                        n  = o.getName(),
-                        t  = battleModelTags(o),
-                        x  = battleRound(p.x),
-                        z  = battleRound(p.z),
-                        ry = math.floor((r.y or 0) + 0.5),
-                        rx = rx,
-                        rz = rz,
-                        sx = battleRound(s.x),
-                        sz = battleRound(s.z),
-                        bx = bx,
-                        bz = bz,
-                        d  = desc,
-                    })
                 end
             end
         end)
@@ -2320,6 +2317,7 @@ function recordBattleSnapshot(reason)
                 for _, entry in pairs(reserves) do
                     if battleReserveContains(entry, p.x, p.z) then
                         table.insert(entry.models, guid)
+                        break -- a model belongs to at most one reserve board
                     end
                 end
             end
@@ -2464,10 +2462,22 @@ end
 -- Mirrors battlemasterDynamicSpawner.ttslua's getWebStatusCode: a field TTS has
 -- renamed before, and a rename that turns success into nil must not silently
 -- read as "the server is down".
+-- request.response_code is the real field (verified against TTS's
+-- Assembly-CSharp.dll: get_response_code exists, get_responseCode is a live
+-- camelCase alias, and status_code/statusCode/status do not exist on this
+-- type at all). Returning 0 for "field missing" used to be indistinguishable
+-- from "server said 0", which is exactly the kind of thing that reads as an
+-- unreachable server when the real bug is a wrong field name -- so a miss
+-- returns nil (every caller already treats non-200 as "retry", so nil behaves
+-- the same as 0 did there) and warns once instead of failing silently.
 function battleWebStatusCode(request)
-    return tonumber(request.response_code) or tonumber(request.responseCode)
-        or tonumber(request.status_code) or tonumber(request.statusCode)
-        or tonumber(request.status) or 0
+    local code = tonumber(request.response_code) or tonumber(request.responseCode)
+    if code == nil and not _battleWebStatusWarned then
+        _battleWebStatusWarned = true
+        broadcastToAll("Battle report: WebRequest has no response_code field -- " ..
+                       "export status can't be read correctly.", {1, 0.6, 0.2})
+    end
+    return code
 end
 
 -- The seated player currently marked host, generalised over Player.getPlayers()
@@ -2544,8 +2554,9 @@ function exportBattleReport(playerColor)
     end
     local endpoints = battleReportEndpoints()
     if #endpoints == 0 then
-        printToColor("No report server configured. Run:  python3 scripts/battle_report_server.py",
-                     playerColor, {1, 0.5, 0.3})
+        printToColor("No report server configured. Run battle_report_server.py from the " ..
+                     "separate lct-report-server repo (see its README) -- this mod has no " ..
+                     "server code of its own.", playerColor, {1, 0.5, 0.3})
         return
     end
     battleExportBusy = true
@@ -2556,11 +2567,10 @@ end
 -- Probes /healthz (tens of bytes) before ever sending the battle log itself,
 -- so a sleeping or absent server fails fast instead of leaving an upload
 -- (up to a few MB, see the plan's payload-size table) hanging against TTS's
--- undocumented WebRequest timeout -- and nothing large is ever sent twice. A
--- 200 here triggers exactly one POST. Each attempt arms its own watchdog
--- (BATTLE_EXPORT_TIMEOUT) rather than trusting that undocumented timeout to
--- fire in any particular window; whichever settles first -- the real
--- response or the watchdog -- wins, and the other is discarded.
+-- undocumented WebRequest timeout. A 200 here triggers exactly one POST. The
+-- probe is cheap and safe to retry -- BATTLE_EXPORT_PROBE_TIMEOUT is short on
+-- purpose, and re-probing after it fires never resends anything large. (The
+-- POST itself is a different story: see battlePostReport.)
 function battleProbeThenPost(state)
     local endpoint = state.endpoints[state.endpointIndex]
     local settled = false
@@ -2569,15 +2579,33 @@ function battleProbeThenPost(state)
         settled = true
         if request.is_error or battleWebStatusCode(request) ~= 200 then
             battleExportLadder(state)
-        else
-            battlePostReport(endpoint, state)
+            return
         end
+        -- The schema handshake: /healthz carries the renderer's own
+        -- BATTLE_LOG_SCHEMA-equivalent, so a server left behind after a schema
+        -- bump is caught here, in a few hundred bytes, rather than after a
+        -- multi-megabyte POST comes back as a generic "export failed". A
+        -- server whose /healthz predates this field (no "schema" key at all)
+        -- is not treated as a mismatch -- there is nothing to compare against,
+        -- so this falls through to the old behaviour of just trying the POST.
+        local ok, health = pcall(function() return JSON.decode(request.text) end)
+        local serverSchema = (ok and type(health) == "table") and tonumber(health.schema) or nil
+        if serverSchema ~= nil and serverSchema ~= BATTLE_LOG_SCHEMA then
+            battleExportBusy = false
+            printToColor("Report server (" .. endpoint.label .. ") understands battle log " ..
+                         "schema " .. serverSchema .. ", but this game recorded schema " ..
+                         BATTLE_LOG_SCHEMA .. " -- refusing to upload rather than send a log " ..
+                         "it can't read. Update the server.",
+                         state.playerColor, {1, 0.5, 0.3})
+            return
+        end
+        battlePostReport(endpoint, state)
     end)
     Wait.time(function()
         if settled then return end
         settled = true
         battleExportLadder(state)
-    end, BATTLE_EXPORT_TIMEOUT)
+    end, BATTLE_EXPORT_PROBE_TIMEOUT)
 end
 
 -- Retries the current endpoint through BATTLE_EXPORT_BACKOFF -- but only when
@@ -2611,9 +2639,10 @@ function battleExportLadder(state)
     local nextEndpoint = state.endpoints[state.endpointIndex]
     if nextEndpoint == nil then
         battleExportBusy = false
-        printToColor("No report server reachable. Run:  python3 scripts/battle_report_server.py",
+        printToColor("No report server reachable. Run battle_report_server.py from the " ..
+                     "separate lct-report-server repo (see its README).",
                      state.playerColor, {1, 0.5, 0.3})
-        printToColor("Or export the save and run:  python3 scripts/export_battle_report.py <save.json>",
+        printToColor("Or save the game and run that repo's export_battle_report.py on the save file.",
                      state.playerColor, {1, 0.7, 0.4})
         return
     end
@@ -2622,8 +2651,22 @@ function battleExportLadder(state)
     battleProbeThenPost(state)
 end
 
+-- The POST is at-most-once: WebRequests can't be cancelled, so once the body
+-- has actually been handed to WebRequest.custom, a watchdog firing here must
+-- not re-enter the ladder (that would send the whole body again, on top of
+-- whichever copy is still in flight). battleHandlePostResult's failure
+-- branches are safe to retry from, because those only run once the request
+-- has genuinely finished (with an error or a definite HTTP status) -- it is
+-- only a bare timeout, where the outcome is still unknown, that must end the
+-- export instead of resending it.
 function battlePostReport(endpoint, state)
-    local body = JSON.encode(battleLog)
+    -- Encoded once per export, not once per attempt: this is state.body's
+    -- purpose -- a ~400 KB-3 MB log is a real frame hitch to re-encode, and it
+    -- would otherwise happen again on every retry against the same endpoint.
+    if state.body == nil then
+        state.body = JSON.encode(battleLog)
+    end
+    local body = state.body
     printToColor("Sending battle report (" .. math.floor(#body / 1024) .. " KB) to the " ..
                  endpoint.label .. " server...", state.playerColor, {0.7, 0.8, 1})
     local settled = false
@@ -2636,8 +2679,13 @@ function battlePostReport(endpoint, state)
     Wait.time(function()
         if settled then return end
         settled = true
-        battleExportLadder(state)
-    end, BATTLE_EXPORT_TIMEOUT)
+        battleExportBusy = false
+        printToColor("Upload to the " .. endpoint.label .. " server timed out waiting for a " ..
+                     "response after " .. BATTLE_EXPORT_POST_TIMEOUT .. "s. It may have gone " ..
+                     "through anyway -- check the server before exporting again; retrying here " ..
+                     "would resend the whole report on top of the copy already in flight.",
+                     state.playerColor, {1, 0.6, 0.2})
+    end, BATTLE_EXPORT_POST_TIMEOUT)
 end
 
 function battleHandlePostResult(request, state)
@@ -3048,15 +3096,16 @@ function battleRestoreSecondaries(snap)
                                      and hit.obj.getGUID() or nil
 
                     -- Anything else sitting in this slot goes to the discard first,
-                    -- or two cards end up stacked in the same place.
-                    if hit ~= nil then
-                        for _, o in ipairs(occupants) do
-                            if o.getGUID() ~= keepGuid then
-                                pcall(function()
-                                    o.locked = false
-                                    o.setPositionSmooth(getSecondaryDiscardPosition(color))
-                                end)
-                            end
+                    -- or two cards end up stacked in the same place. Unconditional
+                    -- (not gated on hit ~= nil): when the wanted card isn't found in
+                    -- the scene either, keepGuid is nil and the spawn-from-grave
+                    -- branch below still needs the slot cleared first.
+                    for _, o in ipairs(occupants) do
+                        if o.getGUID() ~= keepGuid then
+                            pcall(function()
+                                o.locked = false
+                                o.setPositionSmooth(getSecondaryDiscardPosition(color))
+                            end)
                         end
                     end
 
@@ -3393,6 +3442,17 @@ end
 -- the history being reviewed. battleStartGame reopens it for the next game.
 function battleEndGame(player)
     local playerColor = (type(player) == "table" and player.color) or player
+
+    -- getHudColorFromCallback(player, nil) below falls back to player.color and
+    -- clamps anything unrecognised to "Blue" -- so a spectator or a player in a
+    -- seat other than Red/Blue/Grey pressing this would silently end the game
+    -- and open the rewind overlay *for Blue*, with no indication why. Refuse
+    -- instead of guessing.
+    if playerColor ~= "Red" and playerColor ~= "Blue" and playerColor ~= "Grey" then
+        printToColor("You must be seated as Red, Blue or Grey to end the game or open rewind.",
+                     playerColor, {1, 0.6, 0.2})
+        return
+    end
 
     if battleLog == nil or type(battleLog.snaps) ~= "table" or #battleLog.snaps == 0 then
         printToColor("Battle log is empty - start a game and play a round first.",

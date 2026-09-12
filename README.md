@@ -47,83 +47,32 @@ HIDE / SHOW ARMY pair, one row further in:
   right-click to clear. A player may always register their own side; an empty seat may
   be registered by whoever is present, so solo games work from either seat.
 - **CAPTURE** — record an extra snapshot mid-phase.
-- **EXPORT REPORT** — render the report and open it in a browser (needs the local
-  helper below; the button fails softly and tells you what to run if it is not up).
+- **EXPORT REPORT** — render the report and hand back a link (the button fails softly
+  and tells you what to run if no report server answers).
 
-The tooling is standard-library only. Create the environment once:
-
-```bash
-uv venv .venv
-```
-
-Then either leave the helper running while you play and use the in-game button —
-it's `battle_report_server.py` from the separate
-[`lct-report-server`](https://github.com/Tzabari/lct-report-server) repo (it re-reads
-the renderer on every export, so edits there take effect without restarting it):
+This repo has no report-rendering code of its own — no Python, no terrain lookup, no
+HTML template. That all lives in the separate
+[`lct-report-server`](https://github.com/Tzabari/lct-report-server) repo, and EXPORT
+REPORT always talks to it, whether run locally or deployed. To render reports at all,
+clone that repo alongside this one and follow its README; the short version:
 
 ```bash
-.venv/Scripts/python.exe scripts/battle_report_server.py     # Windows
-.venv/bin/python scripts/battle_report_server.py             # macOS / Linux
+git clone https://github.com/Tzabari/lct-report-server ../lct-report-server
+cd ../lct-report-server
+python3 scripts/battle_report_server.py     # local mode: writes report.html, opens it
 ```
 
-...or skip the server entirely, save the game in TTS, and render the exported save
-(this one script *does* live here — it needs no server, hosted or local, at all):
+...or, with nothing running at all, render an already-exported TTS save straight from
+that repo (still needs no server, hosted or local):
 
 ```bash
-.venv/Scripts/python.exe scripts/export_battle_report.py            # newest TTS save
-.venv/Scripts/python.exe scripts/export_battle_report.py <save.json> -o report/
+python3 scripts/export_battle_report.py <save.json> -o report/
 ```
 
-Both write `report/report.html` and `report/snapshots.json` (the full
-reconstruction, and the stable interface for a future in-game viewer). The page
-header carries the time it was rendered, so a stale tab is easy to spot.
-
-The page is a viewer, not a scroll: one board fills the window, picked with three
-rows of tabs - Round, then player, then the phases of that round - so Round 2 ->
-Blue -> Charge is three clicks. The board as it stood when Start Game was pressed
-is its own **Deploy** round ahead of Round 1; it is only recorded if an army was
-registered by then, and the table says so in chat if none was. Prev / Next phase step through in order and the
-arrow keys do the same. The board zooms on the mouse wheel about the cursor, pans
-on drag, and resets on double-click, the `0` key or the Reset view button.
-
-The board is drawn looking down on the table the way you sit at it: +z is the far
-edge, at the top of the picture.
-
-Terrain areas - the flat plates the ruins stand on - are drawn as their exact
-outlines, and none of it is inferred from the capture. The log records which map
-card was loaded, and that card's own spawn payload (`data/maps/<card_guid>.lua`)
-already holds every plate's position, rotation and mesh, so the report reads the
-geometry rather than guessing it: measured against a real recorded game, all 41
-objects matched by GUID to within 0.006", which is the capture's own rounding.
-
-Each plate's true silhouette lives in `data/plate_outlines.json`, traced from the
-real meshes by `scripts/extract_plate_outlines.py`. Eleven shapes cover all 3586
-plates of all 225 shipped maps, so nothing falls back to a box - and the plate the
-maps call a "triangle" draws as the right trapezoid it actually is, facing the
-right way. A test places every plate of every map and fails if any of them lands
-off the table, which is what pins the mirroring down.
-
-The ruins standing on those plates are not drawn for now, so the board stays
-readable under the models. Hovering an area names the objective it surrounds.
-
-A side panel carries VP/CP with each side's primary/secondary split, both
-Reinforcements and Reserves boards, the
-secondaries currently in each side's zones, and casualties as they accumulate.
-Overlay toggles mirror the in-game buttons - deployment zones (redrawn from the
-mission's own draw spec), objectives, territory line, table quarters, the 6"
-strategic reserves inset, and the 3"/6" centre rings. The territory line is
-derived from the deployment that was played, exactly as the table derives it, so
-it tilts with a stepped zone instead of sitting on the centre line.
-
-**Deployment map** is a separate view, off by default: the mission's setup as a
-drawn diagram - terrain, deployment zones drawn heavier and labelled by colour,
-quarters, divider and objectives - with the round, player and phase tabs parked
-until you turn it off. The mission's own layout-art card is deliberately not used
-here: one art card serves three different terrain layouts (the three Battlemaster
-packs, LCT Pack 1 and T5S2 all share a mission name but not a layout), so it would
-be wrong for two maps in three. Board markings are drawn in inches at
-true table scale, so a name label or a zone line stays in proportion to a 32mm base
-however far you zoom.
+What the report itself shows — round/player/phase tabs, a separate deployment-map
+view, true-to-scale terrain read from the map's own payload, and a side panel with
+score, reserves, secondaries and casualties — is documented in `lct-report-server`'s
+own README, since that repo is what builds it.
 
 Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model's
 `uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
@@ -155,34 +104,36 @@ count on an unscripted model (no datasheet popup) still comes back correctly. A
 model that is alive now but was already dead at the moment you rewind to goes back
 into the bag; rewinding forward past its death takes it back out.
 
-#### Hosting the report server
+#### The split with `lct-report-server`
 
-The server behind EXPORT REPORT — both the local helper above and the hosted, Render-deployed
-version — lives in its own repo, [`lct-report-server`](https://github.com/Tzabari/lct-report-server),
-not here. That split is deliberate: it lets Render deploy from a small, fast-cloning repo instead
-of this one's full history, and it keeps a public-facing service's code apart from everything else
-the mod ships. This repo has no Python HTTP server code of its own.
+Splitting the renderer into its own repo keeps this one slim and lets
+[Render](https://render.com) deploy from a small, fast-cloning repo instead of this
+mod's full history — and, since the two repos used to keep manual copies of the same
+five files in sync by hand, it also removes the one thing that let those copies drift
+(they did, once, for about half an hour). There is now nothing shared to keep in sync:
 
-What stays here, on the TTS side:
+- **This repo** owns `TTSLUA/global.ttslua`'s battle-log recording and its EXPORT
+  REPORT wiring (`BATTLE_REPORT_URL`, `BATTLE_REPORT_REMOTE_BASE`/`BATTLE_REPORT_TOKEN`
+  baked at build time by `scripts/compile.py`'s `bake_battle_report_endpoint`, and the
+  probe-then-post retry ladder), plus `data/maps/` — the 228 raw map payloads terrain
+  is read from. It has no renderer, no terrain lookup, and no generated terrain cache.
+- **`lct-report-server`** owns every line of rendering code (`battle_report.py`,
+  `map_terrain.py`, the HTTP service) and the generators that produce its checked-in
+  data (`bake_terrain_cache.py`, `extract_plate_outlines.py`). Those generators are
+  dev-only tools that need this repo's `data/maps/` to run — they take a sibling
+  checkout of this repo (`--payload-dir` / `$LCT_ROOT`) as input, the same way a
+  developer would clone both repos side by side; nothing here runs or depends on them.
+- **The schema handshake** is what replaces manual sync as the safety net: `EXPORT
+  REPORT` probes `/healthz` before ever uploading, the server reports the schema
+  version its renderer understands, and the mod refuses to upload (naming both
+  versions) rather than send a log the server can't read. A log recorded on an older
+  schema than the server still renders — `load_log` upgrades it — so a server that is
+  merely behind loses nothing older, only new schema features until it's updated.
 
-- **The Lua wiring** (`TTSLUA/global.ttslua`) — `BATTLE_REPORT_URL` (the loopback default),
-  `BATTLE_REPORT_REMOTE_BASE`/`BATTLE_REPORT_TOKEN` (baked at build time, see below), the
-  probe-then-post retry ladder (`BATTLE_EXPORT_BACKOFF`), and delivery of the resulting links to
-  chat and a notebook tab.
-- **The compile-time bake** (`scripts/compile.py`'s `bake_battle_report_endpoint`) — writes the
-  hosted service's URL and a shared `LCT_REPORT_TOKEN` into the compiled mod. A `--test` build
-  bakes an empty base by default (local-only); set `LCT_REPORT_BAKE_IN_TEST=1` plus
-  `LCT_REPORT_REMOTE_BASE` to rehearse against a LAN-bound instance without the in-game console.
-- **The terrain cache** (`data/terrain_cache.json`, `scripts/bake_terrain_cache.py`) — this is the
-  one piece of data the server repo actually needs from here, since it's derived from
-  `data/maps/`'s raw payloads (26 MB, mod-only). Rebuild it after touching a map's payload:
-  ```bash
-  python3 scripts/bake_terrain_cache.py            # write data/terrain_cache.json
-  python3 scripts/bake_terrain_cache.py --check    # exit 1 if stale (also run as a unit test)
-  ```
-  `scripts/sync_battlemaster_maps.py` rebakes it automatically as a post-write check. Getting the
-  result into `lct-report-server` is a **manual copy**, done deliberately — see that repo's
-  README for the deploy-time steps and its own env-var/auth/TTL documentation.
+`LCT_REPORT_TOKEN` (compiled in by `bake_battle_report_endpoint`) is not a secret in
+the usual sense — it ships inside the compiled mod that every subscriber downloads —
+it's a rate-limit key, not authentication; see `lct-report-server`'s README for what
+it and the Steam-id header are actually for.
 
 To run the LAN rehearsal that exercises the whole path with nothing deployed to Render: clone
 `lct-report-server`, run its `battle_report_server.py` in hosted mode bound to your machine's LAN

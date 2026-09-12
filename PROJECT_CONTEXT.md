@@ -129,7 +129,7 @@ The compiler performs these steps in order:
 
 Preserve all compiler markers exactly:
 
-- Global: `@@LCT_VERSION@@`, `@@LCT_PATCH@@`, `@@LCT_CHANGELOG@@`, `@@LCT_DEBUG@@`, `@@MAP_INDEX@@`.
+- Global: `@@LCT_VERSION@@`, `@@LCT_PATCH@@`, `@@LCT_CHANGELOG@@`, `@@LCT_DEBUG@@`, `@@MAP_INDEX@@`, `@@BATTLE_REPORT_REMOTE_BASE@@`, `@@BATTLE_REPORT_TOKEN@@`.
 - Start menu: city/Battlemaster/LCT mat URL and name markers plus the randomizer booleans.
 - Battlemaster spawner: `@@MAP_CARD_MACHINERY@@`.
 

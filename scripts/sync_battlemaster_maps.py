@@ -1188,10 +1188,6 @@ def run_post_write_checks(*, compile_test: bool) -> None:
         [sys.executable, "scripts/validate_maps.py", "--require-map-tags"],
         [sys.executable, "-m", "unittest", "scripts.test_validate_maps", "scripts.test_sync_battlemaster_maps"],
         [sys.executable, "scripts/audit_map_payloads.py", "--strict"],
-        # Keeps data/terrain_cache.json (the hosted battle-report server's only
-        # dependency on map data) from silently going stale the moment this sync
-        # adds or changes a payload -- see bake_terrain_cache.py.
-        [sys.executable, "scripts/bake_terrain_cache.py"],
     ]
     if compile_test:
         commands.append([sys.executable, "scripts/compile.py", "--test"])
