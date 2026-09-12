@@ -3,13 +3,13 @@
 
 The renderer that turns a recorded log into a report -- battle_report.py and
 everything it needs (map_terrain.py, the terrain cache, the HTML/JS viewer) --
-moved to the separate lct-report-server repo, along with its own tests. What
+lives in the separate lct-report-server repo, which is now a standalone
+desktop app that opens a TTS save file directly and renders whichever game you
+pick. This mod has no export button and no network code of any kind; what
 stays here is everything that only source-greps TTSLUA/*.ttslua: the recording
-API, the cross-script safety pattern the Lua side depends on, and the hosted
-export wiring. None of it needs battle_report.py to exist.
+API and the cross-script safety pattern the Lua side depends on.
 """
 
-import os
 import re
 import sys
 import unittest
@@ -22,21 +22,10 @@ ROOT = SCRIPT_DIR.parent
 GLOBAL_LUA = ROOT / "TTSLUA" / "global.ttslua"
 START_MENU_LUA = ROOT / "TTSLUA" / "startMenu.ttslua"
 TOOLS_LUA = ROOT / "TTSLUA" / "spawnGameTools.ttslua"
-PROJECT_CONTEXT_MD = ROOT / "PROJECT_CONTEXT.md"
 
 
 class TestLuaWiring(unittest.TestCase):
-    """Lock the Lua-side contracts the (now separate) renderer depends on.
-
-    There used to be a test here, test_schema_version_matches_the_lua_side,
-    asserting BATTLE_LOG_SCHEMA against battle_report.BR.SCHEMA_VERSION. It
-    could only ever compare this repo's own copy of the renderer, not the one
-    actually deployed -- it passed the whole time lct-report-server's copy sat
-    a schema behind this repo's after the split. The real guarantee now is the
-    runtime handshake: battleProbeThenPost checks the server's /healthz schema
-    field against BATTLE_LOG_SCHEMA before ever uploading. See this repo's
-    README and lct-report-server's test suite.
-    """
+    """Lock the Lua-side contracts the (now separate) renderer depends on."""
 
     def test_battle_log_is_persisted_in_global_on_save(self):
         text = GLOBAL_LUA.read_text(encoding="utf-8")
@@ -77,20 +66,10 @@ class TestLuaWiring(unittest.TestCase):
 
     def test_tool_buttons_forward_to_global(self):
         text = TOOLS_LUA.read_text(encoding="utf-8")
-        for fn in ("registerArmyR", "registerArmyB", "captureSnapshot", "exportReport"):
+        for fn in ("registerArmyR", "registerArmyB", "captureSnapshot"):
             self.assertIn(f"function {fn}(", text)
         self.assertIn("battleRegisterFromSelection", text)
         self.assertIn("battleClearArmy", text)
-        self.assertIn("exportBattleReport", text)
-
-    def test_report_url_matches_the_server_default(self):
-        # The local helper (battle_report_server.py) lives in the separate
-        # lct-report-server repo now -- 8787/"/report" is its contract, held
-        # here as a literal so this test needs nothing from that repo.
-        text = GLOBAL_LUA.read_text(encoding="utf-8")
-        m = re.search(r'BATTLE_REPORT_URL\s*=\s*"([^"]+)"', text)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "http://127.0.0.1:8787/report")
 
 
 class TestLuaWiringDeployment(unittest.TestCase):
@@ -104,218 +83,26 @@ class TestLuaWiringDeployment(unittest.TestCase):
         self.assertNotIn("~= table\n", body)
 
 
-class TestLuaWiringRemote(unittest.TestCase):
-    """The hosted path wired into global.ttslua: the compile-time marker,
-    the probe-then-post ladder, Steam-id headers, and -- the one that must
-    never regress -- that none of this ever fires before EXPORT is pressed."""
+class TestNoServerCommunication(unittest.TestCase):
+    """The mod was split from lct-report-server entirely: no export button, no
+    WebRequest, no networking of any kind. The battle log rides out with the
+    save; a standalone desktop app reads the save file directly to render it."""
 
     @classmethod
     def setUpClass(cls):
         cls.src = GLOBAL_LUA.read_text(encoding="utf-8", errors="replace")
         cls.tools_src = TOOLS_LUA.read_text(encoding="utf-8", errors="replace")
 
-    @staticmethod
-    def _body(src, fn):
-        start = src.index(f"function {fn}(")
-        body = src[start:]
-        return body[:body.index("\nend")]
+    def test_no_web_request_anywhere_in_the_mod(self):
+        self.assertNotIn("WebRequest", self.src)
 
-    def test_report_url_matches_the_server_default_is_unaffected(self):
-        # Re-asserted here (it lives on TestLuaWiring) because it is the one
-        # invariant this whole feature must never disturb: the local loopback
-        # path is unchanged.
-        m = re.search(r'BATTLE_REPORT_URL\s*=\s*"([^"]+)"', self.src)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "http://127.0.0.1:8787/report")
-
-    def test_the_remote_base_marker_is_present_for_compile_py_to_bake(self):
-        self.assertIn("-- @@BATTLE_REPORT_REMOTE_BASE@@", self.src)
-        self.assertIn("-- @@BATTLE_REPORT_TOKEN@@", self.src)
-
-    def test_the_markers_are_on_project_contexts_preserved_list(self):
-        # PROJECT_CONTEXT.md exists specifically to stop a marker from being
-        # deleted as apparent litter; this branch added two markers to
-        # global.ttslua without adding them to that list.
-        context = PROJECT_CONTEXT_MD.read_text(encoding="utf-8", errors="replace")
-        self.assertIn("@@BATTLE_REPORT_REMOTE_BASE@@", context)
-        self.assertIn("@@BATTLE_REPORT_TOKEN@@", context)
-
-    def test_compile_py_bakes_the_same_markers(self):
-        # The drift that would otherwise ship a mod pointing nowhere: the
-        # marker exists in the Lua source, but nothing writes to it.
-        compile_src = (SCRIPT_DIR / "compile.py").read_text(encoding="utf-8")
-        self.assertIn("def bake_battle_report_endpoint(", compile_src)
-        self.assertIn("@@BATTLE_REPORT_REMOTE_BASE@@", compile_src)
-        self.assertIn("@@BATTLE_REPORT_TOKEN@@", compile_src)
-        self.assertIn("bake_battle_report_endpoint(global_text", compile_src,
-                     "bake_battle_report_endpoint is defined but never called")
-
-    def test_a_test_build_bakes_an_empty_base_not_the_real_service(self):
-        import compile as C
-        out = C.bake_battle_report_endpoint(self.src, is_test=True)
-        self.assertIn('BATTLE_REPORT_REMOTE_BASE = ""', out)
-        self.assertIn('BATTLE_REPORT_TOKEN = ""', out)
-
-    def test_a_missing_marker_fails_a_release_build_but_only_warns_a_test_build(self):
-        # The marker is a removable-looking trailing comment on an otherwise
-        # complete assignment (see PROJECT_CONTEXT.md's preserved-markers
-        # list), so a --release build must not silently ship with the hosted
-        # export path disabled because someone stripped it in a tidy-up pass.
-        import compile as C
-        stripped = self.src.replace(
-            'BATTLE_REPORT_REMOTE_BASE = "" -- @@BATTLE_REPORT_REMOTE_BASE@@',
-            'BATTLE_REPORT_REMOTE_BASE = ""',
-        )
-        self.assertNotEqual(stripped, self.src, "fixture did not find the marker line to strip")
-        with self.assertRaises(SystemExit):
-            C.bake_battle_report_endpoint(stripped, is_test=False, is_release=True)
-        out = C.bake_battle_report_endpoint(stripped, is_test=False, is_release=False)
-        self.assertIn("marker @@BATTLE_REPORT_REMOTE_BASE@@ not found", "\n".join(C.WARNINGS))
-        self.assertNotIn("@@BATTLE_REPORT_REMOTE_BASE@@", out)
-
-    def test_lct_report_bake_in_test_opts_a_test_build_into_a_real_base(self):
-        # The escape hatch for rehearsing the hosted path (e.g. a LAN-bound
-        # `battle_report_server.py --mode hosted`) without the in-game console.
-        import compile as C
-        saved = {k: os.environ.get(k) for k in
-                 ("LCT_REPORT_BAKE_IN_TEST", "LCT_REPORT_REMOTE_BASE", "LCT_REPORT_TOKEN")}
-        try:
-            os.environ["LCT_REPORT_BAKE_IN_TEST"] = "1"
-            os.environ["LCT_REPORT_REMOTE_BASE"] = "http://192.168.0.217:8799"
-            os.environ["LCT_REPORT_TOKEN"] = "testtoken123"
-            out = C.bake_battle_report_endpoint(self.src, is_test=True)
-            self.assertIn('BATTLE_REPORT_REMOTE_BASE = "http://192.168.0.217:8799"', out)
-            self.assertIn('BATTLE_REPORT_TOKEN = "testtoken123"', out)
-
-            # Without LCT_REPORT_BAKE_IN_TEST, the same env vars are ignored --
-            # a --test build stays local-only unless explicitly opted out.
-            del os.environ["LCT_REPORT_BAKE_IN_TEST"]
-            out = C.bake_battle_report_endpoint(self.src, is_test=True)
-            self.assertIn('BATTLE_REPORT_REMOTE_BASE = ""', out)
-            self.assertIn('BATTLE_REPORT_TOKEN = ""', out)
-        finally:
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
-    def test_the_health_path_matches_the_server(self):
-        # "/healthz" is lct-report-server's contract (battle_report_server.py's
-        # HEALTH_PATH), held here as a literal now that repo is separate.
-        m = re.search(r'BATTLE_REPORT_HEALTH\s*=\s*"([^"]+)"', self.src)
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1), "/healthz")
-
-    def test_export_uses_the_backoff_ladder_and_a_busy_guard(self):
-        body = self._body(self.src, "exportBattleReport")
-        self.assertIn("battleExportBusy", body)
-        export_ladder = self._body(self.src, "battleExportLadder")
-        self.assertIn("BATTLE_EXPORT_BACKOFF", export_ladder)
-        self.assertIn("Wait.time", export_ladder)
-
-    def test_only_the_hosted_endpoint_is_retried_local_fails_fast(self):
-        # A local helper that isn't running fails near-instantly and will
-        # never start itself mid-game -- retrying it through the whole ~2 min
-        # ladder before ever trying the hosted fallback would make "auto" mode
-        # look hung for no reason. Only the endpoint marked retryable (hosted)
-        # gets the backoff ladder; local falls through after one probe.
-        endpoints_body = self._body(self.src, "battleReportEndpoints")
-        self.assertIn("retryable = false", endpoints_body)
-        self.assertIn("retryable = true", endpoints_body)
-        ladder_body = self._body(self.src, "battleExportLadder")
-        self.assertIn("endpoint.retryable", ladder_body)
-
-    def test_each_attempt_has_its_own_watchdog(self):
-        # Never depend on TTS's undocumented WebRequest timeout -- each network
-        # attempt arms its own Wait.time so a slow/absent callback cannot hang
-        # the ladder. The probe and the POST use separate constants (not a
-        # shared one) because they need opposite tuning: /healthz is tiny and
-        # should fail fast, while a several-MB POST must not be mistaken for
-        # hung just because it is still uploading.
-        probe_body = self._body(self.src, "battleProbeThenPost")
-        self.assertIn("Wait.time", probe_body)
-        self.assertIn("BATTLE_EXPORT_PROBE_TIMEOUT", probe_body)
-        post_body = self._body(self.src, "battlePostReport")
-        self.assertIn("Wait.time", post_body)
-        self.assertIn("BATTLE_EXPORT_POST_TIMEOUT", post_body)
-
-    def test_a_post_timeout_does_not_resend_the_body(self):
-        # WebRequests can't be cancelled, so once the body has actually been
-        # handed to WebRequest.custom, a watchdog firing must not re-enter the
-        # retry ladder -- that would resend the whole report on top of the copy
-        # already in flight. Only battleHandlePostResult (which runs only once
-        # the request has genuinely finished, with an error or a definite HTTP
-        # status) is allowed to do that.
-        post_body = self._body(self.src, "battlePostReport")
-        watchdog = post_body[post_body.index("Wait.time"):]
-        self.assertNotIn("battleExportLadder", watchdog,
-                         "a POST watchdog must not resend the body it already sent")
-
-    def test_the_probe_checks_the_servers_schema_before_posting(self):
-        # The handshake that replaces the old cross-repo schema-lockstep test
-        # (see TestLuaWiring's docstring): refuse to upload rather than send a
-        # log the server has already told us it can't read.
-        body = self._body(self.src, "battleProbeThenPost")
-        self.assertIn("health.schema", body)
-        self.assertIn("BATTLE_LOG_SCHEMA", body)
-
-    def test_a_503_is_handled_distinctly_from_an_unreachable_server(self):
-        # The server being busy is not the same situation as the server being
-        # down; retrying immediately would only add to the load that caused it.
-        body = self._body(self.src, "battleHandlePostResult")
-        self.assertIn("503", body)
-        busy_branch = body[body.index("code == 503"):]
-        busy_branch = busy_branch[:busy_branch.index("return") + len("return")]
-        self.assertNotIn("battleExportLadder", busy_branch,
-                         "a 503 (busy) must not re-enter the retry ladder")
-
-    def test_the_result_reaches_chat_and_a_notebook_tab(self):
-        body = self._body(self.src, "battleDeliverReportUrl")
-        self.assertIn("printToAll", body)
-        self.assertIn("battleWriteNotebookTab", body)
-        notebook_body = self._body(self.src, "battleWriteNotebookTab")
-        self.assertIn("Notes.addNotebookTab", notebook_body)
-        self.assertIn("Notes.editNotebookTab", notebook_body)
-
-    def test_steam_id_is_sent_via_the_host_seat_not_the_clicker(self):
-        headers_body = self._body(self.src, "battleReportHeaders")
-        self.assertIn("X-LCT-Steam-Id", headers_body)
-        self.assertIn("battleHostSteamId", headers_body)
-        host_id_body = self._body(self.src, "battleHostSteamId")
-        self.assertIn(".host", host_id_body)
-        self.assertIn("Player.getPlayers", host_id_body)
-
-    def test_the_export_button_tooltip_mentions_the_hosted_path(self):
-        self.assertIn("hosted if configured", self.tools_src)
-
-    def test_the_mod_makes_no_background_requests(self):
-        """Pins "contact the server only on EXPORT" so a later edit cannot
-        quietly reintroduce a warm-up ping. This is the one that must never be
-        weakened -- see the plan's round-1 correction on this exact point."""
-        # "WebRequest." (an actual call, e.g. WebRequest.get/.custom) rather
-        # than the bare word: a comment is allowed to mention WebRequest while
-        # explaining behaviour (see battleReportEndpoints' "local" entry)
-        # without that tripping this check.
-        for fn in ("recordBattleSnapshot", "battleRegisterFromSelection",
-                  "battleClearArmy", "battleStartGame", "battleManualCapture"):
-            body = self._body(self.src, fn)
-            self.assertNotIn("WebRequest.", body, f"{fn} must not call WebRequest")
-
-        # Every WebRequest call in the BATTLE LOG block lives in a function
-        # reachable only from exportBattleReport's own ladder.
-        allowed = {"battleProbeThenPost", "battlePostReport"}
-        for fn in allowed:
-            self.assertIn("WebRequest.", self._body(self.src, fn))
-        section_start = self.src.index("function battleWebStatusCode(")
-        section_end = self.src.index("\nfunction battleSetReportMode(")
-        section = self.src[section_start:section_end]
-        # Every function in this section that calls WebRequest must be one of
-        # the allowed two -- a stray third call site would be a regression.
-        for fn_match in re.finditer(r"function (\w+)\(.*?\n(.*?)\nend", section, re.S):
-            name, body = fn_match.group(1), fn_match.group(2)
-            if "WebRequest." in body:
-                self.assertIn(name, allowed, f"unexpected WebRequest call in {name}")
+    def test_no_export_button_or_report_wiring_left(self):
+        for name in ("exportReport", "exportBattleReport", "battleReportEndpoints",
+                     "battleProbeThenPost", "battlePostReport", "battleExportLadder",
+                     "battleSetReportMode", "BATTLE_REPORT_URL", "BATTLE_REPORT_REMOTE_BASE",
+                     "BATTLE_REPORT_TOKEN", "BATTLE_REPORT_MODE"):
+            self.assertNotIn(name, self.src, f"{name} should have been removed with the export path")
+            self.assertNotIn(name, self.tools_src, f"{name} should have been removed with the export path")
 
 
 class TestCrossScriptTableSafety(unittest.TestCase):

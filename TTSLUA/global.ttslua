@@ -1280,11 +1280,6 @@ function onSave()
         -- construction (roughly 400 KB for a full two-army game), so unlike the
         -- start menu restore point it is cheap to encode on every autosave.
         svBattleLog = battleLog,
-        -- A console dev override (battleSetReportMode / Global.setVar) survives
-        -- a reload. Deliberately not the token -- a session's override typed
-        -- into the console has no business leaking into a save file.
-        svBattleReportMode = BATTLE_REPORT_MODE,
-        svBattleReportBase = BATTLE_REPORT_REMOTE_BASE,
         svVersion = GAME_VERSION
     })
     --saved_data = ""
@@ -1341,9 +1336,10 @@ end
 -- Each player registers their army once (select models -> REGISTER ARMY on the
 -- spawn-game-tools object). From then on every phase/turn transition records
 -- where every registered model stands, alongside round/VP/CP context and the
--- terrain layout, so a finished game can be rendered into a battle report by
--- the separate lct-report-server repo's export_battle_report.py (offline, from
--- an exported save) or its battle_report_server.py (live, via EXPORT REPORT).
+-- terrain layout. The log rides out with the save (svBattleLog); a separate
+-- standalone desktop app (the lct-report-server repo) opens the save file
+-- directly and renders whichever game you pick into a battle report -- this
+-- mod never talks to it, or to anything else, over the network.
 --
 -- Size discipline (compare the onSave note in startMenu.ttslua): a full 5-round
 -- game with two ~100-model armies encodes to roughly 400 KB, about 10x under the
@@ -1362,47 +1358,6 @@ BATTLE_LOG_SCHEMA = 2
 BATTLE_MAX_MODELS = 400
 BATTLE_MAX_SNAPS  = 250
 BATTLE_MAX_NAMES  = 4000
-
--- The local helper. Unchanged, and still the fast path: no cold start, and it
--- hot-reloads the renderer between exports. Lives in the separate
--- lct-report-server repo (run its battle_report_server.py with no --mode
--- flag) -- this mod has no Python server code of its own.
-BATTLE_REPORT_URL = "http://127.0.0.1:8787/report"
-
--- The hosted renderer -- same script as the local helper above, run with
--- --mode hosted and deployed via lct-report-server's render.yaml. Baked at
--- build time by scripts/compile.py; the empty defaults keep an uncompiled
--- source build valid and local-only.
-BATTLE_REPORT_REMOTE_BASE = "" -- @@BATTLE_REPORT_REMOTE_BASE@@
-BATTLE_REPORT_TOKEN = "" -- @@BATTLE_REPORT_TOKEN@@
-
--- "auto" probes the local helper first (no cold start, hot-reloads the
--- renderer) and falls through to the hosted one if it's not there; "local" /
--- "remote" force a single path. Runtime-overridable the same way BM_API_BASE
--- is (battlemasterDynamicSpawner.ttslua), via battleSetReportMode() or a
--- console Global.setVar, and persisted in onSave.
-BATTLE_REPORT_MODE = BATTLE_REPORT_MODE or "auto"
-BATTLE_REPORT_HEALTH = "/healthz"
-
--- Per-attempt watchdogs: exportBattleReport never depends on TTS's undocumented
--- WebRequest timeout, since that could turn out to be shorter than a hosted
--- server's wake time (see exportBattleReport's comment). Split in two because
--- a probe and a POST have opposite needs: /healthz is tens of bytes and either
--- answers in well under a second or the server isn't there, so it should fail
--- fast; the report body can be a few MB (see the plan's payload-size table)
--- and a slow-but-progressing upload must not be mistaken for a hung one --
--- WebRequests can't be cancelled, so firing the ladder while the previous
--- POST is still in flight would send the whole body again.
-BATTLE_EXPORT_PROBE_TIMEOUT = 8
-BATTLE_EXPORT_POST_TIMEOUT = 90
--- Roughly 120s of probing across all six steps -- about double Render's own
--- documented ~60s free-tier wake, in visible steps so the wait never looks
--- dead. Tune against the real service once it is deployed.
-BATTLE_EXPORT_BACKOFF = {5, 10, 15, 20, 30, 40}
-
--- Debounce for the EXPORT REPORT button: a mashed click must not launch a
--- second upload while the first is still probing/posting/retrying.
-battleExportBusy = false
 
 -- GMNotes sentinels the rest of the mod uses for overlays, markers and mission
 -- cards. Anything carrying one of these is furniture, never a player model.
@@ -2452,342 +2407,6 @@ function battleManualCapture(playerColor)
     end)
 end
 
--- TTS cannot write files or launch processes, so the in-game export POSTs the
--- log to a renderer instead: the local helper (battle_report_server.py, from
--- the separate lct-report-server repo) when it is running, or the hosted one
--- (Render, via BATTLE_REPORT_REMOTE_BASE) otherwise. Failure -- neither
--- reachable -- is expected and must stay a soft, informative miss, same as
--- before hosting existed.
---
--- Mirrors battlemasterDynamicSpawner.ttslua's getWebStatusCode: a field TTS has
--- renamed before, and a rename that turns success into nil must not silently
--- read as "the server is down".
--- request.response_code is the real field (verified against TTS's
--- Assembly-CSharp.dll: get_response_code exists, get_responseCode is a live
--- camelCase alias, and status_code/statusCode/status do not exist on this
--- type at all). Returning 0 for "field missing" used to be indistinguishable
--- from "server said 0", which is exactly the kind of thing that reads as an
--- unreachable server when the real bug is a wrong field name -- so a miss
--- returns nil (every caller already treats non-200 as "retry", so nil behaves
--- the same as 0 did there) and warns once instead of failing silently.
-function battleWebStatusCode(request)
-    local code = tonumber(request.response_code) or tonumber(request.responseCode)
-    if code == nil and not _battleWebStatusWarned then
-        _battleWebStatusWarned = true
-        broadcastToAll("Battle report: WebRequest has no response_code field -- " ..
-                       "export status can't be read correctly.", {1, 0.6, 0.2})
-    end
-    return code
-end
-
--- The seated player currently marked host, generalised over Player.getPlayers()
--- so it finds the host regardless of seat colour (mirrors the Player[color].host
--- idiom already used above, e.g. promotePlayers). Only the host's machine can
--- ever issue WebRequest, so this is whose Steam id every export actually
--- carries, whichever seat clicked the button.
-function battleHostSteamId()
-    for _, person in ipairs(Player.getPlayers()) do
-        if person.host then
-            return person.steam_id or ""
-        end
-    end
-    return ""
-end
-
-function battleReportHeaders()
-    local headers = {["Content-Type"] = "application/json"}
-    if BATTLE_REPORT_TOKEN ~= "" then
-        headers["X-LCT-Token"] = BATTLE_REPORT_TOKEN
-    end
-    local steamId = battleHostSteamId()
-    if steamId ~= "" then
-        headers["X-LCT-Steam-Id"] = steamId
-    end
-    return headers
-end
-
--- base .. path, or "" when no hosted base is configured.
-function battleReportRemoteUrl(path)
-    if BATTLE_REPORT_REMOTE_BASE == "" then return "" end
-    return BATTLE_REPORT_REMOTE_BASE .. path
-end
-
--- Ordered {label, reportUrl, healthUrl} endpoints to try, per BATTLE_REPORT_MODE.
-function battleReportEndpoints()
-    local endpoints = {}
-    if BATTLE_REPORT_MODE ~= "remote" then
-        table.insert(endpoints, {
-            label = "local", reportUrl = BATTLE_REPORT_URL,
-            healthUrl = (BATTLE_REPORT_URL:gsub("/report$", BATTLE_REPORT_HEALTH)),
-            -- The local helper doesn't sleep and wake like a hosted service
-            -- does: it's either already running (answers in well under a
-            -- second) or it simply isn't (WebRequest fails almost instantly).
-            -- Retrying a process that isn't there six times over ~2 minutes
-            -- would only make "auto" mode look hung before it ever reaches
-            -- the hosted fallback -- so a single probe is all it gets.
-            retryable = false,
-        })
-    end
-    if BATTLE_REPORT_MODE ~= "local" then
-        local remoteReport = battleReportRemoteUrl("/report")
-        if remoteReport ~= "" then
-            table.insert(endpoints, {
-                label = "hosted", reportUrl = remoteReport,
-                healthUrl = battleReportRemoteUrl(BATTLE_REPORT_HEALTH),
-                -- This is the one that can genuinely be asleep (Render's free
-                -- tier), so it's the one that gets the backoff ladder.
-                retryable = true,
-            })
-        end
-    end
-    return endpoints
-end
-
-function exportBattleReport(playerColor)
-    if battleLog == nil or battleLog.snaps == nil or #battleLog.snaps == 0 then
-        printToColor("Battle log is empty - nothing to export yet.", playerColor, {1, 0.6, 0.2})
-        return
-    end
-    if battleExportBusy then
-        printToColor("Already exporting - hang on a moment.", playerColor, {1, 0.8, 0.3})
-        return
-    end
-    local endpoints = battleReportEndpoints()
-    if #endpoints == 0 then
-        printToColor("No report server configured. Run battle_report_server.py from the " ..
-                     "separate lct-report-server repo (see its README) -- this mod has no " ..
-                     "server code of its own.", playerColor, {1, 0.5, 0.3})
-        return
-    end
-    battleExportBusy = true
-    battleProbeThenPost({endpoints = endpoints, endpointIndex = 1, attemptIndex = 0,
-                         playerColor = playerColor})
-end
-
--- Probes /healthz (tens of bytes) before ever sending the battle log itself,
--- so a sleeping or absent server fails fast instead of leaving an upload
--- (up to a few MB, see the plan's payload-size table) hanging against TTS's
--- undocumented WebRequest timeout. A 200 here triggers exactly one POST. The
--- probe is cheap and safe to retry -- BATTLE_EXPORT_PROBE_TIMEOUT is short on
--- purpose, and re-probing after it fires never resends anything large. (The
--- POST itself is a different story: see battlePostReport.)
-function battleProbeThenPost(state)
-    local endpoint = state.endpoints[state.endpointIndex]
-    local settled = false
-    WebRequest.get(endpoint.healthUrl, function(request)
-        if settled then return end
-        settled = true
-        if request.is_error or battleWebStatusCode(request) ~= 200 then
-            battleExportLadder(state)
-            return
-        end
-        -- The schema handshake: /healthz carries the renderer's own
-        -- BATTLE_LOG_SCHEMA-equivalent, so a server left behind after a schema
-        -- bump is caught here, in a few hundred bytes, rather than after a
-        -- multi-megabyte POST comes back as a generic "export failed". A
-        -- server whose /healthz predates this field (no "schema" key at all)
-        -- is not treated as a mismatch -- there is nothing to compare against,
-        -- so this falls through to the old behaviour of just trying the POST.
-        local ok, health = pcall(function() return JSON.decode(request.text) end)
-        local serverSchema = (ok and type(health) == "table") and tonumber(health.schema) or nil
-        if serverSchema ~= nil and serverSchema ~= BATTLE_LOG_SCHEMA then
-            battleExportBusy = false
-            printToColor("Report server (" .. endpoint.label .. ") understands battle log " ..
-                         "schema " .. serverSchema .. ", but this game recorded schema " ..
-                         BATTLE_LOG_SCHEMA .. " -- refusing to upload rather than send a log " ..
-                         "it can't read. Update the server.",
-                         state.playerColor, {1, 0.5, 0.3})
-            return
-        end
-        battlePostReport(endpoint, state)
-    end)
-    Wait.time(function()
-        if settled then return end
-        settled = true
-        battleExportLadder(state)
-    end, BATTLE_EXPORT_PROBE_TIMEOUT)
-end
-
--- Retries the current endpoint through BATTLE_EXPORT_BACKOFF -- but only when
--- it's marked retryable (the hosted one; see battleReportEndpoints) -- printing
--- a progress line at each step so the wait never looks dead, then falls
--- through to the next configured endpoint, and finally to the soft-miss
--- message once every endpoint has been tried. This is the whole cold-start
--- story: no preemptive warming anywhere in the mod (see the plan's "Cold
--- start" section) means this ladder -- run only because EXPORT REPORT was
--- actually pressed -- is what absorbs a sleeping Render instance's ~60s wake.
-function battleExportLadder(state)
-    local endpoint = state.endpoints[state.endpointIndex]
-    if endpoint.retryable then
-        state.attemptIndex = state.attemptIndex + 1
-        local delay = BATTLE_EXPORT_BACKOFF[state.attemptIndex]
-        if delay ~= nil then
-            if state.attemptIndex == 1 then
-                printToColor("Report server (" .. endpoint.label .. ") is waking up - this can take about a minute...",
-                             state.playerColor, {0.8, 0.8, 1})
-            else
-                printToColor("Still waiting on the " .. endpoint.label .. " report server...",
-                             state.playerColor, {0.7, 0.7, 0.9})
-            end
-            Wait.time(function() battleProbeThenPost(state) end, delay)
-            return
-        end
-    end
-
-    state.endpointIndex = state.endpointIndex + 1
-    state.attemptIndex = 0
-    local nextEndpoint = state.endpoints[state.endpointIndex]
-    if nextEndpoint == nil then
-        battleExportBusy = false
-        printToColor("No report server reachable. Run battle_report_server.py from the " ..
-                     "separate lct-report-server repo (see its README).",
-                     state.playerColor, {1, 0.5, 0.3})
-        printToColor("Or save the game and run that repo's export_battle_report.py on the save file.",
-                     state.playerColor, {1, 0.7, 0.4})
-        return
-    end
-    printToColor("Falling back to the " .. nextEndpoint.label .. " report server...",
-                 state.playerColor, {0.8, 0.8, 1})
-    battleProbeThenPost(state)
-end
-
--- The POST is at-most-once: WebRequests can't be cancelled, so once the body
--- has actually been handed to WebRequest.custom, a watchdog firing here must
--- not re-enter the ladder (that would send the whole body again, on top of
--- whichever copy is still in flight). battleHandlePostResult's failure
--- branches are safe to retry from, because those only run once the request
--- has genuinely finished (with an error or a definite HTTP status) -- it is
--- only a bare timeout, where the outcome is still unknown, that must end the
--- export instead of resending it.
-function battlePostReport(endpoint, state)
-    -- Encoded once per export, not once per attempt: this is state.body's
-    -- purpose -- a ~400 KB-3 MB log is a real frame hitch to re-encode, and it
-    -- would otherwise happen again on every retry against the same endpoint.
-    if state.body == nil then
-        state.body = JSON.encode(battleLog)
-    end
-    local body = state.body
-    printToColor("Sending battle report (" .. math.floor(#body / 1024) .. " KB) to the " ..
-                 endpoint.label .. " server...", state.playerColor, {0.7, 0.8, 1})
-    local settled = false
-    WebRequest.custom(endpoint.reportUrl, "POST", true, body, battleReportHeaders(),
-        function(request)
-            if settled then return end
-            settled = true
-            battleHandlePostResult(request, state)
-        end)
-    Wait.time(function()
-        if settled then return end
-        settled = true
-        battleExportBusy = false
-        printToColor("Upload to the " .. endpoint.label .. " server timed out waiting for a " ..
-                     "response after " .. BATTLE_EXPORT_POST_TIMEOUT .. "s. It may have gone " ..
-                     "through anyway -- check the server before exporting again; retrying here " ..
-                     "would resend the whole report on top of the copy already in flight.",
-                     state.playerColor, {1, 0.6, 0.2})
-    end, BATTLE_EXPORT_POST_TIMEOUT)
-end
-
-function battleHandlePostResult(request, state)
-    if request.is_error then
-        battleExportLadder(state)
-        return
-    end
-    local code = battleWebStatusCode(request)
-    if code == 503 then
-        -- The server is up but its store is full right now -- a different
-        -- situation from "server unreachable", and retrying immediately would
-        -- only add to the load that caused it.
-        battleExportBusy = false
-        printToColor("Report server is busy right now - try again in a few minutes.",
-                     state.playerColor, {1, 0.8, 0.3})
-        return
-    end
-    if code ~= 200 then
-        battleExportLadder(state)
-        return
-    end
-    local ok, result = pcall(function() return JSON.decode(request.text) end)
-    if not ok or type(result) ~= "table" or result.ok ~= true then
-        battleExportLadder(state)
-        return
-    end
-    battleExportBusy = false
-    battleDeliverReportUrl(result, state.playerColor)
-end
-
--- The result reaches the table two ways: printToAll (ambient, visible to
--- everyone, and the record that a report was made) and a Notebook tab (the
--- workhorse -- bodies are real editable text fields, so a URL can be selected
--- and copied, which chat in TTS does not allow; Notes sync to all clients and
--- persist in the save, so a join-in-progress player gets the links too).
-function battleDeliverReportUrl(result, clicker)
-    battleWriteNotebookTab(result)
-    if result.mode == "local" then
-        printToAll("Battle report opened in the host's browser. Full links in the Battle Report notebook tab.",
-                   {0.4, 1, 0.4})
-        return
-    end
-    local expiresIn = tonumber(result.expires_in) or 0
-    local minutes = math.max(1, math.floor(expiresIn / 60 + 0.5))
-    printToAll("Battle report: " .. tostring(result.url or "") .. " - live ~" .. minutes ..
-               " min (sooner if busy or downloaded), anyone with the link can view it. " ..
-               "Full links in the Battle Report notebook tab.", {0.4, 1, 0.4})
-end
-
--- Edits the tab in place (matched by title) so repeated exports don't spam
--- new tabs. Worth knowing: the minute count below is a snapshot of what the
--- server promised *at export time* -- it cannot account for someone else
--- downloading the report afterwards and shortening its remaining life (see
--- report_store.py's mark_downloaded), so it says "about" rather than
--- promising an exact figure. Re-exporting is cheap once the service is warm.
-function battleWriteNotebookTab(result)
-    local title = "Battle Report"
-    local expiresIn = tonumber(result.expires_in) or 0
-    local minutes = math.max(1, math.floor(expiresIn / 60 + 0.5))
-    local body = "LCT Battle Report - " .. tostring(result.snapshots or "?") .. " snapshot(s)\n" ..
-        "Generated " .. os.date("%Y-%m-%d %H:%M") .. ". The view link is live for about " ..
-        minutes .. " more minute(s) - sooner if the server is busy, and it drops to under a " ..
-        "minute as soon as anyone uses the download link below.\n\n" ..
-        "View:      " .. tostring(result.url or "") .. "\n" ..
-        "Download:  " .. tostring(result.download_url or "") .. "\n\n" ..
-        "The downloaded file is self-contained - it keeps working offline, forever, after " ..
-        "the links above go dead. Anyone with a link can view the report, including both " ..
-        "players' names and army lists."
-
-    for _, tab in ipairs(Notes.getNotebookTabs() or {}) do
-        if tab.title == title then
-            Notes.editNotebookTab({index = tab.index, title = title, body = body})
-            return
-        end
-    end
-    Notes.addNotebookTab({title = title, body = body})
-end
-
--- Runtime override, e.g. from the console:
---   Global.call("battleSetReportMode", {mode = "remote", base = "http://192.168.1.50:8788"})
--- A plain Global.setVar("BATTLE_REPORT_MODE", "remote") works too (same trick
--- battlemasterDynamicSpawner.ttslua's BM_API_BASE uses) -- this wrapper just
--- validates the mode and reports back what took effect. Mode and base persist
--- across a save/load (see onSave/onLoad); the token deliberately does not, so
--- a dev override typed into one session's console cannot leak into a save file.
-function battleSetReportMode(params)
-    params = params or {}
-    if params.mode ~= nil then
-        if params.mode == "local" or params.mode == "remote" or params.mode == "auto" then
-            BATTLE_REPORT_MODE = params.mode
-        else
-            log("battleSetReportMode: mode must be 'local', 'remote' or 'auto', got " ..
-                tostring(params.mode))
-        end
-    end
-    if params.base ~= nil then BATTLE_REPORT_REMOTE_BASE = tostring(params.base) end
-    if params.token ~= nil then BATTLE_REPORT_TOKEN = tostring(params.token) end
-    log("Battle report: mode=" .. BATTLE_REPORT_MODE .. " base=" ..
-        (BATTLE_REPORT_REMOTE_BASE ~= "" and BATTLE_REPORT_REMOTE_BASE or "(none)"))
-end
-
-
 --[[ ================= BATTLE LOG: REWIND ================================
 Rewind is REVIEW, not undo. The log is never truncated: pressing END GAME closes
 it to further recording, and from then on the table can be scrubbed to any
@@ -2807,6 +2426,22 @@ _battleRewindBusy = false
 -- The selector's current Round / Player / Phase, shared by every HUD panel: one
 -- player choosing a moment to look at is showing it to the table, not to himself.
 battleRewindSel = battleRewindSel or {r = 1, t = "Red", p = 1}
+
+-- Step-by-step tracing for the rewind path, written to the host's Lua console
+-- (log(), not print()/broadcastToAll -- this is not meant for every player's
+-- chat) rather than only reported after the fact. This exists because the raw
+-- CLR exceptions the TTS API throws for a nil GUID/key ("Value cannot be null.
+-- Parameter name: key") do NOT appear to be catchable by pcall in this host --
+-- every pcall wrapped around the rewind restore phases has, in practice, let
+-- that exact exception through uncaught. A pcall around the failing call is
+-- therefore not a reliable way to find it; a log line immediately BEFORE each
+-- risky native call is, because whatever aborts the script, the log lines up to
+-- and including the one for the call that crashed will already have been
+-- written -- the last line printed names the exact operation in progress when
+-- the crash happened, even though the exception itself was never caught.
+function battleRewindLog(msg)
+    log("[BattleRewind] " .. tostring(msg))
+end
 
 -- Index of the snapshot for a round/turn/phase, or nil.
 --
@@ -2860,6 +2495,9 @@ function battleRestoreModel(guid, tuple)
         name = battleLog.names[tuple[5]]
     end
 
+    battleRewindLog("restoreModel guid=" .. tostring(guid) .. " nameIdx=" ..
+                    tostring(tuple[5]))
+
     local o = battleModelObject(guid)
     if o ~= nil then
         pcall(function()
@@ -2881,6 +2519,7 @@ function battleRestoreModel(guid, tuple)
 
     -- Dead at this moment in the game but alive at the one being left: out of the
     -- graveyard it comes, under its original GUID.
+    battleRewindLog("restoreModel guid=" .. tostring(guid) .. " not on table, exhuming")
     battleExhumeModel(guid, pos, rot, function(obj)
         pcall(function() obj.setLock(false) end)
         battleRestoreModelName(obj, name)
@@ -2912,20 +2551,32 @@ function battleRestoreModels(snap, done)
         end
     end
 
+    battleRewindLog("restoreModels: " .. #work .. " to place, " .. #bury .. " to bury")
+
     local i = 1
     local function step()
         local stop = math.min(i + BATTLE_REWIND_BATCH - 1, #work)
         while i <= stop do
-            battleRestoreModel(work[i].guid, work[i].tuple)
+            -- pcall'd per-model: a bad GUID (or any other CLR exception thrown
+            -- by the TTS API for one model) must not abort every model after it
+            -- in the batch, and naming the GUID is what makes such a failure
+            -- findable instead of a bare "Value cannot be null" at the top.
+            local ok, err = pcall(battleRestoreModel, work[i].guid, work[i].tuple)
+            if not ok then
+                broadcastToAll("Rewind: could not restore model " .. tostring(work[i].guid) ..
+                               ": " .. tostring(err), {1, 0.4, 0.2})
+            end
             i = i + 1
         end
         if i <= #work then
             Wait.frames(step, 1)
             return
         end
+        battleRewindLog("restoreModels: placement done, burying " .. #bury .. " model(s)")
         for _, guid in ipairs(bury) do
             pcall(function() battleBuryModel(guid) end)
         end
+        battleRewindLog("restoreModels: complete")
         if done ~= nil then done(#work, #bury) end
     end
     step()
@@ -2934,6 +2585,8 @@ end
 -- Counters, turn/phase state and the scoresheet. Everything here already had a
 -- setter; the rewind only has to call them in the right order.
 function battleRestoreState(snap)
+    battleRewindLog("restoreState: r=" .. tostring(snap.r) .. " t=" .. tostring(snap.t) ..
+                    " p=" .. tostring(snap.p))
     local function setCounter(guid, value)
         local o = getObjectFromGUID(guid or "")
         if o == nil or value == nil then return end
@@ -2941,11 +2594,13 @@ function battleRestoreState(snap)
     end
 
     if type(snap.cp) == "table" then
+        battleRewindLog("restoreState: setting CP counters")
         setCounter(redCPCounter_GUID, snap.cp.r)
         setCounter(blueCPCounter_GUID, snap.cp.b)
     end
     setCounter(gameTurnCounter_GUID, snap.r)
     if type(snap.tc) == "table" then
+        battleRewindLog("restoreState: setting per-side turn counters")
         setCounter(redTurnCounter_GUID, snap.tc.r)
         setCounter(blueTurnCounter_GUID, snap.tc.b)
     end
@@ -2955,9 +2610,15 @@ function battleRestoreState(snap)
     -- is how every other Global -> startMenu call in the mod already works.
     local sm = getObjectFromGUID(startMenu_GUID)
     if sm ~= nil then
+        battleRewindLog("restoreState: calling startMenu.battleSetTurnState turn=" ..
+                        tostring(snap.t) .. " phase=" .. tostring(snap.p))
         pcall(function()
             sm.call("battleSetTurnState", {turn = snap.t, phase = snap.p})
         end)
+        battleRewindLog("restoreState: battleSetTurnState returned")
+    else
+        battleRewindLog("restoreState: startMenu object not found for GUID " ..
+                        tostring(startMenu_GUID))
     end
 
     -- Scoresheet. Crosses as a JSON string for the reason getScoreGridJSON spells
@@ -2965,6 +2626,7 @@ function battleRestoreState(snap)
     if type(snap.vp) == "table" and type(snap.vp.grid) == "table" then
         local sheet = getObjectFromGUID(scoresheet_GUID)
         if sheet ~= nil then
+            battleRewindLog("restoreState: calling scoresheet.setScoreGrid")
             pcall(function()
                 sheet.call("setScoreGrid", JSON.encode(snap.vp.grid))
             end)
@@ -2982,6 +2644,7 @@ end
 -- silently handed one color's card to the other whenever both held a card with
 -- the same name. battleTakeNearestSecondaryCandidate below picks among them.
 function battleCollectSecondaryCandidates(scene)
+    battleRewindLog("collectSecondaryCandidates: scanning " .. #scene .. " scene object(s)")
     local byName = {}
     for _, o in ipairs(scene) do
         if isSecondaryCardObject(o) then
@@ -2993,11 +2656,21 @@ function battleCollectSecondaryCandidates(scene)
                 -- takeObject can then pull the one card by GUID.
                 pcall(function()
                     local deckPos = o.getPosition()
+                    -- Captured once, now, while the deck is known-good: taking
+                    -- another of this same deck's cards earlier in this same
+                    -- restore pass can collapse it down to its last card (TTS's
+                    -- own behaviour once a Deck is reduced to one), which
+                    -- invalidates the `o` handle. Re-resolving by this saved
+                    -- GUID later is safe; calling a method on a possibly-stale
+                    -- `o` at that point (to ask it for its own GUID again) is
+                    -- exactly the kind of native call that has been crashing.
+                    local deckGuid = o.getGUID()
                     for _, entry in ipairs(o.getObjects()) do
                         local n = entry.name
                         if n ~= nil and n ~= "" then
                             byName[n] = byName[n] or {}
-                            table.insert(byName[n], {deck = o, guid = entry.guid, pos = deckPos})
+                            table.insert(byName[n], {deck = o, deckGuid = deckGuid,
+                                                      guid = entry.guid, pos = deckPos})
                         end
                     end
                 end)
@@ -3010,6 +2683,9 @@ function battleCollectSecondaryCandidates(scene)
             end
         end
     end
+    local names = 0
+    for _ in pairs(byName) do names = names + 1 end
+    battleRewindLog("collectSecondaryCandidates: found " .. names .. " distinct card name(s)")
     return byName
 end
 
@@ -3048,11 +2724,28 @@ end
 -- could not place and carries on, rather than failing the rewind around it.
 function battleRestoreSecondaries(snap)
     local missing = {}
-    if type(snap.sec) ~= "table" then return missing end
+    if type(snap.sec) ~= "table" then
+        battleRewindLog("restoreSecondaries: snap.sec is not a table, nothing to do")
+        return missing
+    end
+    battleRewindLog("restoreSecondaries: starting")
     local scene = getAllObjects()
     local candidates = battleCollectSecondaryCandidates(scene)
+    -- Two of this color's wanted secondaries can come from the SAME physical
+    -- deck (confirmed live: a 2-card deck holding both "Bring it Down" and
+    -- "Cleanse"). Firing takeObject on that deck twice back-to-back -- once for
+    -- each card, in the same synchronous pass -- is what was actually throwing
+    -- the raw "Value cannot be null" crash: TTS collapses a Deck down to a lone
+    -- Card the instant its second-to-last card is taken, which invalidates the
+    -- handle the second call still holds. Keyed by the deck's GUID (captured at
+    -- scan time in battleCollectSecondaryCandidates, not re-read from the
+    -- possibly-stale handle), this makes a second draw from the same deck wait
+    -- for the first one to finish before touching it.
+    local deckBusy = {}
 
     for color, cards in pairs(snap.sec) do
+        battleRewindLog("restoreSecondaries: color=" .. tostring(color) .. " (" ..
+                        #cards .. " recorded card(s))")
         local wanted = {}
         for _, entry in ipairs(cards) do
             local slotIndex = tonumber(entry.i)
@@ -3065,26 +2758,69 @@ function battleRestoreSecondaries(snap)
 
         local zoneGuids = BATTLE_SECONDARY_ZONES[color] or {}
         for slotIndex = 1, #zoneGuids do
-            local zone = getObjectFromGUID(zoneGuids[slotIndex])
+            local zoneGuid = zoneGuids[slotIndex]
+            battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " .. slotIndex ..
+                            " zoneGuid=" .. tostring(zoneGuid))
+            local zone = getObjectFromGUID(zoneGuid)
             local entry = wanted[slotIndex]
+            battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " .. slotIndex ..
+                            " zone=" .. tostring(zone ~= nil) .. " wanted=" ..
+                            tostring(entry and entry.n or "<empty>"))
+            -- pcall'd per slot, not just once for the whole function: one bad
+            -- candidate (a card destroyed or merged into another pile between
+            -- the scene scan above and this slot being reached) must not abort
+            -- every slot after it -- which is what turned "one card didn't come
+            -- back" into "only one card came back at all" before this.
+            local ok, err = pcall(function()
             if zone ~= nil then
+                battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                slotIndex .. ": getSecondarySlotCardPosition")
                 local target = getSecondarySlotCardPosition(zone)
+                battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                slotIndex .. ": getCardsInSecondarySlot")
                 local occupants = getCardsInSecondarySlot(zone, scene)
+                battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                slotIndex .. ": " .. #occupants .. " occupant(s) found")
 
                 if entry == nil then
                     -- No card here at that moment: clear the slot to the discard.
+                    if #occupants > 0 then
+                        battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                        slotIndex .. ": nothing wanted, discarding " ..
+                                        #occupants .. " occupant(s)")
+                    end
                     for _, o in ipairs(occupants) do
-                        pcall(function()
+                        local discardGuid = "?"
+                        pcall(function() discardGuid = o.getGUID() end)
+                        local okDiscard, errDiscard = pcall(function()
                             o.locked = false
-                            o.setPositionSmooth(getSecondaryDiscardPosition(color))
+                            -- Instant, not smooth: refreshSecondaryNamesForColor
+                            -- re-reads this slot's occupant a few lines below, in
+                            -- the same restore pass. A smooth move is still
+                            -- mid-flight at that point, so the departing card
+                            -- gets detected as "still here" and its name gets
+                            -- written right back onto the scoreboard label --
+                            -- which then never gets corrected, since nothing
+                            -- re-queries it once the animation finishes.
+                            o.setPosition(getSecondaryDiscardPosition(color))
                         end)
+                        battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                        slotIndex .. ": discard guid=" .. tostring(discardGuid) ..
+                                        " ok=" .. tostring(okDiscard) ..
+                                        (okDiscard and "" or (" err=" .. tostring(errDiscard))))
                     end
                     clearSecondarySlotAssignment(color, slotIndex)
                 else
                     -- Nearest-by-position, not first-by-name: Red and Blue can
                     -- each hold a card with the same name, and this is what keeps
                     -- one color's card from being handed to the other's slot.
+                    battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                    slotIndex .. ": looking up candidate for '" ..
+                                    tostring(entry.n) .. "'")
                     local hit = battleTakeNearestSecondaryCandidate(candidates, entry.n, target)
+                    battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                    slotIndex .. ": hit=" ..
+                                    (hit == nil and "none" or (hit.obj ~= nil and "loose card" or "in deck")))
                     -- The mod's own convention (see missionManager.ttslua's
                     -- fixedSecondaryBoardRotation / moveFixedSecondaryToSlot): a
                     -- card's slot rotation is always this fixed constant, and face
@@ -3102,10 +2838,19 @@ function battleRestoreSecondaries(snap)
                     -- branch below still needs the slot cleared first.
                     for _, o in ipairs(occupants) do
                         if o.getGUID() ~= keepGuid then
-                            pcall(function()
+                            local discardGuid = "?"
+                            pcall(function() discardGuid = o.getGUID() end)
+                            local okDiscard, errDiscard = pcall(function()
                                 o.locked = false
-                                o.setPositionSmooth(getSecondaryDiscardPosition(color))
+                                -- Instant, not smooth: see the comment on the
+                                -- other discard site above (entry == nil branch)
+                                -- for why -- same race with the label refresh.
+                                o.setPosition(getSecondaryDiscardPosition(color))
                             end)
+                            battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                            slotIndex .. ": discarding non-kept occupant guid=" ..
+                                            tostring(discardGuid) .. " ok=" .. tostring(okDiscard) ..
+                                            (okDiscard and "" or (" err=" .. tostring(errDiscard))))
                         end
                     end
 
@@ -3113,6 +2858,9 @@ function battleRestoreSecondaries(snap)
                         local json = (type(battleLog.secGrave) == "table") and battleLog.secGrave[entry.n] or nil
                         if type(json) == "string" and json ~= "" then
                             local idx = slotIndex
+                            battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                                            " slot " .. slotIndex .. ": spawning '" ..
+                                            tostring(entry.n) .. "' from graveyard JSON")
                             pcall(function()
                                 spawnObjectJSON({
                                     json = json,
@@ -3139,6 +2887,10 @@ function battleRestoreSecondaries(snap)
                         end
                     elseif hit.obj ~= nil then
                         local found = hit.obj
+                        battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                        slotIndex .. ": moving loose card '" .. tostring(entry.n) ..
+                                        "' (guid=" .. tostring(found.getGUID and found.getGUID() or "?") ..
+                                        ") into place")
                         pcall(function()
                             found.locked = false
                             found.setPosition(target)
@@ -3157,32 +2909,113 @@ function battleRestoreSecondaries(snap)
                         end, 20)
                     else
                         local idx = slotIndex
-                        pcall(function()
-                            hit.deck.takeObject({
-                                guid = hit.guid,
-                                position = target,
-                                rotation = rot,
-                                smooth = false,
-                                callback_function = function(card)
-                                    if card == nil then return end
-                                    assignSecondarySlotCard(color, idx, card)
+                        local deckGuid = hit.deckGuid
+                        local wantedName = entry.n
+                        local wantedGuid = hit.guid
+
+                        -- Re-resolved by the GUID captured back in
+                        -- battleCollectSecondaryCandidates, not by calling a
+                        -- method on `hit.deck` -- that handle can already be
+                        -- stale by the time this runs (see deckBusy above).
+                        local function takeFromDeck()
+                            deckBusy[deckGuid] = true
+                            local liveDeck = deckGuid and getObjectFromGUID(deckGuid) or nil
+                            local stillADeck = liveDeck ~= nil and
+                                               (liveDeck.tag == "Deck" or liveDeck.type == "Deck")
+                            battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                                            " slot " .. idx .. ": taking '" .. tostring(wantedName) ..
+                                            "' (guid=" .. tostring(wantedGuid) .. ") from deck " ..
+                                            tostring(deckGuid) .. " stillADeck=" .. tostring(stillADeck))
+                            if stillADeck then
+                                pcall(function()
+                                    liveDeck.takeObject({
+                                        guid = wantedGuid,
+                                        position = target,
+                                        rotation = rot,
+                                        smooth = false,
+                                        callback_function = function(card)
+                                            deckBusy[deckGuid] = false
+                                            if card == nil then return end
+                                            assignSecondarySlotCard(color, idx, card)
+                                            Wait.frames(function()
+                                                pcall(function()
+                                                    if card.is_face_down ~= wantFaceDown then
+                                                        card.flip()
+                                                    end
+                                                    card.locked = true
+                                                end)
+                                            end, 20)
+                                        end,
+                                    })
+                                end)
+                            else
+                                deckBusy[deckGuid] = false
+                                -- The deck already collapsed to its last card (an
+                                -- earlier slot in this same pass took the other
+                                -- one out of it): that lone card is now sitting
+                                -- loose under its own GUID, not inside a
+                                -- container takeObject can reach.
+                                local loneCard = getObjectFromGUID(wantedGuid)
+                                if loneCard ~= nil then
+                                    battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                                                    " slot " .. idx .. ": deck collapsed, '" ..
+                                                    tostring(wantedName) .. "' is now a loose card")
+                                    pcall(function()
+                                        loneCard.locked = false
+                                        loneCard.setPosition(target)
+                                        loneCard.setRotation(rot)
+                                    end)
+                                    assignSecondarySlotCard(color, idx, loneCard)
                                     Wait.frames(function()
                                         pcall(function()
-                                            if card.is_face_down ~= wantFaceDown then
-                                                card.flip()
+                                            if loneCard.is_face_down ~= wantFaceDown then
+                                                loneCard.flip()
                                             end
-                                            card.locked = true
+                                            loneCard.locked = true
                                         end)
                                     end, 20)
-                                end,
-                            })
-                        end)
+                                else
+                                    table.insert(missing, color .. " slot " .. idx ..
+                                                          ": " .. wantedName)
+                                end
+                            end
+                        end
+
+                        if deckGuid and deckBusy[deckGuid] then
+                            battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                                            " slot " .. idx .. ": deck " .. tostring(deckGuid) ..
+                                            " busy with an earlier slot, waiting for it to settle")
+                            Wait.condition(takeFromDeck, function() return not deckBusy[deckGuid] end, 5,
+                                           function()
+                                               battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                                                               " slot " .. idx ..
+                                                               ": timed out waiting on deck " ..
+                                                               tostring(deckGuid))
+                                               table.insert(missing, color .. " slot " .. idx ..
+                                                                     ": " .. wantedName)
+                                           end)
+                        else
+                            takeFromDeck()
+                        end
                     end
                 end
             end
+            end)
+            if not ok then
+                battleRewindLog("restoreSecondaries: " .. tostring(color) .. " slot " ..
+                                slotIndex .. ": FAILED: " .. tostring(err))
+                table.insert(missing, color .. " slot " .. slotIndex .. ": " .. tostring(err))
+            end
         end
-        pcall(function() refreshSecondaryNamesForColor(color) end)
+        battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                        ": refreshing scoreboard secondary names")
+        local okNames, errNames = pcall(function() refreshSecondaryNamesForColor(color) end)
+        if not okNames then
+            battleRewindLog("restoreSecondaries: " .. tostring(color) ..
+                            ": refreshSecondaryNamesForColor FAILED: " .. tostring(errNames))
+        end
     end
+    battleRewindLog("restoreSecondaries: done, " .. #missing .. " missing card(s)")
     return missing
 end
 
@@ -3205,14 +3038,57 @@ function battleRewindTo(index, playerColor)
     -- before END GAME (or after a hand-edited log) must not log itself either.
     _battleCaptureGuard = true
 
-    battleRestoreState(snap)
-    local missing = battleRestoreSecondaries(snap)
+    battleRewindLog("==== rewindTo index=" .. tostring(index) .. " player=" ..
+                    tostring(playerColor) .. " target='" .. tostring(snap.lbl) .. "' ====")
 
+    -- Each restore phase is its own pcall: a bad GUID or nil key thrown by the
+    -- TTS API in one phase (a raw CLR exception, not a Lua error -- these read
+    -- "Value cannot be null. Parameter name: key" rather than anything
+    -- mentioning Lua) must not abort the phases after it, and must be reported
+    -- with enough context to find the offending call instead of just crashing
+    -- to the top labelled with whichever button was pressed.
+    --
+    -- NOTE: in practice this pcall has NOT been observed to catch that raw CLR
+    -- exception -- the crash still surfaces unfiltered, labelled with whichever
+    -- hud* function was on the stack. The battleRewindLog calls threaded through
+    -- battleRestoreState/battleRestoreSecondaries/battleRestoreModels below are
+    -- what actually localise it: whatever step's log line printed last, right
+    -- before the crash text, is the one that didn't return.
+    battleRewindLog("rewindTo: phase 1/3 -- restoreState")
+    local okState, errState = pcall(battleRestoreState, snap)
+    if not okState then
+        battleRewindLog("rewindTo: restoreState FAILED: " .. tostring(errState))
+        printToColor("Rewind: restoring counters/turn state failed: " .. tostring(errState),
+                     playerColor, {1, 0.4, 0.2})
+    end
+
+    battleRewindLog("rewindTo: phase 2/3 -- restoreSecondaries")
+    local okSec, missingOrErr = pcall(battleRestoreSecondaries, snap)
+    local missing = okSec and missingOrErr or {}
+    if not okSec then
+        battleRewindLog("rewindTo: restoreSecondaries FAILED: " .. tostring(missingOrErr))
+        printToColor("Rewind: restoring secondary cards failed: " .. tostring(missingOrErr),
+                     playerColor, {1, 0.4, 0.2})
+    end
+
+    battleRewindLog("rewindTo: phase 3/3 -- restoreModels")
     battleRestoreModels(snap, function(moved, buried)
-        _battleRewindBusy = false
-        -- Released a few frames later so the deferred unlocks and takeObject
-        -- callbacks above have all landed first.
-        Wait.frames(function() _battleCaptureGuard = false end, 3)
+        battleRewindLog("==== rewindTo complete: moved=" .. moved .. " buried=" .. buried ..
+                        " missingSecondaries=" .. #missing .. " ====")
+        -- _battleRewindBusy must clear no sooner than _battleCaptureGuard does:
+        -- the bury/exhume calls issued above (bag.putObject / bag.takeObject)
+        -- are async, so for a few frames a model can be mid-transfer into or
+        -- out of the graveyard bag -- neither cleanly on the table nor cleanly
+        -- inside it. Releasing the busy flag here (as this used to) let a fast
+        -- second REWIND/NEXT/END press start a whole new restore pass into
+        -- that window, looking up a GUID mid-transfer -- a native lookup TTS
+        -- itself can answer inconsistently for, which is a plausible source of
+        -- a raw "Value cannot be null" crash that only a rapid double-press
+        -- would ever trigger.
+        Wait.frames(function()
+            _battleCaptureGuard = false
+            _battleRewindBusy = false
+        end, 3)
 
         broadcastToAll("Rewound to " .. tostring(snap.lbl) .. "  (" .. moved ..
                        " model(s) placed, " .. buried .. " returned to the " ..
@@ -3412,8 +3288,28 @@ function hudRewindPhase(player, value, id)
     battleRefreshRewindOverlay()
 end
 
+-- All three buttons below refuse up front while _battleRewindBusy is set,
+-- rather than letting battleRewindTo's own busy check be the only guard: that
+-- check runs only after hudRewindNext has already mutated the shared
+-- battleRewindSel selector and repainted the overlay for every player, so a
+-- fast second press could visibly skip the selector ahead (or, before the
+-- fix alongside this one, race a still-settling bury/exhume) even though the
+-- actual restore underneath was correctly refused.
 function hudRewindGo(player, value, id)
-    battleRewindToSelection(getHudColorFromCallback(player, id))
+    local color = getHudColorFromCallback(player, id)
+    battleRewindLog("hudRewindGo pressed by " .. tostring(color) .. " sel r=" ..
+                    tostring(battleRewindSel.r) .. " t=" .. tostring(battleRewindSel.t) ..
+                    " p=" .. tostring(battleRewindSel.p))
+    if _battleRewindBusy then
+        printToColor("Rewind already in progress.", color, {1, 0.6, 0.2})
+        return
+    end
+    local ok, err = pcall(battleRewindToSelection, color)
+    if not ok then
+        battleRewindLog("hudRewindGo: UNCAUGHT ERROR reached the handler: " .. tostring(err))
+        _battleRewindBusy = false
+        printToColor("Rewind failed: " .. tostring(err), color, {1, 0.4, 0.2})
+    end
 end
 
 -- Steps the selection forward to the next recorded phase and rewinds straight
@@ -3421,18 +3317,49 @@ end
 -- round/player/phase by hand each time.
 function hudRewindNext(player, value, id)
     local color = getHudColorFromCallback(player, id)
+    battleRewindLog("hudRewindNext pressed by " .. tostring(color) .. " current sel r=" ..
+                    tostring(battleRewindSel.r) .. " t=" .. tostring(battleRewindSel.t) ..
+                    " p=" .. tostring(battleRewindSel.p))
+    if _battleRewindBusy then
+        printToColor("Rewind already in progress.", color, {1, 0.6, 0.2})
+        return
+    end
     local r, t, p = battleRewindNextSelection()
     if r == nil then
         printToColor("Already at the last recorded phase.", color, {1, 0.6, 0.2})
         return
     end
+    battleRewindLog("hudRewindNext: advancing selection to r=" .. tostring(r) .. " t=" ..
+                    tostring(t) .. " p=" .. tostring(p))
     battleRewindSel.r, battleRewindSel.t, battleRewindSel.p = r, t, p
     battleRefreshRewindOverlay()
-    battleRewindToSelection(color)
+    -- pcall'd top to bottom: whatever throws the raw CLR "Value cannot be null"
+    -- exception, this turns it into a readable chat message instead of a crash
+    -- reported only as "<hudRewindNext>" with no indication which step failed.
+    -- (In practice this pcall has not been seen to catch that exception -- see
+    -- the note on battleRewindTo. Keep it anyway: it does catch ordinary Lua
+    -- errors, and battleRewindLog's trail is what covers the rest.)
+    local ok, err = pcall(battleRewindToSelection, color)
+    if not ok then
+        battleRewindLog("hudRewindNext: UNCAUGHT ERROR reached the handler: " .. tostring(err))
+        _battleRewindBusy = false
+        printToColor("Rewind failed: " .. tostring(err), color, {1, 0.4, 0.2})
+    end
 end
 
 function hudRewindEnd(player, value, id)
-    battleReturnToEnd(getHudColorFromCallback(player, id))
+    local color = getHudColorFromCallback(player, id)
+    battleRewindLog("hudRewindEnd pressed by " .. tostring(color))
+    if _battleRewindBusy then
+        printToColor("Rewind already in progress.", color, {1, 0.6, 0.2})
+        return
+    end
+    local ok, err = pcall(battleReturnToEnd, color)
+    if not ok then
+        battleRewindLog("hudRewindEnd: UNCAUGHT ERROR reached the handler: " .. tostring(err))
+        _battleRewindBusy = false
+        printToColor("Rewind failed: " .. tostring(err), color, {1, 0.4, 0.2})
+    end
 end
 
 -- END GAME: capture the final state, close the log, open the selector.
@@ -3489,7 +3416,16 @@ function battleEndGame(player)
 
         local last = battleLog.snaps[#battleLog.snaps]
         if last ~= nil then
-            battleRewindSel.r = tonumber(last.r) or 1
+            -- Clamped to 1: the round-picker grid and battleRewindNextSelection's
+            -- combos only cover rounds 1..BATTLE_REWIND_ROUNDS (that's all the
+            -- Round buttons in the overlay). A game ended during round 0 (Deploy,
+            -- before the first NEXT PHASE/pass) records its last snapshot with
+            -- r = 0, which no combo can ever equal -- battleRewindNextSelection's
+            -- "where am I now" search then never finds a match, falls back to
+            -- scanning the whole grid from the top, and NEXT PHASE stops meaning
+            -- "step forward from here" and starts meaning "jump to the first
+            -- recorded moment" instead.
+            battleRewindSel.r = math.max(1, tonumber(last.r) or 1)
             battleRewindSel.t = last.t or "Red"
             battleRewindSel.p = tonumber(last.p) or 1
         end
@@ -3591,8 +3527,6 @@ function onLoad(saved_data)
         packSelected = loaded_data.svPackSelected
         playerHudSettings = loaded_data.svPlayerHudSettings or playerHudSettings
         battleLog = restoreBattleLog(loaded_data.svBattleLog)
-        BATTLE_REPORT_MODE = loaded_data.svBattleReportMode or BATTLE_REPORT_MODE
-        BATTLE_REPORT_REMOTE_BASE = loaded_data.svBattleReportBase or BATTLE_REPORT_REMOTE_BASE
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         if packSelected then
@@ -4242,8 +4176,13 @@ function getSecondaryCardNameForColor(color, index, zone)
 end
 
 function setSecondaryName(nameGuids, index, cardName)
-    local labelObj = getObjectFromGUID(nameGuids[index])
+    local guid = nameGuids[index]
+    battleRewindLog("setSecondaryName: index=" .. tostring(index) .. " guid=" ..
+                    tostring(guid) .. " cardName=" .. tostring(cardName))
+    local labelObj = getObjectFromGUID(guid)
     if not labelObj then
+        battleRewindLog("setSecondaryName: index=" .. tostring(index) ..
+                        " label object not found for guid " .. tostring(guid))
         return
     end
 
@@ -4264,12 +4203,17 @@ function setRedSecondaryName(index, cardName)
 end
 
 function refreshSecondaryNames(zoneGuids, nameGuids, setter, color)
+    battleRewindLog("refreshSecondaryNames: color=" .. tostring(color) .. " (" ..
+                    #nameGuids .. " label slot(s))")
     for index = 1, #nameGuids do
         local zoneGuid = zoneGuids[index]
+        battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " index=" ..
+                        index .. " zoneGuid=" .. tostring(zoneGuid))
         local zone = getObjectFromGUID(zoneGuid)
         local cardName = getSecondaryCardNameForColor(color, index, zone)
         setter(index, cardName)
     end
+    battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " done")
 end
 
 function refreshBlueSecondaryNames()

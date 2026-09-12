@@ -69,31 +69,17 @@ local captureBtnB = {
     tooltip="Record an extra battle-log snapshot right now, in addition to the automatic one per phase."
 }
 
-local exportBtnLbl = "EXPORT\nbattle report"
-local exportBtnR = {
-    label=exportBtnLbl, click_function="exportReport", function_owner=self,
-    position={XposHideArmy-2*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
-    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
-    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  see the lct-report-server repo"
-}
-local exportBtnB = {
-    label=exportBtnLbl, click_function="exportReport", function_owner=self,
-    position={XposHideArmy+Xoffset-2*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
-    height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.15,0.35,0.15}, font_color={1,1,1},
-    tooltip="Render the battle report and share the link (local helper, or hosted if configured).\nLocal helper:  see the lct-report-server repo"
-}
-
 local endGameBtnLbl = "END GAME\nopen rewind"
 local endGameTip = "Record the final state, close the battle log, and open the rewind selector.\nPress again later to reopen the selector."
 local endGameBtnR = {
     label=endGameBtnLbl, click_function="endGame", function_owner=self,
-    position={XposHideArmy-3*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
+    position={XposHideArmy-2*battleBtnGap,Ypos,ZposBattle}, rotation={0,0,0},
     height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.35,0.2,0.1}, font_color={1,1,1},
     tooltip=endGameTip
 }
 local endGameBtnB = {
     label=endGameBtnLbl, click_function="endGame", function_owner=self,
-    position={XposHideArmy+Xoffset-3*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
+    position={XposHideArmy+Xoffset-2*battleBtnGap,Ypos,-ZposBattle}, rotation={0,180,0},
     height=battleBtnHeight, width=battleBtnWidth, font_size=battleBtnFont, color={0.35,0.2,0.1}, font_color={1,1,1},
     tooltip=endGameTip
 }
@@ -199,8 +185,6 @@ function createMenu()
     self.createButton(registerArmyBtnB)
     self.createButton(captureBtnR)
     self.createButton(captureBtnB)
-    self.createButton(exportBtnR)
-    self.createButton(exportBtnB)
     self.createButton(endGameBtnR)
     self.createButton(endGameBtnB)
 end
@@ -283,10 +267,6 @@ end
 
 function captureSnapshot(obj, player, alt)
     Global.call("battleManualCapture", player)
-end
-
-function exportReport(obj, player, alt)
-    Global.call("exportBattleReport", player)
 end
 
 function endGame(obj, player, alt)

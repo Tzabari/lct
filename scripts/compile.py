@@ -70,12 +70,6 @@ BM_MAT_RANDOMIZER_ENABLED = False
 LCT_MAT_RANDOMIZER_ENABLED = False
 GLOBAL_LUA = "global.ttslua"
 
-# The hosted battle-report renderer -- lives in the separate lct-report-server
-# repo (its render.yaml is what actually deploys it). A --test build always
-# bakes "" instead (see bake_battle_report_endpoint) so local iteration never
-# talks to the real deployed service by accident.
-BATTLE_REPORT_REMOTE_BASE = "https://lct-report.onrender.com"
-
 # The Battlemaster dynamic spawner bakes the canonical map-card machinery into
 # its own script (via @@MAP_CARD_MACHINERY@@), so it must be excluded from the
 # map-card load-hook injector or its embedded template would be rewritten.
@@ -422,66 +416,6 @@ def bake_map_index(lua_text: str) -> str:
     return lua_text
 
 
-def bake_battle_report_endpoint(lua_text: str, is_test: bool, is_release: bool = False) -> str:
-    """Replace the @@BATTLE_REPORT_REMOTE_BASE@@ / @@BATTLE_REPORT_TOKEN@@
-    markers in global.ttslua with the hosted renderer's URL and shared token,
-    so a compiled build knows where to send EXPORT REPORT when the local
-    helper is not running. Mirrors bake_map_index's marker-rewrite approach.
-
-    A --test build bakes an empty base regardless of BATTLE_REPORT_REMOTE_BASE
-    above: local iteration should hit the loopback helper (BATTLE_REPORT_URL,
-    unaffected by any of this) and hot-reload the renderer, never the real
-    deployed service by accident.
-
-    Set LCT_REPORT_BAKE_IN_TEST=1 to opt a --test build out of that and bake a
-    real base/token anyway -- for rehearsing the hosted path (e.g. against a
-    LAN-bound `battle_report_server.py --mode hosted`, run from the separate
-    lct-report-server repo) without needing the in-game console.
-    LCT_REPORT_REMOTE_BASE overrides BATTLE_REPORT_REMOTE_BASE
-    above when set, so that rehearsal can point at a LAN address instead of the
-    real deployed service. Neither variable does anything without the other:
-    a plain --test build stays local-only by default.
-
-    The token comes from the environment and is never committed. Empty only
-    warns, never fails -- a build without the secret still produces a working,
-    local-only mod; the hosted path simply never gets tried (BATTLE_REPORT_MODE
-    "auto" falls through to it only when a base is configured at all).
-
-    A missing *marker*, unlike a missing token, means the comment anchor
-    bake_map_index/this function rewrite has been stripped from global.ttslua --
-    the line still parses and runs, just with whatever base/token the source
-    happens to have, so a build succeeds looking complete while the hosted
-    export path is silently disabled. That is fine for --test, but fail() on a
-    --release build rather than let it ship unnoticed (see PROJECT_CONTEXT.md's
-    preserved-markers list).
-    """
-    marker_missing = fail if is_release else warn
-
-    bake_anyway = is_test and os.environ.get("LCT_REPORT_BAKE_IN_TEST", "") not in ("", "0", "false", "False")
-    skip = is_test and not bake_anyway
-    base = "" if skip else os.environ.get("LCT_REPORT_REMOTE_BASE", BATTLE_REPORT_REMOTE_BASE)
-    base_literal = f"BATTLE_REPORT_REMOTE_BASE = {json.dumps(base)}   -- @@BATTLE_REPORT_REMOTE_BASE@@"
-    lua_text, count = re.subn(r"^.*--\s*@@BATTLE_REPORT_REMOTE_BASE@@.*$", base_literal,
-                              lua_text, count=1, flags=re.M)
-    if count != 1:
-        marker_missing("marker @@BATTLE_REPORT_REMOTE_BASE@@ not found in global.ttslua — "
-                        "hosted report endpoint not baked.")
-
-    token = "" if skip else os.environ.get("LCT_REPORT_TOKEN", "")
-    if base and not token:
-        warn("LCT_REPORT_TOKEN is not set — this build will POST to the hosted "
-             "report server with no token; it works only if the server has no "
-             "token configured either.")
-    token_literal = f"BATTLE_REPORT_TOKEN = {json.dumps(token)}   -- @@BATTLE_REPORT_TOKEN@@"
-    lua_text, count = re.subn(r"^.*--\s*@@BATTLE_REPORT_TOKEN@@.*$", token_literal,
-                              lua_text, count=1, flags=re.M)
-    if count != 1:
-        marker_missing("marker @@BATTLE_REPORT_TOKEN@@ not found in global.ttslua — token not injected.")
-
-    print(f"  Baked battle-report endpoint ({base or '(local-only)'}).")
-    return lua_text
-
-
 def bake_map_card_machinery(lua_text: str) -> str:
     """Replace the @@MAP_CARD_MACHINERY@@ marker with the canonical load/clear head
     from data/map_card_machinery.lua, encoded as a Lua string literal.
@@ -731,7 +665,6 @@ def main():
         lua_files[0].read_text(encoding="utf-8"), version, patch, changelog_notes, debug_enabled
     )
     global_text = bake_map_index(global_text)
-    global_text = bake_battle_report_endpoint(global_text, is_test=debug_enabled, is_release=args.release)
     inject_lua_into_line(json_lines, json_lua_line_idxs[0], global_text)
     print(term.green("Done."))
 

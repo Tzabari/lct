@@ -38,41 +38,23 @@ Map-card nicknames and manifest `card_name` values carry a trailing creator cred
 Players register their armies once per game, and the table then records a snapshot
 at every phase/turn change: each registered model's position, facing, base size and
 current wounds, plus the terrain layout, round, VP and CP. The log lives in Global's
-saved state (`svBattleLog`) and rides out with the save.
+saved state (`svBattleLog`) and rides out with the save — that's it; this mod does
+nothing else with it.
 
-In game, the three buttons sit on the game-tools object beside that side's
+In game, the two buttons sit on the game-tools object beside that side's
 HIDE / SHOW ARMY pair, one row further in:
 
 - **REGISTER ARMY** (one per side) — select your models, left-click to register them,
   right-click to clear. A player may always register their own side; an empty seat may
   be registered by whoever is present, so solo games work from either seat.
 - **CAPTURE** — record an extra snapshot mid-phase.
-- **EXPORT REPORT** — render the report and hand back a link (the button fails softly
-  and tells you what to run if no report server answers).
 
-This repo has no report-rendering code of its own — no Python, no terrain lookup, no
-HTML template. That all lives in the separate
-[`lct-report-server`](https://github.com/Tzabari/lct-report-server) repo, and EXPORT
-REPORT always talks to it, whether run locally or deployed. To render reports at all,
-clone that repo alongside this one and follow its README; the short version:
-
-```bash
-git clone https://github.com/Tzabari/lct-report-server ../lct-report-server
-cd ../lct-report-server
-python3 scripts/battle_report_server.py     # local mode: writes report.html, opens it
-```
-
-...or, with nothing running at all, render an already-exported TTS save straight from
-that repo (still needs no server, hosted or local):
-
-```bash
-python3 scripts/export_battle_report.py <save.json> -o report/
-```
-
-What the report itself shows — round/player/phase tabs, a separate deployment-map
-view, true-to-scale terrain read from the map's own payload, and a side panel with
-score, reserves, secondaries and casualties — is documented in `lct-report-server`'s
-own README, since that repo is what builds it.
+This repo has no report-rendering code and no networking of any kind — no export
+button, no server, no `WebRequest` calls anywhere in the mod. Rendering a report is
+entirely the separate [`lct-report-server`](https://github.com/Tzabari/lct-report-server)
+repo's job: it's a standalone desktop app that opens a TTS save file you point it at,
+lets you pick which recorded game to view, and builds the HTML report from the
+`svBattleLog` it finds inside. See that repo's README for how to run it.
 
 Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model's
 `uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
@@ -83,12 +65,11 @@ so models imported by other means still record position but report no wounds.
 The same log the report is built from can put the table itself back to any
 recorded moment, in TTS, with no export step.
 
-**END GAME** sits next to EXPORT REPORT. Pressing it records one last snapshot,
-closes the log to further recording (so a rewind can never overwrite the game it
-is reviewing), and opens a Round / Player / Phase selector - greyed out wherever
-no snapshot exists for that combination, the same gaps EXPORT REPORT's tabs would
-show. Pressing END GAME again later reopens the selector rather than ending the
-game a second time.
+**END GAME** sits next to CAPTURE. Pressing it records one last snapshot, closes the
+log to further recording (so a rewind can never overwrite the game it is reviewing),
+and opens a Round / Player / Phase selector - greyed out wherever no snapshot exists
+for that combination. Pressing END GAME again later reopens the selector rather than
+ending the game a second time.
 
 Pick a round, a player and a phase and press **REWIND**: every model, CP, VP and
 secondary card returns to the state captured then. **RETURN TO END** puts
@@ -103,43 +84,6 @@ moment - restored from the model's own recorded nickname, which is why a wound
 count on an unscripted model (no datasheet popup) still comes back correctly. A
 model that is alive now but was already dead at the moment you rewind to goes back
 into the bag; rewinding forward past its death takes it back out.
-
-#### The split with `lct-report-server`
-
-Splitting the renderer into its own repo keeps this one slim and lets
-[Render](https://render.com) deploy from a small, fast-cloning repo instead of this
-mod's full history — and, since the two repos used to keep manual copies of the same
-five files in sync by hand, it also removes the one thing that let those copies drift
-(they did, once, for about half an hour). There is now nothing shared to keep in sync:
-
-- **This repo** owns `TTSLUA/global.ttslua`'s battle-log recording and its EXPORT
-  REPORT wiring (`BATTLE_REPORT_URL`, `BATTLE_REPORT_REMOTE_BASE`/`BATTLE_REPORT_TOKEN`
-  baked at build time by `scripts/compile.py`'s `bake_battle_report_endpoint`, and the
-  probe-then-post retry ladder), plus `data/maps/` — the 228 raw map payloads terrain
-  is read from. It has no renderer, no terrain lookup, and no generated terrain cache.
-- **`lct-report-server`** owns every line of rendering code (`battle_report.py`,
-  `map_terrain.py`, the HTTP service) and the generators that produce its checked-in
-  data (`bake_terrain_cache.py`, `extract_plate_outlines.py`). Those generators are
-  dev-only tools that need this repo's `data/maps/` to run — they take a sibling
-  checkout of this repo (`--payload-dir` / `$LCT_ROOT`) as input, the same way a
-  developer would clone both repos side by side; nothing here runs or depends on them.
-- **The schema handshake** is what replaces manual sync as the safety net: `EXPORT
-  REPORT` probes `/healthz` before ever uploading, the server reports the schema
-  version its renderer understands, and the mod refuses to upload (naming both
-  versions) rather than send a log the server can't read. A log recorded on an older
-  schema than the server still renders — `load_log` upgrades it — so a server that is
-  merely behind loses nothing older, only new schema features until it's updated.
-
-`LCT_REPORT_TOKEN` (compiled in by `bake_battle_report_endpoint`) is not a secret in
-the usual sense — it ships inside the compiled mod that every subscriber downloads —
-it's a rate-limit key, not authentication; see `lct-report-server`'s README for what
-it and the Steam-id header are actually for.
-
-To run the LAN rehearsal that exercises the whole path with nothing deployed to Render: clone
-`lct-report-server`, run its `battle_report_server.py` in hosted mode bound to your machine's LAN
-address, point this mod at it from the in-game console
-(`Global.setVar("BATTLE_REPORT_REMOTE_BASE", "http://<lan-ip>:<port>")`,
-`Global.setVar("BATTLE_REPORT_MODE", "remote")`), and export as normal.
 
 ### Validation
 
