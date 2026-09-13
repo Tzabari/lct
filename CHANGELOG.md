@@ -13,10 +13,12 @@ How this file is used by the compiler (`compile.py --release`):
 To cut a release: add a new `## vX.Y.Z` section at the top with its bullets,
 then run `python3 compile.py --release`.
 
+## v1.11.3
+- UI Scoreboard change for better visibility and new button underneath scoring overlay.
+
 ## v1.11.2
 - Maps: Updated T5S2 map pack thanks to NConroy! Now all Map options are fully compatible with the latest GW layout update!
 - Bug fix: Now changing table mat should not have any objects floating. 
-- 
 
 ## v1.11.1
 - Bug fixes: Fixed Lava theme footprint border, map picker UI arrow bugs and also updated Mothmy Titanias token bag!

@@ -50,13 +50,13 @@ function setHudValue(params)
 end
 
 playerHudSettings = {
-    Red = {helpOverlayOpen = false, scoringOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"},
-    Blue = {helpOverlayOpen = false, scoringOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"},
-    Grey = {helpOverlayOpen = false, scoringOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Red = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Blue = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Grey = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
 }
 
 function getDefaultHudSettings()
-    return {helpOverlayOpen = false, scoringOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"}
+    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"}
 end
 
 function ensureHudSettings(color)
@@ -247,16 +247,49 @@ function hudToggleMinimalist(player, value, id)
     applyMinimalistForColor(color)
 end
 
+-- Scoring-overlay minimalist mode hides the primary-mission line and the
+-- Discard/Remaining Secondaries block for both columns (Active Secondaries stays
+-- visible), leaving name/VP header, round-by-round PRI/SEC grid, and Active
+-- Secondaries. The whole overlay panel is also scaled to ~59.5% of its normal
+-- size (30% off, then a further 15% off that) since Panel `scale` in TTS UI XML
+-- scales its full subtree, fonts included, in one shot.
+--
+-- Scale alone only zooms the fixed-size panel out; it doesn't reclaim the empty
+-- space left by the hidden sections. So minimalist mode also shrinks the panel's
+-- own `height` to fit the reduced content (header 84 + rounds grid 300 + the
+-- Overall/Active spacer 16 + active header/divider/list ~188, plus layout
+-- spacing/padding, comfortably fits in 820 of the outer HorizontalLayout's fixed
+-- 110/60 top/bottom padding), and repositions the title/close/minus buttons
+-- (positioned by absolute offsetXY from the panel's own center) to keep their
+-- prior 60px margin from the new, smaller top edge.
+SCORING_OVERLAY_SCALE_FULL = "0.55 0.55 0.55"
+SCORING_OVERLAY_SCALE_MINIMAL = "0.32725 0.32725 0.32725"
+SCORING_OVERLAY_HEIGHT_FULL = "1300"
+SCORING_OVERLAY_HEIGHT_MINIMAL = "820"
+SCORING_OVERLAY_HEADER_Y_FULL = "590"
+SCORING_OVERLAY_HEADER_Y_MINIMAL = "350"
+
 function applyHudPreferencesForColor(color)
     local settings = ensureHudSettings(color)
     local helpOverlayActive = settings.helpOverlayOpen and "true" or "false"
     local overlayActive = settings.hudVisible and "true" or "false"
     local scoringOverlayActive = settings.scoringOverlayOpen and "true" or "false"
+    local scoringMinimalist = settings.scoringOverlayMinimalist
     local clockActive = not settings.clockHidden
 
     setHudAttributeForColor(color, {id = "HelpOverlay", attr = "active", value = helpOverlayActive})
     setHudAttributeForColor(color, {id = "VPScores", attr = "active", value = overlayActive})
     setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "active", value = scoringOverlayActive})
+    setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "scale", value = scoringMinimalist and SCORING_OVERLAY_SCALE_MINIMAL or SCORING_OVERLAY_SCALE_FULL})
+    setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "height", value = scoringMinimalist and SCORING_OVERLAY_HEIGHT_MINIMAL or SCORING_OVERLAY_HEIGHT_FULL})
+    local headerY = scoringMinimalist and SCORING_OVERLAY_HEADER_Y_MINIMAL or SCORING_OVERLAY_HEADER_Y_FULL
+    setHudAttributeForColor(color, {id = "ScoringOverlay_Title", attr = "offsetXY", value = "0 " .. headerY})
+    setHudAttributeForColor(color, {id = "ScoringOverlay_CloseBtn", attr = "offsetXY", value = "740 " .. headerY})
+    setHudAttributeForColor(color, {id = "ScoringOverlay_MinimalistBtn", attr = "offsetXY", value = "666 " .. headerY})
+    for _, side in ipairs({"Red", "Blue"}) do
+        setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "PrimaryMission", attr = "active", value = scoringMinimalist and "false" or "true"})
+        setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "Extras", attr = "active", value = scoringMinimalist and "false" or "true"})
+    end
     setHudAttributeForColor(color, {id = "LockBtn", attr = "color", value = "#FFFFFF"})
     setHudAttributeForColor(color, {id = "ClockBtn", attr = "color", value = "#FFFFFF"})
 
@@ -307,6 +340,15 @@ function hudCloseScoringOverlay(player, value, id)
     local color = getHudColorFromCallback(player, id)
     local settings = ensureHudSettings(color)
     settings.scoringOverlayOpen = false
+    applyHudPreferencesForColor(color)
+end
+
+-- The "-" button beside the scoreboard's close button. Independent of the main
+-- HUD's own minimalist toggle (hudToggleMinimalist/hudMinimalist above).
+function hudToggleScoringMinimalist(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local settings = ensureHudSettings(color)
+    settings.scoringOverlayMinimalist = not settings.scoringOverlayMinimalist
     applyHudPreferencesForColor(color)
 end
 
@@ -434,7 +476,7 @@ function getDiscardedSecondaryNames(color, objects)
     local function addName(n)
         if not n or n == "" or DISCARD_NAME_IGNORE[n] then return end
         local turn = turns[n]
-        names[#names + 1] = turn and (n .. " - Turn " .. turn) or n
+        names[#names + 1] = turn and (n .. " (" .. turn .. ")") or n
     end
     for _, obj in ipairs(objects or getAllObjects()) do
         local tag = obj.tag
@@ -739,7 +781,7 @@ function refreshScoringOverlay()
 
     -- Dynamic, symmetric section heights based on content count.
     -- Both sides get the same height per section (max of red/blue) so columns line up.
-    local lineHeight = 27  -- matches the 22pt list font (item 3)
+    local lineHeight = 27  -- matches the 23pt list font (item 3)
     local minSection = 30  -- room for the empty-state placeholder
     local function sectionH(count)
         if count <= 0 then return minSection end
@@ -1249,7 +1291,6 @@ function announceVersion()
     else
         printToAll("LCT - Patch " .. patchNumber(), "Yellow")
     end
-    broadcastToAll("All Map options are fully compatible with the latest GW layout update!", {0.4, 0.8, 1.0})
 end
 
 -- Push the latest patch number + notes (injected from CHANGELOG.md) into the
