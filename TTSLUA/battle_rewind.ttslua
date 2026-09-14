@@ -727,16 +727,25 @@ end
 
 -- Cards currently in each side's secondary slots, in slot order. Face-down state
 -- is kept so a report can show which were still hidden at that point in the game.
--- NOTE: this goes through getCardsInSecondarySlot rather than reading
--- zone.getObjects() directly. A card dealt into a slot is often not registered as
--- being "in" the zone -- it is dropped on top of it, and TTS only counts an object
--- as inside once it has settled and reported in -- so the direct read came back
--- empty even with all the slots visibly filled. That helper is the mod's own
--- proven path: it takes the zone's contents AND sweeps every object sitting within
--- the zone's footprint, and it accepts .type as well as .tag, which is the other
--- half of why the direct read missed cards.
--- The scene is fetched once and handed down: that footprint sweep walks every
--- object on the table, and there are sixteen slots to check.
+-- NOTE: this goes through getCardsInSecondarySlotForColor -- the same per-slot
+-- resolver the scoreboard's own slot buttons use -- rather than the lower-level
+-- getCardsInSecondarySlot directly. That matters beyond just not duplicating the
+-- footprint sweep: getCardsInSecondarySlotForColor also checks
+-- secondarySlotAssignments (assignSecondarySlotCard/getAssignedSecondarySlotCard),
+-- the scoreboard's own explicit record of which card was dealt into which slot,
+-- ahead of the footprint scan. Reading only the footprint scan, as this used to,
+-- could disagree with the scoreboard about which card is in a slot; going through
+-- the same resolver means this can't drift from what the scoreboard shows.
+-- The footprint sweep itself still needs a zone.getObjects() fallback: a card
+-- dealt into a slot is often not registered as being "in" the zone -- it is
+-- dropped on top of it, and TTS only counts an object as inside once it has
+-- settled and reported in -- so a direct read can come back empty even with all
+-- the slots visibly filled. getCardsInSecondarySlot (called via
+-- getCardsInSecondarySlotForColor) is what does that, and also accepts .type as
+-- well as .tag, which is the other half of why a direct read can miss cards.
+-- The scene is fetched once and handed down through getCardsInSecondarySlotForColor's
+-- own scene parameter: that footprint sweep walks every object on the table, and
+-- there are sixteen slots to check.
 function battleSecondaryState()
     local out = {}
     local scene = getAllObjects()
@@ -746,12 +755,12 @@ function battleSecondaryState()
             local zone = getObjectFromGUID(zguid)
             if zone ~= nil then
                 -- One slot holds one active secondary, so this stops at the first
-                -- named object. A loose card wins over a deck: the helper returns
+                -- named object. A loose card wins over a deck: the resolver returns
                 -- decks as well (it has to, since a card can still be sitting in
                 -- one), and a deck's name is the deck's, not the secondary's.
                 pcall(function()
                     local fallback = nil
-                    for _, o in ipairs(getCardsInSecondarySlot(zone, scene)) do
+                    for _, o in ipairs(getCardsInSecondarySlotForColor(color, slotIndex, zone, scene)) do
                         local name = o.getName()
                         if name ~= nil and name ~= "" then
                             -- i is the slot number, not the position in this list.

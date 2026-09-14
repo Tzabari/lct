@@ -2218,12 +2218,16 @@ function getAssignedSecondarySlotCard(color, index)
     return nil
 end
 
-function getCardsInSecondarySlotForColor(color, index, zone)
+-- scene is an optional pre-fetched getAllObjects() list, passed straight through to
+-- getCardsInSecondarySlot -- battleSecondaryState checks all sixteen slots on every
+-- phase snapshot and fetches it once up front rather than paying for a fresh sweep
+-- per slot; every other caller here just omits it and takes that per-call sweep.
+function getCardsInSecondarySlotForColor(color, index, zone, scene)
     local cards = {}
     local seen = {}
     addUniqueSecondaryCard(cards, seen, getAssignedSecondarySlotCard(color, index))
 
-    for _, card in ipairs(getCardsInSecondarySlot(zone)) do
+    for _, card in ipairs(getCardsInSecondarySlot(zone, scene)) do
         addUniqueSecondaryCard(cards, seen, card)
     end
 

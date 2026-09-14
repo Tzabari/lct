@@ -274,7 +274,7 @@ class TestSecondaryScan(unittest.TestCase):
         return text[:text.index("\n}")]
 
     def test_it_uses_the_mods_own_slot_helper(self):
-        self.assertIn("getCardsInSecondarySlot(zone", self.body)
+        self.assertIn("getCardsInSecondarySlotForColor(color, slotIndex, zone", self.body)
 
     def test_it_does_not_read_the_zone_directly(self):
         # zone.getObjects() came back empty with all four slots visibly filled: a
@@ -282,6 +282,17 @@ class TestSecondaryScan(unittest.TestCase):
         code = "\n".join(ln for ln in self.body.splitlines()
                          if not ln.lstrip().startswith("--"))
         self.assertNotIn("zone.getObjects()", code)
+
+    def test_it_goes_through_the_scoreboards_own_slot_resolver(self):
+        # getCardsInSecondarySlotForColor also checks secondarySlotAssignments
+        # (assignSecondarySlotCard/getAssignedSecondarySlotCard) -- the scoreboard's
+        # own explicit record of which card was dealt into which slot -- ahead of
+        # the footprint scan. Going through it, instead of calling the lower-level
+        # getCardsInSecondarySlot directly, means the battle log can't disagree
+        # with the scoreboard about which card is in a slot.
+        self.assertIn("function getCardsInSecondarySlotForColor(color, index, zone, scene)",
+                      self.source)
+        self.assertIn("getAssignedSecondarySlotCard(color, index)", self.source)
 
     def test_the_helper_it_leans_on_still_exists(self):
         self.assertIn("function getCardsInSecondarySlot(zone", self.source)
@@ -313,9 +324,12 @@ class TestSecondaryScan(unittest.TestCase):
 
     def test_it_walks_the_table_once_for_all_sixteen_slots(self):
         # The helper's footprint sweep is a getAllObjects() pass per slot, which
-        # was cheap over four slots and wasteful over sixteen.
+        # was cheap over four slots and wasteful over sixteen. The pre-fetched
+        # scene has to reach getCardsInSecondarySlot itself, two calls deep:
+        # battleSecondaryState -> getCardsInSecondarySlotForColor -> here.
         self.assertIn("local scene = getAllObjects()", self.body)
-        self.assertIn("getCardsInSecondarySlot(zone, scene)", self.body)
+        self.assertIn("getCardsInSecondarySlotForColor(color, slotIndex, zone, scene)", self.body)
+        self.assertIn("getCardsInSecondarySlot(zone, scene)", self.source)
         self.assertIn("ipairs(scene or getAllObjects())", self.source)
 
 
