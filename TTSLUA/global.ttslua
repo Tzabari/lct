@@ -1273,19 +1273,24 @@ function onSave()
         redSecondaryDeckGUID = missionPackData[packSelected].redSecondaryDeck_GUID
         blueSecondaryDeckGUID = missionPackData[packSelected].blueSecondaryDeck_GUID
     end
-    saved_data = JSON.encode({
+    -- Everything except the battle log is a handful of scalars, so it is encoded
+    -- fresh every time and can never go stale. The battle log is the big half --
+    -- a couple of hundred KB by the end of a game -- and TTS autosaves every few
+    -- minutes whether or not anything happened, so it comes from a cache that is
+    -- only rebuilt when the log actually changed (see battleLogEncoded) and is
+    -- spliced in here rather than re-encoded.
+    local head = JSON.encode({
         svredPlayerID = redPlayerID,
         svbluePlayerID = bluePlayerID,
         svPackSelected = packSelected,
         svRedSecondaryDeckGUID = redSecondaryDeckGUID,
         svBlueSecondaryDeckGUID = blueSecondaryDeckGUID,
         svPlayerHudSettings = playerHudSettings,
-        -- Battle log: army registrations plus one snapshot per phase. Small by
-        -- construction (roughly 400 KB for a full two-army game), so unlike the
-        -- start menu restore point it is cheap to encode on every autosave.
-        svBattleLog = battleLog,
         svVersion = GAME_VERSION
     })
+    local sep = (#head > 2) and "," or ""
+    saved_data = head:sub(1, #head - 1) .. sep .. '"svBattleLog":' ..
+                 battleLogEncoded() .. "}"
     --saved_data = ""
     return saved_data
 end
@@ -1337,8 +1342,8 @@ end
 -- Battle log / army registration / rewind now lives in
 -- TTSLUA/battle_rewind.ttslua -- compile.py concatenates it into this
 -- script at build time, so it is still part of Global's environment (the
--- calls below into battleLog/battleRegisterFromSelection/battleCaptureDestroyed*/
--- restoreBattleLog/battleRewindLog resolve there).
+-- calls below into battleLog/battleRegisterFromSelection/battleLogEncoded/
+-- battleCaptureDestroyedSecondary/restoreBattleLog/battleRewindLog resolve there).
 
 -- Legacy hotkey entry points, now routed through the battle-log registry. They
 -- used to overwrite GMNotes, which collides with the map/overlay sentinels the
@@ -1388,11 +1393,21 @@ function onObjectDestroy(obj)
     -- destruction (vortex, Clear Mat, bag entry) would pay it once per die.
     if obj.tag == "Dice" then return end
     removeYellowscribeGlobalCards(obj.getGUID())
-    -- TTS calls exactly one onObjectDestroy, so the graveyard hangs off this one
-    -- rather than declaring a second handler that would silently replace it.
-    -- The Red/Blue trash bins destroy by collision, so models binned that way
-    -- arrive here like any other deletion.
-    pcall(function() battleCaptureDestroyed(obj) end)
+    -- TTS calls exactly one onObjectDestroy, so this hangs off that one rather
+    -- than declaring a second handler that would silently replace it.
+    --
+    -- Models are deliberately NOT handled here. They used to be: a destroyed
+    -- roster model was cloned into a bag so a rewind could bring it back, which
+    -- meant the clone could itself be destroyed and cloned again -- binning one
+    -- model via the Red/Blue trash bins could loop, and did. Every registered
+    -- model now has a stand-in made at registration time instead (see THE
+    -- STAND-INS in battle_rewind.ttslua), so a deletion needs no reaction at all:
+    -- the model simply stops appearing in snapshots from that phase on.
+    --
+    -- Secondary cards have no such copy -- they are drawn mid-game, not
+    -- registered -- so a card deleted outright is still kept by name here. This
+    -- only ever writes a string into a table; nothing is spawned, so it cannot
+    -- feed itself the way the model path could.
     pcall(function() battleCaptureDestroyedSecondary(obj) end)
 end
 
@@ -2063,12 +2078,12 @@ end
 
 function setSecondaryName(nameGuids, index, cardName)
     local guid = nameGuids[index]
-    battleRewindLog("setSecondaryName: index=" .. tostring(index) .. " guid=" ..
-                    tostring(guid) .. " cardName=" .. tostring(cardName))
+    battleRewindLog("setSecondaryName: index=", index, " guid=", guid,
+                    " cardName=", cardName)
     local labelObj = getObjectFromGUID(guid)
     if not labelObj then
-        battleRewindLog("setSecondaryName: index=" .. tostring(index) ..
-                        " label object not found for guid " .. tostring(guid))
+        battleRewindLog("setSecondaryName: index=", index,
+                        " label object not found for guid ", guid)
         return
     end
 
@@ -2089,17 +2104,17 @@ function setRedSecondaryName(index, cardName)
 end
 
 function refreshSecondaryNames(zoneGuids, nameGuids, setter, color)
-    battleRewindLog("refreshSecondaryNames: color=" .. tostring(color) .. " (" ..
-                    #nameGuids .. " label slot(s))")
+    battleRewindLog("refreshSecondaryNames: color=", color, " (",
+                    #nameGuids, " label slot(s))")
     for index = 1, #nameGuids do
         local zoneGuid = zoneGuids[index]
-        battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " index=" ..
-                        index .. " zoneGuid=" .. tostring(zoneGuid))
+        battleRewindLog("refreshSecondaryNames: ", color, " index=",
+                        index, " zoneGuid=", zoneGuid)
         local zone = getObjectFromGUID(zoneGuid)
         local cardName = getSecondaryCardNameForColor(color, index, zone)
         setter(index, cardName)
     end
-    battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " done")
+    battleRewindLog("refreshSecondaryNames: ", color, " done")
 end
 
 function refreshBlueSecondaryNames()

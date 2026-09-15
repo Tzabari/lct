@@ -38,8 +38,22 @@ class TestLuaWiring(unittest.TestCase):
 
     def test_battle_log_is_persisted_in_global_on_save(self):
         text = GLOBAL_LUA.read_text(encoding="utf-8")
-        self.assertIn("svBattleLog = battleLog", text)
+        self.assertIn('"svBattleLog":', text)
+        self.assertIn("battleLogEncoded()", text)
         self.assertIn("restoreBattleLog(loaded_data.svBattleLog)", text)
+
+    def test_the_log_is_only_re_encoded_when_it_changed(self):
+        """onSave runs on every TTS autosave, a few minutes apart, whether or
+        not anything happened -- so the expensive half comes from a cache."""
+        text = BATTLE_REWIND_LUA.read_text(encoding="utf-8")
+        start = text.find("function battleLogEncoded(")
+        self.assertNotEqual(start, -1, "battleLogEncoded is gone")
+        body = text[start:start + 600]
+        # The cache key must be read before the encode, so a mutation racing it
+        # leaves the key stale rather than being silently dropped from the save.
+        self.assertLess(body.find("local key"), body.find("JSON.encode(battleLog)"),
+                        "the cache key must be taken before encoding, not after")
+        self.assertIn("function battleLogTouch(", text)
 
     def test_every_phase_transition_records_a_snapshot(self):
         text = START_MENU_LUA.read_text(encoding="utf-8")
@@ -79,6 +93,79 @@ class TestLuaWiring(unittest.TestCase):
             self.assertIn(f"function {fn}(", text)
         self.assertIn("battleRegisterFromSelection", text)
         self.assertIn("battleClearArmy", text)
+
+
+class TestStandIns(unittest.TestCase):
+    """Every registered model is copied once, at registration. That copy is what
+    rewind moves, which is what lets the feature ignore deletions entirely."""
+
+    def setUp(self):
+        self.text = BATTLE_REWIND_LUA.read_text(encoding="utf-8", errors="replace")
+
+    def test_registering_an_army_makes_the_copies(self):
+        start = self.text.find("function registerArmy(")
+        self.assertNotEqual(start, -1)
+        body = self.text[start:self.text.find("\nend", start)]
+        self.assertIn("battleMakeStandIns(", body)
+
+    def test_replacing_a_registration_drops_the_old_copies(self):
+        """Otherwise re-registering leaves stand-ins in the bag that nothing
+        points at -- the accumulation problem this design exists to end."""
+        for fn in ("registerArmy", "battleClearArmy"):
+            start = self.text.find(f"function {fn}(")
+            body = self.text[start:self.text.find("\nend", start)]
+            self.assertIn("battleDropStandIns(", body, f"{fn} leaks stand-ins")
+
+    def test_a_copy_keeps_its_name_but_not_its_datasheet(self):
+        """The nickname carries the wound prefix a rewind reads back. The
+        datasheet script and XmlUI are ~98 KB per model in every autosave."""
+        start = self.text.find("function battleMakeStandIn(")
+        self.assertNotEqual(start, -1)
+        body = self.text[start:self.text.find("\nend\n", start)]
+        self.assertIn('c.setLuaScript("")', body)
+        self.assertIn('c.UI.setXml("")', body)
+        self.assertNotIn("setName(", body)
+        self.assertNotIn("setNickname(", body)
+
+    def test_models_are_no_longer_captured_on_destroy(self):
+        """The regression that started this: a destroyed model was cloned into a
+        bag, so the clone could be destroyed and cloned again. One save ended up
+        with 380 copies of three models."""
+        combined = combined_global_text()
+        self.assertNotIn("battleCaptureDestroyed(obj)", combined)
+        self.assertNotIn("function battleCaptureDestroyed(", combined)
+
+    def test_end_game_clears_the_originals_off_the_table(self):
+        start = self.text.find("function battleEndGame(")
+        body = self.text[start:self.text.find("\nfunction ", start + 10)]
+        self.assertIn("battleRetireOriginals(", body)
+
+    def test_rewind_refuses_until_the_game_has_ended(self):
+        """Before END GAME the originals are still standing, so moving stand-ins
+        would show every model twice."""
+        start = self.text.find("function battleRewindTo(")
+        body = self.text[start:self.text.find("_battleRewindBusy = true", start)]
+        self.assertIn("battleLog.ended ~= true", body)
+
+    def test_starting_a_new_game_drops_registrations_whose_models_are_gone(self):
+        """END GAME destroys every registered model, so a roster carried straight
+        into the next game would name only destroyed GUIDs -- every model
+        instantly 'dead' and no 'register an army first' warning, because the
+        roster is not empty."""
+        start = self.text.find("function resetBattleLog(")
+        self.assertNotEqual(start, -1)
+        body = self.text[start:self.text.find("\nend", start)]
+        self.assertIn("battlePruneRoster()", body)
+
+    def test_the_prune_keeps_a_registration_whose_models_are_still_standing(self):
+        """Registering during setup and then pressing START GAME must not lose
+        the registration -- only entries whose object is gone are dropped."""
+        start = self.text.find("function battlePruneRoster(")
+        self.assertNotEqual(start, -1)
+        body = self.text[start:self.text.find("\nend\n", start)]
+        self.assertIn("if getObjectFromGUID(guid) == nil then", body)
+        # and the stand-in goes with the roster entry, not on its own
+        self.assertIn("battleDestroyStandIns(doomed)", body)
 
 
 class TestEndGameAutoSave(unittest.TestCase):

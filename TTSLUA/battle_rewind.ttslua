@@ -25,13 +25,17 @@
 -- per ForceOrg unit uuid, since they are identical across a unit. The caps below
 -- bound pathological cases.
 
--- Schema 2 adds everything an in-game rewind needs that the HTML report never
+-- Schema 2 added everything an in-game rewind needs that the HTML report never
 -- did: a Y coordinate (models stand on ruin upper floors), the scoresheet's full
 -- per-round grid rather than just totals, the turn-counter values, a slot index
 -- on each secondary card, and the model's displayed nickname interned into a
--- string pool. restoreBattleLog drops a log whose v does not match, so v1 logs
--- are discarded cleanly instead of being half-read.
-BATTLE_LOG_SCHEMA = 2
+-- string pool. Schema 3 replaces the graveyard's grave/gmap bookkeeping with the
+-- stand-in bag's dbag/dbl; the snapshots themselves are unchanged, so a report
+-- renderer only reads fields that both versions have. restoreBattleLog drops a
+-- log whose v does not match, so older logs -- which have no stand-ins and could
+-- therefore only rewind an empty table -- are discarded cleanly rather than
+-- half-read.
+BATTLE_LOG_SCHEMA = 3
 BATTLE_MAX_MODELS = 400
 BATTLE_MAX_SNAPS  = 250
 BATTLE_MAX_NAMES  = 4000
@@ -61,19 +65,17 @@ function defaultBattleLog()
         -- Pool of distinct model nicknames seen this game, verbatim and including
         -- the "[00ff16]18/18[-] " wound prefix. Snapshots store an index into it.
         names = {},
-        -- Dead models live as real objects in a bag under the table rather than as
-        -- JSON in this log: a character model's embedded datasheet script plus its
-        -- XmlUI runs ~105 KB, so 400 of them would be ~40 MB against a ~400 KB
-        -- budget. grave is the bag's GUID; gmap remaps a roster GUID when a
-        -- resurrected model could not reclaim its original one.
-        grave = nil,
-        gmap = {},
-        -- A destroyed secondary card cannot be found by name on a later rewind
-        -- the way a live one can, so its JSON is kept here (one copy per card
-        -- name, most recently destroyed wins) and respawned on demand. Unlike
-        -- the model graveyard these are never parked in a bag: a card's target
-        -- slot and facing are already known at restore time, so it is spawned
-        -- straight into place.
+        -- Every registered model gets a stand-in copy parked in a bag under the
+        -- table the moment it is registered (see THE STAND-INS below). dbag is
+        -- that bag's GUID; dbl maps a roster GUID to its stand-in's.
+        dbag = nil,
+        dbl = {},
+        -- Cards are drawn mid-game, not registered, so they get no stand-in. A
+        -- destroyed one cannot be found by name on a later rewind the way a live
+        -- one can, so its JSON is kept here (one copy per card name, most
+        -- recently destroyed wins) and respawned on demand. Nothing is parked in
+        -- a bag: a card's target slot and facing are already known at restore
+        -- time, so it is spawned straight into place.
         secGrave = {},
         ended = false,
     }
@@ -83,8 +85,49 @@ battleLog = battleLog or defaultBattleLog()
 _battleDeployTried = _battleDeployTried or false
 _battleCaptureGuard = false
 _battleCapWarned = false
-_battleGraveGuard = {}
 _battleNameIndex = nil
+
+-- Bumped by every mutation of battleLog; onSave reuses its cached encoding for as
+-- long as this does not move. Starting one past whatever a previous load left
+-- behind forces the first save after a script reload to re-encode.
+battleLogRev = (battleLogRev or 0) + 1
+_battleLogEnc = nil
+_battleLogEncKey = nil
+
+function battleLogTouch()
+    battleLogRev = battleLogRev + 1
+end
+
+-- A backstop for a mutation that forgets to call battleLogTouch: cheap counts
+-- that every kind of growth moves. Missing a touch then costs a redundant
+-- re-encode, not a save that silently omits what changed.
+function battleLogFingerprint()
+    if battleLog == nil then return "nil" end
+    local roster = 0
+    for _ in pairs(battleLog.roster or {}) do roster = roster + 1 end
+    local snaps = (type(battleLog.snaps) == "table") and #battleLog.snaps or 0
+    local names = (type(battleLog.names) == "table") and #battleLog.names or 0
+    return snaps .. "/" .. names .. "/" .. roster .. "/" .. tostring(battleLog.ended)
+end
+
+-- The log encoded for the save blob, re-encoded only when it has actually
+-- changed. TTS autosaves every few minutes whether or not anything happened, and
+-- encoding the whole log is by far the most expensive thing onSave does.
+--
+-- The cache key is read BEFORE encoding, never after. Nothing else runs during
+-- JSON.encode -- TTS Lua is single-threaded, and Wait callbacks only ever run
+-- between calls, not inside one -- but keying on the pre-encode revision means
+-- that even if that stopped being true, a mutation racing the encode would leave
+-- the key stale and the next save would re-encode, rather than this handing back
+-- a string that never contained the change.
+function battleLogEncoded()
+    local key = tostring(battleLogRev) .. "|" .. battleLogFingerprint()
+    if _battleLogEnc ~= nil and _battleLogEncKey == key then return _battleLogEnc end
+    local encoded = JSON.encode(battleLog)
+    _battleLogEnc = encoded
+    _battleLogEncKey = key
+    return encoded
+end
 
 -- Interns a nickname and returns its 1-based index in battleLog.names.
 --
@@ -134,175 +177,360 @@ function battleRound(n, places)
 end
 
 
---[[ ================= BATTLE LOG: THE GRAVEYARD =========================
-Dead models are preserved as real objects in a bag parked under the table, not as
-JSON in the save blob. A character model carries a ~59 KB embedded datasheet
-script plus ~40 KB of XmlUI -- 105 KB each, against a whole-log budget of ~400 KB
--- so storing their JSON was never possible. Bag contents are ordinary save
-objects, so this costs the Lua blob nothing at all.
+--[[ ================= BATTLE LOG: THE STAND-INS =========================
+Every registered model gets a copy -- a stand-in -- made at REGISTER ARMY time
+and parked in a bag under the table. Rewind moves stand-ins and nothing else;
+END GAME clears the originals off the table so the two can never both be
+standing there.
 
-The bag sits at BATTLE_GRAVE_POS, well below the table, locked and with
+Making the copy up front is what lets this feature ignore deletions entirely.
+The previous design watched onObjectDestroy and cloned a model as it died, which
+meant the clone could be destroyed in turn and captured again: one recorded game
+ended up with 380 copies of three models in the bag, ~0.83 MB of a 10.5 MB save,
+and the churn to match.
+
+A stand-in keeps its nickname, description, tags, mesh and colour -- everything a
+rewind reads or a player sees -- but not the datasheet LuaScript or its XmlUI
+panel. Those run ~98 KB per model and TTS writes them into every autosave, so
+they are the single biggest thing in these save files; a review prop has no use
+for either. That makes a stand-in ~3 KB against its original's ~98 KB, so the
+table is lighter after END GAME than it was during the game.
+
+The bag sits at BATTLE_STANDIN_POS, well below the table, locked and with
 GMNotes = "MapExclude" so both the map-clear wipe and isBattleModel skip it.
 ======================================================================= ]]
 
-BATTLE_GRAVE_POS  = {x = 0, y = -12, z = 0}
-BATTLE_GRAVE_NAME = "Battle Log Graveyard"
+BATTLE_STANDIN_POS   = {x = 0, y = -12, z = 0}
+BATTLE_STANDIN_NAME  = "Battle Log Stand-ins"
+-- Spawning or destroying a whole army in one frame is a visible hitch, so the
+-- bulk operations below work through this many per frame.
+BATTLE_STANDIN_BATCH = 4
 
--- Resolves a roster GUID to the live object, following the remap table.
---
--- spawnObjectJSON normally hands a resurrected model its original GUID back once
--- the source object is gone (respawnSelectionObjects in startMenu.ttslua relies on
--- exactly this), which is what keeps roster keys valid across a death. gmap is
--- insurance for the case where TTS has not freed the GUID yet and hands out a new
--- one: the roster keeps its original key and this looks through.
-function battleModelObject(guid)
-    if type(guid) ~= "string" or guid == "" then return nil end
-    local o = getObjectFromGUID(guid)
-    if o ~= nil then return o end
-    if battleLog ~= nil and type(battleLog.gmap) == "table" then
-        local alias = battleLog.gmap[guid]
-        if type(alias) == "string" and alias ~= guid then
-            return getObjectFromGUID(alias)
-        end
-    end
-    return nil
-end
-
--- The graveyard bag, spawned on first use. Returns nil on the frame it spawns --
--- callers that must have it (the destroy hook) retry a frame later.
-function battleGraveyardBag(create)
+-- The stand-in bag, spawned on first use. Returns nil when it does not exist and
+-- create is false.
+function battleStandInBag(create)
     if battleLog == nil then battleLog = defaultBattleLog() end
-    if type(battleLog.grave) == "string" then
-        local bag = getObjectFromGUID(battleLog.grave)
+    if type(battleLog.dbag) == "string" then
+        local bag = getObjectFromGUID(battleLog.dbag)
         if bag ~= nil then return bag end
-        battleLog.grave = nil
+        battleLog.dbag = nil
     end
     if create == false then return nil end
 
     local bag = spawnObject({
         type = "Bag",
-        position = BATTLE_GRAVE_POS,
+        position = BATTLE_STANDIN_POS,
         rotation = {0, 0, 0},
         scale = {1, 1, 1},
         sound = false,
     })
     if bag == nil then return nil end
-    bag.setName(BATTLE_GRAVE_NAME)
+    bag.setName(BATTLE_STANDIN_NAME)
     -- MapExclude keeps the map-clear sweep and the battle-log model test off it.
     bag.setGMNotes("MapExclude")
     bag.setLock(true)
     bag.interactable = false
-    battleLog.grave = bag.getGUID()
+    battleLog.dbag = bag.getGUID()
+    battleLogTouch()
     return bag
 end
 
--- Destroys the graveyard and everything in it. Only ever called when the log that
--- indexed its contents is being thrown away.
-function battleEmptyGraveyard()
-    local bag = battleGraveyardBag(false)
+-- The stand-in for a roster GUID, but only while it is out on the table: one
+-- still inside the bag is bag contents, which getObjectFromGUID cannot see.
+function battleStandInObject(guid)
+    if battleLog == nil or type(battleLog.dbl) ~= "table" then return nil end
+    local dg = battleLog.dbl[guid]
+    if type(dg) ~= "string" or dg == "" then return nil end
+    return getObjectFromGUID(dg)
+end
+
+-- Destroys the stand-in bag and everything in it. Only ever called when the log
+-- that indexed its contents is being thrown away.
+function battleEmptyStandIns()
+    local bag = battleStandInBag(false)
     if bag ~= nil then pcall(function() bag.destruct() end) end
     if battleLog ~= nil then
-        battleLog.grave = nil
-        battleLog.gmap = {}
+        battleLog.dbag = nil
+        battleLog.dbl = {}
+        battleLogTouch()
     end
 end
 
--- Buries a live roster model: takes it off the table and into the bag.
---
--- putObject fires onObjectEnterContainer, NOT onObjectDestroy, so this cannot
--- re-enter the capture path below -- which matters because rewinding forward has
--- to re-bury every model that was dead at the target moment.
-function battleBuryModel(guid)
-    local o = battleModelObject(guid)
+-- Takes a stand-in off the table and back into the bag: the model was not on the
+-- board at the moment being rewound to. This is the half that makes rewinding
+-- FORWARD work -- a model killed in round one is standing there while round one
+-- is on screen and must not linger once the players jump to round three.
+function battleStandInStore(guid)
+    local o = battleStandInObject(guid)
     if o == nil then return false end
-    local bag = battleGraveyardBag(true)
+    local bag = battleStandInBag(true)
     if bag == nil then return false end
-    _battleGraveGuard[guid] = true
-    local ok = pcall(function()
+    return pcall(function()
         o.setLock(false)
         bag.putObject(o)
     end)
-    Wait.frames(function() _battleGraveGuard[guid] = nil end, 2)
-    return ok
 end
 
--- Brings a model back out of the graveyard at a given position.
+-- Brings a stand-in out of the bag at a given position.
 --
--- takeObject reaches objects inside a container that getObjectFromGUID cannot see,
--- and preserves the GUID, so a resurrected model answers to its roster key again.
-function battleExhumeModel(guid, pos, rot, callback)
-    local bag = battleGraveyardBag(false)
-    if bag == nil then return false end
-    local ok = pcall(function()
+-- takeObject reaches objects inside a container that getObjectFromGUID cannot
+-- see. It normally hands back the same GUID; the remap covers the case where TTS
+-- hands out a new one, so the roster key keeps resolving to its stand-in.
+function battleStandInDeploy(guid, pos, rot, callback)
+    local bag = battleStandInBag(false)
+    if bag == nil or battleLog == nil or type(battleLog.dbl) ~= "table" then return false end
+    local dg = battleLog.dbl[guid]
+    if type(dg) ~= "string" or dg == "" then return false end
+    return pcall(function()
         bag.takeObject({
-            guid = guid,
+            guid = dg,
             position = pos,
             rotation = rot,
             smooth = false,
             callback_function = function(obj)
                 if obj == nil then return end
                 local actual = obj.getGUID()
-                if actual ~= guid then battleLog.gmap[guid] = actual end
+                if actual ~= dg then
+                    battleLog.dbl[guid] = actual
+                    battleLogTouch()
+                end
                 if callback ~= nil then callback(obj) end
             end,
         })
     end)
-    return ok
 end
 
--- Called from the extended onObjectDestroy for registered roster models. Captures
--- the model's JSON now (the object is about to be gone) and respawns it into the
--- graveyard a frame later, once TTS has released the GUID so the clone can reclaim
--- it. Anything not on the roster is ignored, which keeps mass deletions -- Clear
--- Mat, a vortex, a trash bin sweep -- from filling the bag with furniture.
-function battleCaptureDestroyed(obj)
-    if battleLog == nil then return end
-    if type(battleLog.roster) ~= "table" then return end
-    local guid = obj.getGUID()
-    if guid == nil or battleLog.roster[guid] == nil then return end
-    if _battleGraveGuard[guid] then return end
-    if battleLog.ended == true then return end
-    _battleGraveGuard[guid] = true
-
-    local json = nil
-    local okJson = pcall(function() json = obj.getJSON() end)
-    if not okJson or type(json) ~= "string" or json == "" then
-        _battleGraveGuard[guid] = nil
+-- Copies one live model into the bag and records the mapping.
+--
+-- The copy is spawned from the original's JSON while the original is still on the
+-- table, so TTS hands the copy a fresh GUID -- which is exactly what is wanted
+-- here: the roster stays keyed by the model the players use, dbl points at its
+-- stand-in, and the two never collide.
+function battleMakeStandIn(o, guid, done)
+    if o == nil or battleLog == nil then
+        if done ~= nil then done(false) end
+        return
+    end
+    local bag = battleStandInBag(true)
+    if bag == nil then
+        if done ~= nil then done(false) end
         return
     end
 
-    Wait.frames(function()
-        local bag = battleGraveyardBag(true)
-        if bag == nil then _battleGraveGuard[guid] = nil; return end
-        local ok = pcall(function()
-            local clone = spawnObjectJSON({
-                json = json,
-                position = BATTLE_GRAVE_POS,
-                sound = false,
-                callback_function = function(spawned)
-                    if spawned == nil then return end
-                    local actual = spawned.getGUID()
-                    if actual ~= guid then battleLog.gmap[guid] = actual end
-                    spawned.setLock(false)
-                    bag.putObject(spawned)
-                    Wait.frames(function() _battleGraveGuard[guid] = nil end, 2)
-                end,
-            })
-            if clone == nil then _battleGraveGuard[guid] = nil end
-        end)
-        if not ok then _battleGraveGuard[guid] = nil end
-    end, 1)
+    local json = nil
+    local okJson = pcall(function() json = o.getJSON() end)
+    if not okJson or type(json) ~= "string" or json == "" then
+        if done ~= nil then done(false) end
+        return
+    end
+
+    local spawned = spawnObjectJSON({
+        json = json,
+        position = BATTLE_STANDIN_POS,
+        sound = false,
+        callback_function = function(c)
+            if c == nil then
+                if done ~= nil then done(false) end
+                return
+            end
+            -- The nickname is what a rewind reads back off a stand-in (and what
+            -- carries the wound prefix), so it stays, along with the mesh, tags,
+            -- description and colour that come with the JSON. The datasheet
+            -- script and its XmlUI panel do not: ~98 KB per model, written into
+            -- every autosave, and of no use to a review prop.
+            pcall(function() c.setLuaScript("") end)
+            pcall(function() c.setLuaScriptState("") end)
+            pcall(function() c.UI.setXml("") end)
+            battleLog.dbl[guid] = c.getGUID()
+            battleLogTouch()
+            pcall(function()
+                c.setLock(false)
+                bag.putObject(c)
+            end)
+            if done ~= nil then done(true) end
+        end,
+    })
+    if spawned == nil and done ~= nil then done(false) end
+end
+
+-- Stand-ins for a list of {o = object, guid = rosterGuid} jobs, a few per frame.
+-- `done` fires once every job has reported back, not when the last one was
+-- merely started: spawning is asynchronous, and END GAME must not clear a model
+-- off the table before its copy exists.
+function battleMakeStandIns(jobs, done)
+    if #jobs == 0 then
+        if done ~= nil then done(0) end
+        return
+    end
+    local made, finished = 0, 0
+    local function oneDone(ok)
+        finished = finished + 1
+        if ok then made = made + 1 end
+        if finished >= #jobs and done ~= nil then done(made) end
+    end
+
+    local i = 1
+    local function step()
+        local stop = math.min(i + BATTLE_STANDIN_BATCH - 1, #jobs)
+        while i <= stop do
+            local job = jobs[i]
+            -- battleMakeStandIn reports through oneDone on every path it can
+            -- return from; this covers it raising before it gets that far.
+            if not pcall(battleMakeStandIn, job.o, job.guid, oneDone) then
+                oneDone(false)
+            end
+            i = i + 1
+        end
+        if i <= #jobs then Wait.frames(step, 1) end
+    end
+    step()
+end
+
+-- Makes a stand-in for any registered model that is on the table without one.
+-- Normally finds nothing. It covers a copy that failed to spawn at registration,
+-- and it runs at END GAME -- the last moment the models it would copy are still
+-- standing there to be copied.
+function battleEnsureStandIns(done)
+    local jobs = {}
+    for guid, _ in pairs((battleLog ~= nil and battleLog.roster) or {}) do
+        if battleLog.dbl[guid] == nil then
+            local o = getObjectFromGUID(guid)
+            if o ~= nil then table.insert(jobs, {o = o, guid = guid}) end
+        end
+    end
+    battleMakeStandIns(jobs, done)
+end
+
+-- Destroys a list of stand-in GUIDs, a few per frame. A stand-in is normally in
+-- the bag, but one taken out by a rewind is loose on the table, so both have to
+-- be handled.
+function battleDestroyStandIns(doomed)
+    if #doomed == 0 then return end
+    local bag = battleStandInBag(false)
+    local i = 1
+    local function step()
+        local stop = math.min(i + BATTLE_STANDIN_BATCH - 1, #doomed)
+        while i <= stop do
+            local dg = doomed[i]
+            local loose = getObjectFromGUID(dg)
+            if loose ~= nil then
+                pcall(function() loose.destruct() end)
+            elseif bag ~= nil then
+                -- Inside the bag: takeObject is the only way to reach it.
+                pcall(function()
+                    bag.takeObject({
+                        guid = dg,
+                        position = BATTLE_STANDIN_POS,
+                        smooth = false,
+                        callback_function = function(x)
+                            if x ~= nil then pcall(function() x.destruct() end) end
+                        end,
+                    })
+                end)
+            end
+            i = i + 1
+        end
+        if i <= #doomed then Wait.frames(step, 1) end
+    end
+    step()
+end
+
+-- Throws away the stand-ins for one side (or all of them, for color = nil) and
+-- forgets the mapping. Called when a registration is replaced or cleared, so the
+-- bag never accumulates stand-ins nothing points at any more.
+function battleDropStandIns(color)
+    if battleLog == nil or type(battleLog.dbl) ~= "table" then return end
+    local doomed = {}
+    for guid, rec in pairs(battleLog.roster or {}) do
+        if (color == nil or rec.c == color) and type(battleLog.dbl[guid]) == "string" then
+            table.insert(doomed, battleLog.dbl[guid])
+            battleLog.dbl[guid] = nil
+        end
+    end
+    if #doomed == 0 then return end
+    battleLogTouch()
+    battleDestroyStandIns(doomed)
+end
+
+-- Drops roster entries whose model is not on the table any more, along with their
+-- stand-ins and any unit left with no members.
+--
+-- Registrations are meant to survive from setup into the game that follows, which
+-- is why resetBattleLog keeps them. END GAME, though, clears every registered
+-- model off the table, so a roster carried straight from a finished game into the
+-- next one would name nothing but destroyed GUIDs: every model instantly "dead",
+-- last game's stand-ins still in the bag, and no "register an army first" warning
+-- either, because the roster is not empty. This is what turns that into an honest
+-- empty roster -- while leaving a setup-time registration, whose models are all
+-- still standing, completely untouched.
+function battlePruneRoster()
+    if battleLog == nil or type(battleLog.roster) ~= "table" then return 0 end
+    local doomed, keptUnits, dropped = {}, {}, 0
+    -- Clearing fields of a table being traversed is defined in Lua; only adding
+    -- new ones is not.
+    for guid, rec in pairs(battleLog.roster) do
+        if getObjectFromGUID(guid) == nil then
+            local dg = (type(battleLog.dbl) == "table") and battleLog.dbl[guid] or nil
+            if type(dg) == "string" and dg ~= "" then table.insert(doomed, dg) end
+            battleLog.roster[guid] = nil
+            if type(battleLog.dbl) == "table" then battleLog.dbl[guid] = nil end
+            if type(battleLog.dead) == "table" then battleLog.dead[guid] = nil end
+            dropped = dropped + 1
+        elseif rec ~= nil and rec.u ~= nil then
+            keptUnits[rec.u] = true
+        end
+    end
+    if dropped == 0 then return 0 end
+
+    for uuid, _ in pairs(battleLog.units or {}) do
+        if not keptUnits[uuid] then battleLog.units[uuid] = nil end
+    end
+    battleLogTouch()
+    battleDestroyStandIns(doomed)
+    return dropped
+end
+
+-- END GAME: clears the registered models off the table so the stand-ins can take
+-- over. Rewind moves stand-ins only, so leaving the originals standing would show
+-- every model twice.
+function battleRetireOriginals(done)
+    local doomed = {}
+    for guid, _ in pairs((battleLog ~= nil and battleLog.roster) or {}) do
+        local o = getObjectFromGUID(guid)
+        if o ~= nil then table.insert(doomed, o) end
+    end
+    if #doomed == 0 then
+        if done ~= nil then done(0) end
+        return
+    end
+    local i = 1
+    local function step()
+        local stop = math.min(i + BATTLE_STANDIN_BATCH - 1, #doomed)
+        while i <= stop do
+            local o = doomed[i]
+            pcall(function() o.destruct() end)
+            i = i + 1
+        end
+        if i <= #doomed then
+            Wait.frames(step, 1)
+            return
+        end
+        if done ~= nil then done(#doomed) end
+    end
+    step()
 end
 
 -- Called from the extended onObjectDestroy for loose secondary cards. A card
 -- that is deleted -- rather than merely moved to the discard -- leaves nothing
 -- for a later rewind to find by name, so its JSON is kept here (one copy per
 -- name; the most recently destroyed wins) and respawned fresh when a rewind
--- needs it. Unlike battleCaptureDestroyed this never touches the graveyard bag:
--- a secondary's target slot and facing are already known at restore time, so
--- there is nothing to park -- battleRestoreSecondaries spawns it straight into
--- place. Cards still sitting in a deck are not covered: a deck's own JSON has
--- no single name to key on, and losing a whole deck box is not the reported
+-- needs it. This is the only destroy handling left in the feature, and it is
+-- safe to leave on that hook because it only ever writes a string into a table:
+-- nothing is spawned, so it cannot trigger itself the way the old model capture
+-- could. A secondary's target slot and facing are already known at restore time,
+-- so there is nothing to park -- battleRestoreSecondaries spawns it straight
+-- into place. Cards still sitting in a deck are not covered: a deck's own JSON
+-- has no single name to key on, and losing a whole deck box is not the reported
 -- failure this exists to recover from.
 function battleCaptureDestroyedSecondary(obj)
     if battleLog == nil then return end
@@ -316,6 +544,7 @@ function battleCaptureDestroyedSecondary(obj)
     if not ok or type(json) ~= "string" or json == "" then return end
     if type(battleLog.secGrave) ~= "table" then battleLog.secGrave = {} end
     battleLog.secGrave[name] = json
+    battleLogTouch()
 end
 
 -- ForceOrg / yellowscribe stamps a live wound counter into the model nickname:
@@ -444,6 +673,9 @@ function registerArmy(color, objs, mode)
     if battleLog == nil then battleLog = defaultBattleLog() end
 
     if mode ~= "add" then
+        -- Before the roster entries go: dropStandIns reads the roster to work out
+        -- which stand-ins belong to this side.
+        battleDropStandIns(color)
         for guid, rec in pairs(battleLog.roster) do
             if rec.c == color then
                 local o = getObjectFromGUID(guid)
@@ -505,6 +737,21 @@ function registerArmy(color, objs, mode)
     end
 
     battleSyncTeamModels(color)
+    battleLogTouch()
+
+    -- The stand-ins are made here, once, while every model is still standing on
+    -- the table. That is the whole point: nothing downstream has to watch for a
+    -- model being deleted, because its copy already exists.
+    local standIns = {}
+    for _, o in ipairs(objs or {}) do
+        if isBattleModel(o) then
+            local g = o.getGUID()
+            if battleLog.roster[g] ~= nil and battleLog.dbl[g] == nil then
+                table.insert(standIns, {o = o, guid = g})
+            end
+        end
+    end
+    battleMakeStandIns(standIns, nil)
 
     local unitCount = 0
     for _ in pairs(seenUnits) do unitCount = unitCount + 1 end
@@ -551,6 +798,9 @@ function battleClearArmy(params)
     end
     if battleLog == nil then battleLog = defaultBattleLog() end
 
+    -- Before the roster entries go, for the same reason as in registerArmy.
+    battleDropStandIns(target)
+
     local removed = 0
     for guid, rec in pairs(battleLog.roster) do
         if rec.c == target then
@@ -566,6 +816,7 @@ function battleClearArmy(params)
         if u.c == target then battleLog.units[uuid] = nil end
     end
     battleSyncTeamModels(target)
+    battleLogTouch()
     broadcastToAll(target .. " army registration cleared (" .. removed .. " model(s)).", {1, 0.6, 0.2})
 end
 
@@ -880,7 +1131,10 @@ function recordBattleSnapshot(reason)
     local newDead = {}
     for guid, rec in pairs(battleLog.roster) do
         if battleLog.dead[guid] == nil then
-            local o = battleModelObject(guid)
+            -- Gone from the table means dead, and that is the whole of this
+            -- feature's deletion handling: no destroy hook, no capture. The
+            -- model's stand-in is already in the bag, made at registration.
+            local o = getObjectFromGUID(guid)
             if o == nil then
                 battleLog.dead[guid] = true
                 table.insert(newDead, guid)
@@ -927,31 +1181,46 @@ function recordBattleSnapshot(reason)
         sec  = battleSecondaryState(),
     })
 
-    -- Encoding the whole log is not free, so only sample it in debug builds.
+    battleLogTouch()
+
+    -- Size trace for debug builds. It goes to the host's console, not every
+    -- player's chat -- this is a developer number, and a --test build is still
+    -- something people play on. battleLogEncoded is the same cached string
+    -- onSave uses, so sampling it here costs nothing the save was not going to
+    -- pay for anyway.
     if DEBUG == true and (#battleLog.snaps % 10) == 0 then
-        local encoded = JSON.encode(battleLog)
-        printToAll("[DEBUG] battle log: " .. #battleLog.snaps .. " snapshot(s), " ..
-                   math.floor(#encoded / 1024) .. " KB", {0.6, 0.6, 0.6})
+        battleRewindLog("battle log: ", #battleLog.snaps, " snapshot(s), ",
+                        math.floor(#battleLogEncoded() / 1024), " KB")
     end
 end
 
 function resetBattleLog(keepRoster)
-    local roster, units = {}, {}
+    local roster, units, dbag, dbl = {}, {}, nil, {}
     if keepRoster and battleLog ~= nil then
+        -- A registration whose models are gone -- the state END GAME leaves
+        -- behind -- is not worth carrying into the next game. See battlePruneRoster.
+        battlePruneRoster()
         roster = battleLog.roster or {}
         units  = battleLog.units or {}
+        -- Registrations survive into the next game, so their stand-ins must too:
+        -- a model can be deleted mid-game, and re-registering is the only thing
+        -- that can make its copy again.
+        dbag   = battleLog.dbag
+        dbl    = battleLog.dbl or {}
+    else
+        -- Nothing will point at the bag once the roster goes, so it is emptied
+        -- rather than orphaned under the table for the rest of the session.
+        battleEmptyStandIns()
     end
-    -- The graveyard bag is emptied rather than orphaned: a new log has no snapshot
-    -- that could ever take a model back out of it, so anything left inside would be
-    -- unreachable clutter parked under the table for the rest of the session.
-    battleEmptyGraveyard()
     battleLog = defaultBattleLog()
     battleLog.roster = roster
     battleLog.units  = units
+    battleLog.dbag   = dbag
+    battleLog.dbl    = dbl
     _battleCapWarned = false
     _battleDeployTried = false
     _battleNameIndex = nil
-    _battleGraveGuard = {}
+    battleLogTouch()
 end
 
 -- The chosen deployment as data, not geometry. LCT destroys the drawn deployment
@@ -1069,10 +1338,22 @@ battleRewindSel = battleRewindSel or {r = 1, t = "Red", p = 1}
 -- the crash happened, even though the exception itself was never caught.
 -- Gated on DEBUG (true only for --test builds, see its declaration in
 -- global.ttslua) so a --release build's host console stays quiet.
-function battleRewindLog(msg)
-    if DEBUG then
-        log("[BattleRewind] " .. tostring(msg))
+--
+-- Takes its message in pieces rather than pre-joined, because `..` runs at the
+-- call site, before the gate: written as battleRewindLog("x=" .. x), a release
+-- build still pays to build every string it then throws away. Callers on a path
+-- that runs during ordinary play pass pieces; the ones that only run when a
+-- player presses REWIND are free to pass one already-joined string.
+function battleRewindLog(...)
+    if not DEBUG then return end
+    local n = select("#", ...)
+    if n == 1 then
+        log("[BattleRewind] " .. tostring(...))
+        return
     end
+    local parts = {}
+    for i = 1, n do parts[i] = tostring((select(i, ...))) end
+    log("[BattleRewind] " .. table.concat(parts))
 end
 
 -- Index of the snapshot for a round/turn/phase, or nil.
@@ -1130,7 +1411,7 @@ function battleRestoreModel(guid, tuple)
     battleRewindLog("restoreModel guid=" .. tostring(guid) .. " nameIdx=" ..
                     tostring(tuple[5]))
 
-    local o = battleModelObject(guid)
+    local o = battleStandInObject(guid)
     if o ~= nil then
         pcall(function()
             -- Locked for the teleport so the physics engine never wakes and
@@ -1149,21 +1430,21 @@ function battleRestoreModel(guid, tuple)
         return
     end
 
-    -- Dead at this moment in the game but alive at the one being left: out of the
-    -- graveyard it comes, under its original GUID.
-    battleRewindLog("restoreModel guid=" .. tostring(guid) .. " not on table, exhuming")
-    battleExhumeModel(guid, pos, rot, function(obj)
+    -- Not standing at the moment being left, but on the board at the one being
+    -- rewound to: its stand-in comes out of the bag.
+    battleRewindLog("restoreModel guid=" .. tostring(guid) .. " stand-in is in the bag, taking it out")
+    battleStandInDeploy(guid, pos, rot, function(obj)
         pcall(function() obj.setLock(false) end)
         battleRestoreModelName(obj, name)
     end)
 end
 
--- Restores every model in the snapshot, then buries the ones that were dead at
--- that moment, spreading the work across frames.
+-- Places a stand-in for every model in the snapshot, then puts away the ones
+-- that were already dead at that moment, spreading the work across frames.
 --
--- Burying is the half that makes rewinding FORWARD work: a model killed in round
--- one is on the table while reviewing round one and must not linger there when the
--- players jump back to round three.
+-- Putting away is the half that makes rewinding FORWARD work: a model killed in
+-- round one is standing on the table while round one is on screen and must not
+-- linger there when the players jump back to round three.
 function battleRestoreModels(snap, done)
     local work = {}
     local alive = {}
@@ -1174,16 +1455,16 @@ function battleRestoreModels(snap, done)
         end
     end
 
-    local bury = {}
+    local store = {}
     if type(battleLog.roster) == "table" then
         for guid, _ in pairs(battleLog.roster) do
-            if not alive[guid] and battleModelObject(guid) ~= nil then
-                table.insert(bury, guid)
+            if not alive[guid] and battleStandInObject(guid) ~= nil then
+                table.insert(store, guid)
             end
         end
     end
 
-    battleRewindLog("restoreModels: " .. #work .. " to place, " .. #bury .. " to bury")
+    battleRewindLog("restoreModels: " .. #work .. " to place, " .. #store .. " to put away")
 
     local i = 1
     local function step()
@@ -1204,12 +1485,12 @@ function battleRestoreModels(snap, done)
             Wait.frames(step, 1)
             return
         end
-        battleRewindLog("restoreModels: placement done, burying " .. #bury .. " model(s)")
-        for _, guid in ipairs(bury) do
-            pcall(function() battleBuryModel(guid) end)
+        battleRewindLog("restoreModels: placement done, putting away " .. #store .. " stand-in(s)")
+        for _, guid in ipairs(store) do
+            pcall(function() battleStandInStore(guid) end)
         end
         battleRewindLog("restoreModels: complete")
-        if done ~= nil then done(#work, #bury) end
+        if done ~= nil then done(#work, #store) end
     end
     step()
 end
@@ -1491,7 +1772,7 @@ function battleRestoreSecondaries(snap)
                             local idx = slotIndex
                             battleRewindLog("restoreSecondaries: " .. tostring(color) ..
                                             " slot " .. slotIndex .. ": spawning '" ..
-                                            tostring(entry.n) .. "' from graveyard JSON")
+                                            tostring(entry.n) .. "' from stored card JSON")
                             pcall(function()
                                 spawnObjectJSON({
                                     json = json,
@@ -1663,6 +1944,14 @@ function battleRewindTo(index, playerColor)
         printToColor("Rewind already in progress.", playerColor, {1, 0.6, 0.2})
         return false
     end
+    -- Rewind moves stand-ins, and the originals are only cleared off the table by
+    -- END GAME. Running one before that would stand a copy of every model next to
+    -- the model it was copied from.
+    if battleLog.ended ~= true then
+        printToColor("Rewind opens after END GAME - the log is still recording.",
+                     playerColor, {1, 0.6, 0.2})
+        return false
+    end
 
     _battleRewindBusy = true
     -- Belt and braces: battleLog.ended already stops recording, but a rewind run
@@ -1703,14 +1992,14 @@ function battleRewindTo(index, playerColor)
     end
 
     battleRewindLog("rewindTo: phase 3/3 -- restoreModels")
-    battleRestoreModels(snap, function(moved, buried)
-        battleRewindLog("==== rewindTo complete: moved=" .. moved .. " buried=" .. buried ..
+    battleRestoreModels(snap, function(moved, storedAway)
+        battleRewindLog("==== rewindTo complete: moved=" .. moved .. " storedAway=" .. storedAway ..
                         " missingSecondaries=" .. #missing .. " ====")
         -- _battleRewindBusy must clear no sooner than _battleCaptureGuard does:
-        -- the bury/exhume calls issued above (bag.putObject / bag.takeObject)
-        -- are async, so for a few frames a model can be mid-transfer into or
-        -- out of the graveyard bag -- neither cleanly on the table nor cleanly
-        -- inside it. Releasing the busy flag here (as this used to) let a fast
+        -- the put-away/take-out calls issued above (bag.putObject /
+        -- bag.takeObject) are async, so for a few frames a stand-in can be
+        -- mid-transfer into or out of the bag -- neither cleanly on the table nor
+        -- cleanly inside it. Releasing the busy flag here (as this used to) let a fast
         -- second REWIND/NEXT/END press start a whole new restore pass into
         -- that window, looking up a GUID mid-transfer -- a native lookup TTS
         -- itself can answer inconsistently for, which is a plausible source of
@@ -1722,8 +2011,7 @@ function battleRewindTo(index, playerColor)
         end, 3)
 
         broadcastToAll("Rewound to " .. tostring(snap.lbl) .. "  (" .. moved ..
-                       " model(s) placed, " .. buried .. " returned to the " ..
-                       "graveyard)", {0.4, 1, 0.4})
+                       " model(s) placed, " .. storedAway .. " put away)", {0.4, 1, 0.4})
         if #missing > 0 then
             broadcastToAll("Could not find " .. #missing .. " secondary card(s): " ..
                            table.concat(missing, ", "), {1, 0.6, 0.2})
@@ -1921,7 +2209,7 @@ end
 -- check runs only after hudRewindNext has already mutated the shared
 -- battleRewindSel selector and repainted the overlay for every player, so a
 -- fast second press could visibly skip the selector ahead (or, before the
--- fix alongside this one, race a still-settling bury/exhume) even though the
+-- fix alongside this one, race a still-settling bag transfer) even though the
 -- actual restore underneath was correctly refused.
 function hudRewindGo(player, value, id)
     local color = getHudColorFromCallback(player, id)
@@ -2108,6 +2396,34 @@ function battleEndGame(player)
             battleRewindSel.t = last.t or "Red"
             battleRewindSel.p = tonumber(last.p) or 1
         end
+
+        -- Hand the table over to the stand-ins: clear the registered models off
+        -- it, then put the stand-ins where those models just stood, so the board
+        -- looks unchanged and rewind has something to move.
+        --
+        -- Deliberately after the save above, so the END GAME file on disk still
+        -- holds the real models with their datasheets intact. What the table
+        -- carries from here on is the ~3 KB copies, which is what every later
+        -- autosave has to write.
+        local handedOver = false
+        local function handOver()
+            if handedOver then return end
+            handedOver = true
+            battleRetireOriginals(function(removed)
+                if last == nil then return end
+                battleRestoreModels(last, function(placed)
+                    broadcastToAll("Cleared " .. removed .. " model(s) off the table and put " ..
+                                   placed .. " stand-in(s) in their place. Rewind moves these.",
+                                   {0.6, 0.8, 1})
+                end)
+            end)
+        end
+        battleEnsureStandIns(handOver)
+        -- Normally there is nothing to make and handOver has already run by the
+        -- line below. A stand-in that never finishes spawning must not leave the
+        -- originals standing for the rest of the session, so hand over anyway.
+        Wait.time(handOver, 10)
+
         battleOpenRewindOverlay(getHudColorFromCallback(player, nil))
     end)
 end
@@ -2123,12 +2439,15 @@ function restoreBattleLog(raw)
     if type(raw.dead)   == "table" then log.dead   = raw.dead end
     if type(raw.snaps)  == "table" then log.snaps  = raw.snaps end
     if type(raw.names)  == "table" then log.names  = raw.names end
-    if type(raw.gmap)   == "table" then log.gmap   = raw.gmap end
-    if type(raw.grave)  == "string" then log.grave = raw.grave end
+    if type(raw.dbl)    == "table" then log.dbl    = raw.dbl end
+    if type(raw.dbag)   == "string" then log.dbag  = raw.dbag end
     if type(raw.secGrave) == "table" then log.secGrave = raw.secGrave end
     log.ended = raw.ended == true
     -- The name pool's reverse lookup is derived, not saved; dropping it here has
     -- battleAddName rebuild it from log.names on first use after a load.
     _battleNameIndex = nil
+    -- The caller is about to swap this in as battleLog, so any encoding cached
+    -- for the log it replaces is stale.
+    battleLogTouch()
     return log
 end
