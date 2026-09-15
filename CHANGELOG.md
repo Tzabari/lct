@@ -13,6 +13,34 @@ How this file is used by the compiler (`compile.py --release`):
 To cut a release: add a new `## vX.Y.Z` section at the top with its bullets,
 then run `python3 compile.py --release`.
 
+## v1.12.0
+- Feat: Battle Log. Each player selects their models and presses REGISTER ARMY on the game-tools object; from then on the table records where every registered model stands at each phase change, plus the terrain layout, VP/CP and per-model wounds. Press EXPORT REPORT (or run the exporter on a saved game) to get a browsable battle report with a top-down board per phase.
+- Feat: EXPORT REPORT can also reach a hosted renderer instead of the local helper, so anyone at the table gets a shareable link with nothing installed. The mod never contacts it except when EXPORT is pressed, probing first so a sleeping free-tier instance's ~60s wake shows a progress message instead of failing. A view link and a permanent-download link are printed to chat and written to a "Battle Report" notebook tab; the view link expires (15 minutes by default, sooner if the server is busy or the report has been downloaded) but the downloaded copy is self-contained and keeps working offline forever.
+- Feat: Battle Log works with only one player seated, from either seat, so solo games and testing record properly. A present player can register an empty seat's army.
+- Feat: CAPTURE button records an extra snapshot mid-phase, for moments a phase boundary would miss.
+- Feat: The battle report is now a viewer: one board fills the window, with Round tabs, a player tab, per-round phase tabs and Next/Prev phase buttons (arrow keys work too).
+- Feat: Report overlay toggles mirror the in-game ones - deployment zones, objectives, territory line, table quarters, 6" strategic reserves and the 3"/6" centre rings.
+- Feat: The report tracks both Reinforcements and Reserves boards and each side's currently active secondaries.
+- Feat: The report board zooms and pans (mouse wheel to zoom, drag to pan, double-click or 0 to reset), and the terrain, deployment and name markings are drawn at true table scale so they no longer swamp the models.
+- Feat: A Deployment map view shows the mission setup on its own - zones, quarters and objectives - instead of a moment in the game.
+- Feat: The board as it stood when Start Game was pressed is its own **Deploy** round in the report, ahead of Round 1. Register your army before starting the game to get it; the table says so if nothing was registered in time.
+- Feat: The score panel shows each side's primary/secondary split alongside the VP total.
+- Bug fix: VP always read 0 in the battle log. The score sheet's playerSum takes a plain number, but Object.call hands it the parameter table, so every snapshot threw "attempt to index a nil value" - scores now come from getMatchSummary.
+- Bug fix: The battle log recorded no map name, players or deployment when the game was already in progress (only pressing Start Game filled them in). Any snapshot now backfills whatever context is missing, without overwriting what Start Game recorded.
+- Bug fix: Recording a snapshot raised "Attempt to perform operations with resources owned by different scripts" on every phase, which aborted the snapshot and left the whole game unlogged. The chosen deployment now crosses between scripts as JSON instead of as a table owned by the start menu.
+- Bug fix: The report server rendered with whatever version of the renderer was on disk when it started, so a server left running kept serving the old report. It now re-reads the renderer per export, and the page header stamps the time it was rendered.
+- Feat: Report terrain is now exact rather than inferred. The report looks up the map card that was loaded and reads the terrain straight out of that card's own spawn data, so every terrain area is drawn at its true position and true outline - including the wedge-shaped plate, which is a trapezoid rather than the triangle its name suggests, and which used to come out mirrored.
+- Feat: Terrain areas are drawn from the real plate models, traced once and shipped with the mod. Eleven shapes cover every terrain area on all 225 maps, so no map falls back to a rough box.
+- Change: The ruins standing on the terrain areas are no longer drawn, and neither is the mission's layout-art diagram in the Deployment map view. The ruin shapes cluttered the board under the models, and one layout-art card covers three different terrain layouts, so it was wrong for two maps in three.
+- Bug fix: The report board was mirrored top-to-bottom. It was drawn as if seen from under the table, which also reversed every model's facing.
+- Bug fix: Report terrain was unreadable. The battlemat is untagged on many maps, so it was drawn as a board-sized slab of terrain covering everything; the outlines that mark terrain areas were drawn as if they were the terrain; and objective markers were drawn as terrain boxes while the outlines around them were drawn as the objectives.
+- Bug fix: The report's territory line was always the centre line. It is now derived from the deployment that was played, as the table derives it, so it tilts correctly for stepped and diagonal zones - and Combat Patrol's own declared divider is used where a mission has one.
+- Bug fix: Active secondaries never appeared in the report. The scan read each slot zone directly, and a card dropped into a slot is not registered as inside it until it settles; it now goes through the same slot helper the scoreboard uses.
+- Bug fix: The report listed only the first two of a player's secondaries. The battle log kept its own two-entry list of slot zones rather than using the mod's, so a card drawn into slots 3 to 8 was recorded nowhere; all eight slots a side are now read.
+- Bug fix: The report drew only five of the mod's eight deployment shapes, so Combat Patrol zones went missing, and a "No Deployment Zone" mission could blank the page.
+- Feat: Battle Rewind. Press END GAME (next to EXPORT REPORT) to record the final state, close the battle log to further recording, and open a Round / Player / Phase selector - greyed out wherever no snapshot was recorded. Pick a moment and press REWIND to put every model, CP, VP and secondary back exactly as they were then; press RETURN TO END to put the table back to the end of the game. Rewinding is a review, not an undo - the log is never truncated, so you can scrub back and forth as much as you like without losing anything.
+- Feat: A model destroyed during the game comes back under its original GUID when a rewind puts it back on the board, at the position, wounds and health-bracket colour it had at that moment; a model still alive when you rewind past its death goes back to the graveyard until you return to a moment after it fell.
+
 ## v1.11.3
 - UI Scoreboard change for better visibility and new button underneath scoring overlay.
 

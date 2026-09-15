@@ -3,9 +3,10 @@
 Compiles TTSLUA scripts into the TTS JSON save file.
 
 Usage:
-    python3 compile.py            # prompts for version, writes compiled JSON
-    python3 compile.py --test     # uses "test" as version, copies to TTS saves folder
-    python3 compile.py --release  # version + patch notes from CHANGELOG.md, copies to TTS saves folder
+    python3 compile.py                 # prompts for version, writes compiled JSON
+    python3 compile.py --test          # uses "test" as version, copies to TTS saves folder
+    python3 compile.py --test --branch # uses "test-<branch>" instead, copies to TTS saves folder
+    python3 compile.py --release       # version + patch notes from CHANGELOG.md, copies to TTS saves folder
 """
 
 import argparse
@@ -15,12 +16,14 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))  # allow sibling imports when run from elsewhere
 import term
+import lua_strings
 import validate_maps
 
 # Warnings collected across the whole run so the closing summary can report them
@@ -67,6 +70,15 @@ LCT_MAT_CSV = SCRIPT_DIR.parent / "data" / "lct_mats_city.csv"
 BM_MAT_RANDOMIZER_ENABLED = False
 LCT_MAT_RANDOMIZER_ENABLED = False
 GLOBAL_LUA = "global.ttslua"
+
+# Global-companion source files: concatenated onto global.ttslua's text before
+# it is injected into the Global object's single LuaScript slot, so their
+# functions/variables land in Global's ordinary Lua environment exactly as if
+# still written inline. Not standalone objects -- no GUID header, never
+# matched against a JSON object -- so collect_lua_files() excludes them from
+# its GUID scan. Split out purely to keep a large feature's source readable
+# on its own; add to this list to split out another one.
+GLOBAL_COMPANION_LUA = ["battle_rewind.ttslua"]
 
 # The Battlemaster dynamic spawner bakes the canonical map-card machinery into
 # its own script (via @@MAP_CARD_MACHINERY@@), so it must be excluded from the
@@ -128,6 +140,30 @@ def get_tts_saves_path() -> Path:
     else:
         return home / ".local" / "share" / "Tabletop Simulator" / "Saves"
 
+
+def get_git_branch(repo_root: Path):
+    """Current branch name, or None if not a git repo, detached HEAD, or git
+    is unavailable. Lets --test tag its build per-branch, so two worktrees
+    (or two branches in one checkout) building at once don't overwrite each
+    other's builds/ output or TTS saves copy."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_root, capture_output=True, text=True, check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":  # detached HEAD
+        return None
+    return branch
+
+
+def sanitize_version_tag(tag: str) -> str:
+    """Collapse a branch name to a single safe path/version segment, e.g.
+    "feature/battle-rewind" -> "feature-battle-rewind" -- it flows into a
+    filename (builds/, the TTS saves copy) and a JSON string value alike."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-")
 
 
 def inject_xml(json_lines: list, xml_file: Path):
@@ -304,13 +340,21 @@ def inject_map_payloads(json_lines: list, json_guid_entries: list,
 
 
 def collect_lua_files() -> list:
-    """Return [global.ttslua, ...all other .ttslua files recursively sorted]."""
+    """Return [global.ttslua, ...all other GUID-bearing .ttslua files recursively
+    sorted]. Excludes GLOBAL_COMPANION_LUA -- those aren't standalone objects."""
     global_file = PATH_LUA / GLOBAL_LUA
+    companion_names = set(GLOBAL_COMPANION_LUA)
     others = sorted(
         f for f in PATH_LUA.rglob("*.ttslua")
-        if f.name != GLOBAL_LUA
+        if f.name != GLOBAL_LUA and f.name not in companion_names
     )
     return [global_file] + others
+
+
+def collect_global_companion_files() -> list:
+    """GLOBAL_COMPANION_LUA file paths, in the order their text is appended to
+    global.ttslua's before injection into the Global LuaScript slot."""
+    return [PATH_LUA / name for name in GLOBAL_COMPANION_LUA]
 
 
 def parse_changelog(path: Path):
@@ -339,7 +383,7 @@ def parse_changelog(path: Path):
 def stamp_global(lua_text: str, version: str, patch: str, notes: list, debug: bool) -> str:
     """Rewrite the GAME_VERSION / GAME_PATCH / GAME_CHANGELOG / DEBUG markers in global.ttslua.
 
-    version : build stamp ("test" or the release version) — drives chat + save name.
+    version : build stamp ("test", "test-<branch>", or the release version) — drives chat + save name.
     patch   : latest CHANGELOG version — shown on the splash overlay.
     notes   : latest CHANGELOG bullets — shown on the splash overlay.
     debug   : build-wide debug switch — true for --test, false otherwise.
@@ -510,7 +554,11 @@ def stamp_save_name(line: str, version: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Compile TTS Lua scripts into JSON.")
     parser.add_argument("--test", action="store_true",
-                        help="Tag as 'test' build and copy to TTS saves folder.")
+                        help="Tag as a 'test' build and copy to TTS saves folder.")
+    parser.add_argument("--branch", action="store_true",
+                        help="With --test, tag as 'test-<branch>' instead of plain 'test', "
+                             "so two branches building at once don't clobber each other's "
+                             "builds/ output or TTS saves copy.")
     parser.add_argument("--release", action="store_true",
                         help="Take version and patch notes from CHANGELOG.md and copy to TTS saves folder.")
     parser.add_argument("--no-validate", action="store_true",
@@ -518,6 +566,8 @@ def main():
     args = parser.parse_args()
     if args.test and args.release:
         fail("use either --test or --release, not both.")
+    if args.branch and not args.test:
+        fail("--branch only makes sense with --test.")
 
     json_file = PATH_JSON / f"{JSON_NAME}.json"
     if not json_file.exists():
@@ -560,8 +610,15 @@ def main():
     else:
         warn(f"no '## vX.Y.Z' entry found in {CHANGELOG.name} — splash not updated.")
 
-    if args.test:
+    if args.test and args.branch:
+        branch = get_git_branch(SCRIPT_DIR.parent)
+        tag = sanitize_version_tag(branch) if branch else ""
+        version = f"test-{tag}" if tag else "test"
+        print(f"Test build tag: {version}"
+              + ("" if tag else " (branch name unavailable)"))
+    elif args.test:
         version = "test"
+        print(f"Test build tag: {version}")
     elif args.release:
         if not patch:
             fail(f"--release needs a '## vX.Y.Z' entry at the top of {CHANGELOG.name}.")
@@ -572,6 +629,20 @@ def main():
             version = "v" + version
 
     lua_files = collect_lua_files()
+    companion_files = collect_global_companion_files()
+
+    # --- Reject unterminated string literals ---
+    # TTS only surfaces these at runtime ("unfinished string near ..."), and the
+    # affected object silently loses its whole script. Generic Lua parsers are not
+    # a reliable guard here, so check explicitly before anything is injected.
+    string_errors = []
+    for f in lua_files + companion_files:
+        for _, line_no, quote, snippet in lua_strings.check_file(f):
+            string_errors.append(f"{f.name}:{line_no}: unterminated {quote} string -> {snippet}")
+    if string_errors:
+        for err in string_errors:
+            print(f"  {err}")
+        fail(f"{len(string_errors)} unterminated string literal(s). Ending compilation.")
 
     # --- Extract GUIDs from each non-global lua file ---
     lua_guids = []  # [(guid_str, file_index), ...]
@@ -612,7 +683,8 @@ def main():
     print(f"Injecting {xml_file.name}... ", end="")
     inject_xml(json_lines, xml_file)
 
-    # --- Inject global.ttslua into the first LuaScript slot ---
+    # --- Inject global.ttslua (+ its Global-companion files) into the first
+    # LuaScript slot ---
     # Stamp the player-facing version + patch notes into the Global script as it
     # is injected; the source file on disk is left untouched.
     # Debug build switch: on for --test, off for --release and prompted builds.
@@ -622,6 +694,10 @@ def main():
         lua_files[0].read_text(encoding="utf-8"), version, patch, changelog_notes, debug_enabled
     )
     global_text = bake_map_index(global_text)
+    for f in companion_files:
+        if not f.exists():
+            fail(f"{f} not found. Ending compilation.")
+        global_text += "\n\n" + f.read_text(encoding="utf-8")
     inject_lua_into_line(json_lines, json_lua_line_idxs[0], global_text)
     print(term.green("Done."))
 

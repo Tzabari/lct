@@ -60,7 +60,7 @@ its caches so the old all-three-state archives are rejected.
 This is not a normal application with a single executable entry point. The source tree describes a TTS save:
 
 1. `TTSJSON/ftc_base.json` is the source object graph: objects, decks, bags, GUIDs, transforms, and stripped map-card script heads.
-2. `TTSLUA/*.ttslua` contains Global and per-object scripts. The first line of every per-object script declares the GUID or GUIDs that receive it.
+2. `TTSLUA/*.ttslua` contains Global and per-object scripts. The first line of every per-object script declares the GUID or GUIDs that receive it — except a Global-companion file (e.g. `battle_rewind.ttslua`), which has no GUID header and is concatenated onto `global.ttslua`'s text before injection (`GLOBAL_COMPANION_LUA` in `compile.py`).
 3. `TTSJSON/ftc_base_ui.xml` is Global screen-space UI.
 4. `data/map_manifest.csv` is the authoritative map inventory and metadata catalog.
 5. `data/maps/<card_guid>.lua` stores each map card's large terrain payload outside the JSON.
@@ -77,6 +77,7 @@ The source JSON is deliberately incomplete as a playable artifact. The compiled 
 | `TTSJSON/ftc_base.json` | Canonical TTS source save/object graph. Large but much smaller since terrain extraction. |
 | `TTSJSON/ftc_base_ui.xml` | Global HUD, scoring overlays, splash, role menu, and hidden debug panel. |
 | `TTSLUA/global.ttslua` | Central GUID registry, global state, HUD/scoring/secondary logic, debug dispatch, player seating, and Global readiness signal. |
+| `TTSLUA/battle_rewind.ttslua` | Global-companion source (no GUID header) for battle log / army registration / rewind: recording, the graveyard, and in-game rewind. `compile.py` concatenates it onto `global.ttslua`'s text before injecting Global's script. |
 | `TTSLUA/startMenu.ttslua` | Main orchestration object (`738804`): game-mode/setup menus, mission generation, map loading, map undo, deployment/objectives, turns/phases, and game start. |
 | `TTSLUA/mapFilter.ttslua` | Creator/category filter and mat/theme picker UI; publishes selected creators to Global. |
 | `TTSLUA/customDiceTable.ttslua` | Red/Blue dice-tray UI and spatial logic: spawning, filtering, reroll selection, quick roll, lethal/sustained helpers, bubbles, coherency, engagement, and highlight paint. |

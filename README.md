@@ -9,6 +9,8 @@ Run the compiler from the `scripts` folder:
 ```bash
 python3 compile.py             # prompt for a version, write the compiled JSON
 python3 compile.py --test      # tag as "test", copy to your TTS saves folder
+python3 compile.py --test --branch # tag as "test-<branch>" instead, so two branches
+                                    # building at once don't clobber each other's copy
 python3 compile.py --release   # version + patch notes from CHANGELOG.md, then copy
 python3 compile.py --no-validate   # skip the map-card validation gate
 ```
@@ -32,6 +34,54 @@ python3 extract_map_payloads.py   # strip terrain to data/maps/, shrink the save
 At build time `bake_map_index` generates a GUID-keyed `MAP_INDEX` table (`{creator, display, type, eligible}`) from the CSV and stamps it into the `@@MAP_INDEX@@` marker in `TTSLUA/global.ttslua`. Runtime systems (mission generation, map filter) read it via `Global.getTable("MAP_INDEX")` — this lets them look up a card's creator/eligibility even while it's still inside a deck. The source keeps an empty `MAP_INDEX = {}` default so uncompiled builds stay valid.
 
 Map-card nicknames and manifest `card_name` values carry a trailing creator credit (e.g. ` - T5S2`, ` - BTTF`); runtime matching strips it when resolving layout art and deployment zones. Creator tag→display mappings must stay aligned between `MAP_CREATOR_DISPLAY_NAMES` (`validate_maps.py`) and `mapCreatorDisplaySuffixes` (`startMenu.ttslua`); validation rejects mismatches.
+
+### Battle reports
+
+Players register their armies once per game, and the table then records a snapshot
+at every phase/turn change: each registered model's position, facing, base size and
+current wounds, plus the terrain layout, round, VP and CP. The log lives in Global's
+saved state (`svBattleLog`) and rides out with the save — that's it; this mod does
+nothing else with it.
+
+In game, the two buttons sit on the game-tools object beside that side's
+HIDE / SHOW ARMY pair, one row further in:
+
+- **REGISTER ARMY** (one per side) — select your models, left-click to register them,
+  right-click to clear. A player may always register their own side; an empty seat may
+  be registered by whoever is present, so solo games work from either seat.
+- **CAPTURE** — record an extra snapshot mid-phase.
+
+This repo has no report-rendering code and no networking of any kind — no export
+button, no server, no `WebRequest` calls anywhere in the mod.
+
+Model datasheets come from ForceOrg/yellowscribe: unit grouping uses each model's
+`uuid:<unit>` tag and wounds are read from the `[00ff16]2/2[-] Name` nickname prefix,
+so models imported by other means still record position but report no wounds.
+
+### In-game rewind
+
+The same battle log can put the table itself back to any recorded moment, in
+TTS, with no export step.
+
+**END GAME** sits next to CAPTURE. Pressing it records one last snapshot, closes the
+log to further recording (so a rewind can never overwrite the game it is reviewing),
+and opens a Round / Player / Phase selector - greyed out wherever no snapshot exists
+for that combination. Pressing END GAME again later reopens the selector rather than
+ending the game a second time.
+
+Pick a round, a player and a phase and press **REWIND**: every model, CP, VP and
+secondary card returns to the state captured then. **RETURN TO END** puts
+everything back to the end-of-game state recorded by END GAME. This is a review,
+not an undo - the log is never truncated, so you can scrub back and forth as much
+as you like and always get back to where you were.
+
+A model destroyed during the game is not deleted; it is moved into a hidden bag
+under the table and comes back under its *original* GUID when a rewind needs it on
+the board again, at the position, wounds and health-bracket colour it had at that
+moment - restored from the model's own recorded nickname, which is why a wound
+count on an unscripted model (no datasheet popup) still comes back correctly. A
+model that is alive now but was already dead at the moment you rewind to goes back
+into the bag; rewinding forward past its death takes it back out.
 
 ### Validation
 

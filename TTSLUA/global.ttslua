@@ -56,7 +56,7 @@ playerHudSettings = {
 }
 
 function getDefaultHudSettings()
-    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"}
+    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, rewindOverlayOpen = false, clockHidden = false, hudVisible = true, scale = "Medium"}
 end
 
 function ensureHudSettings(color)
@@ -275,6 +275,7 @@ function applyHudPreferencesForColor(color)
     local overlayActive = settings.hudVisible and "true" or "false"
     local scoringOverlayActive = settings.scoringOverlayOpen and "true" or "false"
     local scoringMinimalist = settings.scoringOverlayMinimalist
+    local rewindOverlayActive = settings.rewindOverlayOpen and "true" or "false"
     local clockActive = not settings.clockHidden
 
     setHudAttributeForColor(color, {id = "HelpOverlay", attr = "active", value = helpOverlayActive})
@@ -290,6 +291,7 @@ function applyHudPreferencesForColor(color)
         setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "PrimaryMission", attr = "active", value = scoringMinimalist and "false" or "true"})
         setHudAttributeForColor(color, {id = "ScoringOverlay_" .. side .. "Extras", attr = "active", value = scoringMinimalist and "false" or "true"})
     end
+    setHudAttributeForColor(color, {id = "RewindOverlay", attr = "active", value = rewindOverlayActive})
     setHudAttributeForColor(color, {id = "LockBtn", attr = "color", value = "#FFFFFF"})
     setHudAttributeForColor(color, {id = "ClockBtn", attr = "color", value = "#FFFFFF"})
 
@@ -310,15 +312,23 @@ function hudToggleHelp(player, value, id)
     settings.helpOverlayOpen = not settings.helpOverlayOpen
     if settings.helpOverlayOpen then
         settings.scoringOverlayOpen = false
+        settings.rewindOverlayOpen = false
     end
     applyHudPreferencesForColor(color)
 end
 
-function hudCloseHelp(player, value, id)
+-- Shared by every per-player HUD overlay's close button (help, scoring, rewind):
+-- each just clears its own settings flag and reapplies. flagName is a
+-- playerHudSettings key (e.g. "helpOverlayOpen"), not the overlay's UI id.
+function hudCloseOverlay(flagName, player, id)
     local color = getHudColorFromCallback(player, id)
     local settings = ensureHudSettings(color)
-    settings.helpOverlayOpen = false
+    settings[flagName] = false
     applyHudPreferencesForColor(color)
+end
+
+function hudCloseHelp(player, value, id)
+    hudCloseOverlay("helpOverlayOpen", player, id)
 end
 
 function hudToggleLock(player, value, id)
@@ -327,6 +337,7 @@ function hudToggleLock(player, value, id)
     settings.scoringOverlayOpen = not settings.scoringOverlayOpen
     if settings.scoringOverlayOpen then
         settings.helpOverlayOpen = false
+        settings.rewindOverlayOpen = false
         -- The freshly-opened board renders from XML defaults, so drop the cache to
         -- force a full repaint (cached values would otherwise be skipped as "current").
         invalidateScoringCache()
@@ -337,10 +348,7 @@ function hudToggleLock(player, value, id)
 end
 
 function hudCloseScoringOverlay(player, value, id)
-    local color = getHudColorFromCallback(player, id)
-    local settings = ensureHudSettings(color)
-    settings.scoringOverlayOpen = false
-    applyHudPreferencesForColor(color)
+    hudCloseOverlay("scoringOverlayOpen", player, id)
 end
 
 -- The "-" button beside the scoreboard's close button. Independent of the main
@@ -1129,7 +1137,7 @@ MISSION_PACK_PARIAH_NEXUS = 1
 -- Player-facing version + patch notes. The compiler rewrites these three lines
 -- on every build from CHANGELOG.md; the `@@LCT_...@@` markers must stay intact.
 -- Left as-is, an uncompiled / dev build simply shows "DEV".
---   GAME_VERSION : build stamp ("test" or the release version) - chat + save name
+--   GAME_VERSION : build stamp ("test", "test-<branch>", or the release version) - chat + save name
 --   GAME_PATCH   : latest CHANGELOG version - shown on the splash overlay
 --   GAME_CHANGELOG: latest CHANGELOG bullets - shown on the splash overlay
 GAME_VERSION = "DEV"   -- @@LCT_VERSION@@
@@ -1272,6 +1280,10 @@ function onSave()
         svRedSecondaryDeckGUID = redSecondaryDeckGUID,
         svBlueSecondaryDeckGUID = blueSecondaryDeckGUID,
         svPlayerHudSettings = playerHudSettings,
+        -- Battle log: army registrations plus one snapshot per phase. Small by
+        -- construction (roughly 400 KB for a full two-army game), so unlike the
+        -- start menu restore point it is cheap to encode on every autosave.
+        svBattleLog = battleLog,
         svVersion = GAME_VERSION
     })
     --saved_data = ""
@@ -1286,8 +1298,8 @@ end
 -- Short chat banner on load. A test build announces itself; a release build
 -- just states its patch. Patch notes live on the splash overlay, not chat.
 function announceVersion()
-    if GAME_VERSION == "test" then
-        printToAll("LCT - TEST BUILD (Patch " .. patchNumber() .. ")", "Yellow")
+    if GAME_VERSION == "test" or GAME_VERSION:match("^test%-") then
+        printToAll("LCT - TEST BUILD [" .. GAME_VERSION .. "] (Patch " .. patchNumber() .. ")", "Yellow")
     else
         printToAll("LCT - Patch " .. patchNumber(), "Yellow")
     end
@@ -1322,23 +1334,22 @@ function updateTeamModel(obj, team)
     Global.setTable("teamModels", teamModels)
 end
 
-function tagSelectedAsRed(playerColor, target)
-    local objs = Player[playerColor].getSelectedObjects()
-    for _, obj in ipairs(objs) do
-      obj.setGMNotes("Red")
-      updateTeamModel(obj, "Red")
-    end
-    printToColor("Tagged selected objects as Red", playerColor, "Red")
-  end
+-- Battle log / army registration / rewind now lives in
+-- TTSLUA/battle_rewind.ttslua -- compile.py concatenates it into this
+-- script at build time, so it is still part of Global's environment (the
+-- calls below into battleLog/battleRegisterFromSelection/battleCaptureDestroyed*/
+-- restoreBattleLog/battleRewindLog resolve there).
 
-  function tagSelectedAsBlue(playerColor, target)
-    local objs = Player[playerColor].getSelectedObjects()
-    for _, obj in ipairs(objs) do
-      obj.setGMNotes("Blue")
-      updateTeamModel(obj, "Blue")
-    end
-    printToColor("Tagged selected objects as Blue", playerColor, "Blue")
-  end
+-- Legacy hotkey entry points, now routed through the battle-log registry. They
+-- used to overwrite GMNotes, which collides with the map/overlay sentinels the
+-- rest of the mod stores there; registration adds a tag instead.
+function tagSelectedAsRed(playerColor, target)
+    battleRegisterFromSelection({clicker = playerColor, target = "Red", mode = "add"})
+end
+
+function tagSelectedAsBlue(playerColor, target)
+    battleRegisterFromSelection({clicker = playerColor, target = "Blue", mode = "add"})
+end
 
 function hideMissionDeckUntilSelected(deckGUID)
     local deck = getObjectFromGUID(deckGUID)
@@ -1377,6 +1388,12 @@ function onObjectDestroy(obj)
     -- destruction (vortex, Clear Mat, bag entry) would pay it once per die.
     if obj.tag == "Dice" then return end
     removeYellowscribeGlobalCards(obj.getGUID())
+    -- TTS calls exactly one onObjectDestroy, so the graveyard hangs off this one
+    -- rather than declaring a second handler that would silently replace it.
+    -- The Red/Blue trash bins destroy by collision, so models binned that way
+    -- arrive here like any other deletion.
+    pcall(function() battleCaptureDestroyed(obj) end)
+    pcall(function() battleCaptureDestroyedSecondary(obj) end)
 end
 
 function onLoad(saved_data)
@@ -1395,6 +1412,7 @@ function onLoad(saved_data)
         bluePlayerID = loaded_data.svbluePlayerID
         packSelected = loaded_data.svPackSelected
         playerHudSettings = loaded_data.svPlayerHudSettings or playerHudSettings
+        battleLog = restoreBattleLog(loaded_data.svBattleLog)
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         if packSelected then
@@ -1405,6 +1423,7 @@ function onLoad(saved_data)
         redPlayerID = ""
         bluePlayerID = ""
         packSelected = nil
+        battleLog = defaultBattleLog()
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
     end
@@ -1912,7 +1931,9 @@ end
 -- then locked, especially during/after smooth movement. Combine the zone query
 -- with a positional scan (same approach as the mission primary slots) so
 -- occupancy, labels, discard and recycle all see cards that are visibly there.
-function getCardsInSecondarySlot(zone)
+-- `scene` is an optional pre-fetched getAllObjects() list, for callers that check
+-- several slots at once and should not walk the whole table once per slot.
+function getCardsInSecondarySlot(zone, scene)
     if not zone then
         return {}
     end
@@ -1934,7 +1955,7 @@ function getCardsInSecondarySlot(zone)
     local center = bounds.center
     local halfX = bounds.size.x / 2
     local halfZ = bounds.size.z / 2
-    for _, obj in ipairs(getAllObjects()) do
+    for _, obj in ipairs(scene or getAllObjects()) do
         local pos = obj.getPosition()
         if math.abs(pos.x - center.x) <= halfX and
            math.abs(pos.z - center.z) <= halfZ and
@@ -2041,8 +2062,13 @@ function getSecondaryCardNameForColor(color, index, zone)
 end
 
 function setSecondaryName(nameGuids, index, cardName)
-    local labelObj = getObjectFromGUID(nameGuids[index])
+    local guid = nameGuids[index]
+    battleRewindLog("setSecondaryName: index=" .. tostring(index) .. " guid=" ..
+                    tostring(guid) .. " cardName=" .. tostring(cardName))
+    local labelObj = getObjectFromGUID(guid)
     if not labelObj then
+        battleRewindLog("setSecondaryName: index=" .. tostring(index) ..
+                        " label object not found for guid " .. tostring(guid))
         return
     end
 
@@ -2063,12 +2089,17 @@ function setRedSecondaryName(index, cardName)
 end
 
 function refreshSecondaryNames(zoneGuids, nameGuids, setter, color)
+    battleRewindLog("refreshSecondaryNames: color=" .. tostring(color) .. " (" ..
+                    #nameGuids .. " label slot(s))")
     for index = 1, #nameGuids do
         local zoneGuid = zoneGuids[index]
+        battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " index=" ..
+                        index .. " zoneGuid=" .. tostring(zoneGuid))
         local zone = getObjectFromGUID(zoneGuid)
         local cardName = getSecondaryCardNameForColor(color, index, zone)
         setter(index, cardName)
     end
+    battleRewindLog("refreshSecondaryNames: " .. tostring(color) .. " done")
 end
 
 function refreshBlueSecondaryNames()
@@ -2191,12 +2222,16 @@ function getAssignedSecondarySlotCard(color, index)
     return nil
 end
 
-function getCardsInSecondarySlotForColor(color, index, zone)
+-- scene is an optional pre-fetched getAllObjects() list, passed straight through to
+-- getCardsInSecondarySlot -- battleSecondaryState checks all sixteen slots on every
+-- phase snapshot and fetches it once up front rather than paying for a fresh sweep
+-- per slot; every other caller here just omits it and takes that per-call sweep.
+function getCardsInSecondarySlotForColor(color, index, zone, scene)
     local cards = {}
     local seen = {}
     addUniqueSecondaryCard(cards, seen, getAssignedSecondarySlotCard(color, index))
 
-    for _, card in ipairs(getCardsInSecondarySlot(zone)) do
+    for _, card in ipairs(getCardsInSecondarySlot(zone, scene)) do
         addUniqueSecondaryCard(cards, seen, card)
     end
 
