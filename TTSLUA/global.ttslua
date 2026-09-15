@@ -317,11 +317,18 @@ function hudToggleHelp(player, value, id)
     applyHudPreferencesForColor(color)
 end
 
-function hudCloseHelp(player, value, id)
+-- Shared by every per-player HUD overlay's close button (help, scoring, rewind):
+-- each just clears its own settings flag and reapplies. flagName is a
+-- playerHudSettings key (e.g. "helpOverlayOpen"), not the overlay's UI id.
+function hudCloseOverlay(flagName, player, id)
     local color = getHudColorFromCallback(player, id)
     local settings = ensureHudSettings(color)
-    settings.helpOverlayOpen = false
+    settings[flagName] = false
     applyHudPreferencesForColor(color)
+end
+
+function hudCloseHelp(player, value, id)
+    hudCloseOverlay("helpOverlayOpen", player, id)
 end
 
 function hudToggleLock(player, value, id)
@@ -341,10 +348,7 @@ function hudToggleLock(player, value, id)
 end
 
 function hudCloseScoringOverlay(player, value, id)
-    local color = getHudColorFromCallback(player, id)
-    local settings = ensureHudSettings(color)
-    settings.scoringOverlayOpen = false
-    applyHudPreferencesForColor(color)
+    hudCloseOverlay("scoringOverlayOpen", player, id)
 end
 
 -- The "-" button beside the scoreboard's close button. Independent of the main

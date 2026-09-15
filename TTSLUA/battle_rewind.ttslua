@@ -569,14 +569,6 @@ function battleClearArmy(params)
     broadcastToAll(target .. " army registration cleared (" .. removed .. " model(s)).", {1, 0.6, 0.2})
 end
 
-function battleCounterValue(guid)
-    local o = getObjectFromGUID(guid or "")
-    if o == nil then return 0 end
-    local ok, v = pcall(function() return o.call("getValue") end)
-    if ok and v ~= nil then return tonumber(v) or 0 end
-    return 0
-end
-
 -- Scores for both sides in one call. NOTE: playerSum takes a plain number, so
 -- Object.call("playerSum", {1}) hands it the TABLE {1} and it errors indexing
 -- scores[pId] -- getMatchSummary is the supported entry point and calls
@@ -860,7 +852,7 @@ function recordBattleSnapshot(reason)
     local phases = sm.getTable("phases") or {}
     local phaseName = phases[phase] or ("Phase " .. tostring(phase))
 
-    local round = battleCounterValue(gameTurnCounter_GUID)
+    local round = currentBattleRound()
 
     local label = "Round " .. round .. ", " .. tostring(turn) .. " Turn"
     local okLbl, built = pcall(function() return sm.call("getTurnStateLabel") end)
@@ -923,12 +915,12 @@ function recordBattleSnapshot(reason)
         why  = reason or "phase",
         ts   = os.time(),
         vp   = battleScores(),
-        cp   = {r = battleCounterValue(redCPCounter_GUID),
-                b = battleCounterValue(blueCPCounter_GUID)},
+        cp   = {r = counterValue(getObjectFromGUID(redCPCounter_GUID)),
+                b = counterValue(getObjectFromGUID(blueCPCounter_GUID))},
         -- Per-side turn counters, so a rewind can rebuild getTurnStateLabel's
         -- "Round 2, Red Turn 3" exactly rather than guessing the turn number.
-        tc   = {r = battleCounterValue(redTurnCounter_GUID),
-                b = battleCounterValue(blueTurnCounter_GUID)},
+        tc   = {r = counterValue(getObjectFromGUID(redTurnCounter_GUID)),
+                b = counterValue(getObjectFromGUID(blueTurnCounter_GUID))},
         m    = m,
         dead = newDead,
         res  = reserves,
@@ -1228,9 +1220,8 @@ function battleRestoreState(snap)
     battleRewindLog("restoreState: r=" .. tostring(snap.r) .. " t=" .. tostring(snap.t) ..
                     " p=" .. tostring(snap.p))
     local function setCounter(guid, value)
-        local o = getObjectFromGUID(guid or "")
-        if o == nil or value == nil then return end
-        pcall(function() o.call("setValue", tonumber(value) or 0) end)
+        if value == nil then return end
+        counterSetValue(getObjectFromGUID(guid), tonumber(value) or 0)
     end
 
     if type(snap.cp) == "table" then
@@ -1901,10 +1892,7 @@ function battleOpenRewindOverlay(color)
 end
 
 function hudCloseRewind(player, value, id)
-    local color = getHudColorFromCallback(player, id)
-    local settings = ensureHudSettings(color)
-    settings.rewindOverlayOpen = false
-    applyHudPreferencesForColor(color)
+    hudCloseOverlay("rewindOverlayOpen", player, id)
 end
 
 function hudRewindRound(player, value, id)
