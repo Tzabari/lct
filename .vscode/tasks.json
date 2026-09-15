@@ -1,0 +1,94 @@
+{
+    // Terminal > Run Task... > "TTS: console"
+    //
+    // Runs scripts/tts_console.py, which listens on Tabletop Simulator's
+    // External Editor port and relays every print/log/error into the terminal.
+    // The problem matcher below turns the errors into Problems-panel entries
+    // pointing at the .ttslua source, because the console has already mapped
+    // the compiled Global line number back to the file it came from.
+    //
+    // Only one process can hold port 39998, so this and the VSCode
+    // "Tabletop Simulator Lua" extension's console cannot both run.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "TTS: console",
+            "type": "shell",
+            "command": "python",
+            "args": [
+                "scripts/tts_console.py"
+            ],
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "clear": true
+            },
+            "problemMatcher": {
+                "owner": "tts",
+                "source": "Tabletop Simulator",
+                "fileLocation": [
+                    "relative",
+                    "${workspaceFolder}"
+                ],
+                // The console prefixes each line with a timestamp and suffixes
+                // errors with the object's GUID; only the middle is matched.
+                "pattern": {
+                    "regexp": "^(?:\\d\\d:\\d\\d:\\d\\d\\s+)?(\\S+\\.ttslua):(\\d+):(\\d+):\\s+(error|warning):\\s+(.*?)\\s*(?:\\[[^\\]]*\\])?$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                },
+                // A listener never "finishes", so the watcher is told the task
+                // is active from the moment it prints its banner and never ends.
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^Listening for Tabletop Simulator",
+                    "endsPattern": "^__never__$"
+                }
+            }
+        },
+        {
+            "label": "TTS: build (test)",
+            "type": "shell",
+            "command": "python",
+            "args": [
+                "scripts/compile.py",
+                "--test"
+            ],
+            "options": {
+                "env": {
+                    "PYTHONIOENCODING": "utf-8"
+                }
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "TTS: tests",
+            "type": "shell",
+            "command": "python",
+            "args": [
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "scripts",
+                "-p",
+                "test_*.py"
+            ],
+            "group": "test",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        }
+    ]
+}
