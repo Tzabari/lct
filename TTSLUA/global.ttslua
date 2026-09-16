@@ -1132,7 +1132,7 @@ MISSION_PACK_PARIAH_NEXUS = 1
 -- Player-facing version + patch notes. The compiler rewrites these three lines
 -- on every build from CHANGELOG.md; the `@@LCT_...@@` markers must stay intact.
 -- Left as-is, an uncompiled / dev build simply shows "DEV".
---   GAME_VERSION : build stamp ("test", "test-<branch>", or the release version) - chat + save name
+--   GAME_VERSION : build stamp ("test" or the release version) - chat + save name
 --   GAME_PATCH   : latest CHANGELOG version - shown on the splash overlay
 --   GAME_CHANGELOG: latest CHANGELOG bullets - shown on the splash overlay
 GAME_VERSION = "DEV"   -- @@LCT_VERSION@@
@@ -1291,8 +1291,8 @@ end
 -- Short chat banner on load. A test build announces itself; a release build
 -- just states its patch. Patch notes live on the splash overlay, not chat.
 function announceVersion()
-    if GAME_VERSION == "test" or GAME_VERSION:match("^test%-") then
-        printToAll("LCT - TEST BUILD [" .. GAME_VERSION .. "] (Patch " .. patchNumber() .. ")", "Yellow")
+    if GAME_VERSION == "test" then
+        printToAll("LCT - TEST BUILD (Patch " .. patchNumber() .. ")", "Yellow")
     else
         printToAll("LCT - Patch " .. patchNumber(), "Yellow")
     end

@@ -496,20 +496,15 @@ and skipped. There is no card graveyard; see §D.
 
 # Part C: Dev branch (`feature/battle-rewind-v3-dev`) — implemented
 
-This branch mostly adds files. It also touches `compile.py` beyond the
-one-line companion entry (an unterminated-string check and the `--test`
-branch-tag resolver both need real logic, not just a file) and makes a 2-line
-`global.ttslua` edit so the "TEST BUILD" chat banner still fires for a
-branch-tagged version string. It is rebased onto the current feature branch
-after every feature commit and is never merged.
+This branch only adds files, plus one line in the companion list
+(`battleDebug.ttslua`). It is rebased onto the current feature branch after
+every feature commit and is never merged.
 
 | File | Purpose |
 |---|---|
 | `TTSLUA/battleDebug.ttslua` | Global companion, added to `GLOBAL_COMPANION_LUA`. Each function returns early unless `DEBUG` is set. `battleDebugDump(i)` prints a snapshot and its resolved state. `battleDebugCheckChain()` checks every base link and every resolve. `battleDebugSimulateDelete(guid)` deletes a model through the normal path (`destroyObject`). `battleDebugTimeCapture()` times a capture and a resolve with `os.clock()`. |
 | `scripts/tts_console.py`, `scripts/test_tts_console.py` | copied from `feature/battle-log`: an External Editor API console (ports 39998/39999) that maps error lines back to source files. `test_tts_console.py`'s two compiled-line-mapping tests were retargeted from `battle_rewind.ttslua`/`battleLogEncoded`/`battleLogTouch` (that branch's names) to this repo's `battleLog.ttslua`/`battleLogEncode`/`battleLogOnSave`. |
 | `.vscode/tasks.json` | copied from `feature/battle-log` unchanged: "TTS: console", "TTS: build (test)", "TTS: tests" |
-| `scripts/lua_strings.py` + a check in `compile.py` | copied unchanged; the compile.py check runs over `lua_files + companion_files` (so `battleLog.ttslua`/`battleDebug.ttslua` are covered) and fails the build on an unterminated string, since TTS otherwise drops the whole script silently |
-| `compile.py --branch` tagging | adapted from `feature/battle-log`: `get_git_branch`/`sanitize_version_tag` tag `--test` builds as `test-<branch>`, so the two worktrees don't overwrite each other's copy in the TTS saves folder; `global.ttslua`'s `announceVersion()` now matches `test-*` too |
 | `scripts/test_battle_log_rewind.py` | Static checks: the hooks exist, `onSave` does no encoding, there's no `Wait.repeat` polling, and the companion files contain no `!=`. Plus `lupa` (`lupa.lua52`) tests of `State.equals`, capture diffing, `battleLogResolve` and post-rewind branching against the real `battleLog.ttslua` source, run through a small pure-Lua JSON + TTS-API stub prelude; skipped when `lupa` isn't installed (`pip install lupa`). |
 | `README.md` | dev-only section on `tts_console.py`, marked as living only on this branch |
 

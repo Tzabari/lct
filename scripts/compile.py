@@ -4,7 +4,7 @@ Compiles TTSLUA scripts into the TTS JSON save file.
 
 Usage:
     python3 compile.py            # prompts for version, writes compiled JSON
-    python3 compile.py --test     # uses "test-<branch>" as version, copies to TTS saves folder
+    python3 compile.py --test     # uses "test" as version, copies to TTS saves folder
     python3 compile.py --release  # version + patch notes from CHANGELOG.md, copies to TTS saves folder
 """
 
@@ -15,14 +15,12 @@ import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))  # allow sibling imports when run from elsewhere
 import term
-import lua_strings
 import validate_maps
 
 # Warnings collected across the whole run so the closing summary can report them
@@ -138,31 +136,6 @@ def get_tts_saves_path() -> Path:
         return home / "Library" / "Tabletop Simulator" / "Saves"
     else:
         return home / ".local" / "share" / "Tabletop Simulator" / "Saves"
-
-
-def get_git_branch(repo_root: Path):
-    """Current branch name, or None if not a git repo, detached HEAD, or git
-    is unavailable. Lets --test tag its build per-branch, so two worktrees
-    (or two branches in one checkout) building at once don't overwrite each
-    other's builds/ output or TTS saves copy."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=repo_root, capture_output=True, text=True, check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    branch = result.stdout.strip()
-    if not branch or branch == "HEAD":  # detached HEAD
-        return None
-    return branch
-
-
-def sanitize_version_tag(tag: str) -> str:
-    """Collapse a branch name to a single safe path/version segment, e.g.
-    "feature/battle-rewind" -> "feature-battle-rewind" -- it flows into a
-    filename (builds/, the TTS saves copy) and a JSON string value alike."""
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", tag).strip("-")
 
 
 def inject_xml(json_lines: list, xml_file: Path):
@@ -553,7 +526,7 @@ def stamp_save_name(line: str, version: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Compile TTS Lua scripts into JSON.")
     parser.add_argument("--test", action="store_true",
-                        help="Tag as a 'test-<branch>' build and copy to TTS saves folder.")
+                        help="Tag as 'test' build and copy to TTS saves folder.")
     parser.add_argument("--release", action="store_true",
                         help="Take version and patch notes from CHANGELOG.md and copy to TTS saves folder.")
     parser.add_argument("--no-validate", action="store_true",
@@ -604,11 +577,7 @@ def main():
         warn(f"no '## vX.Y.Z' entry found in {CHANGELOG.name} — splash not updated.")
 
     if args.test:
-        branch = get_git_branch(SCRIPT_DIR.parent)
-        tag = sanitize_version_tag(branch) if branch else ""
-        version = f"test-{tag}" if tag else "test"
-        print(f"Test build tag: {version}"
-              + ("" if tag else " (branch name unavailable)"))
+        version = "test"
     elif args.release:
         if not patch:
             fail(f"--release needs a '## vX.Y.Z' entry at the top of {CHANGELOG.name}.")
@@ -620,19 +589,6 @@ def main():
 
     lua_files = collect_lua_files()
     companion_files = collect_global_companion_files()
-
-    # --- Reject unterminated string literals ---
-    # TTS only surfaces these at runtime ("unfinished string near ..."), and the
-    # affected object silently loses its whole script. Generic Lua parsers are not
-    # a reliable guard here, so check explicitly before anything is injected.
-    string_errors = []
-    for f in lua_files + companion_files:
-        for _, line_no, quote, snippet in lua_strings.check_file(f):
-            string_errors.append(f"{f.name}:{line_no}: unterminated {quote} string -> {snippet}")
-    if string_errors:
-        for err in string_errors:
-            print(f"  {err}")
-        fail(f"{len(string_errors)} unterminated string literal(s). Ending compilation.")
 
     # --- Extract GUIDs from each non-global lua file ---
     lua_guids = []  # [(guid_str, file_index), ...]
