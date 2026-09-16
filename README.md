@@ -141,7 +141,7 @@ legacy theme list/debug batch only when offline TTS-cache recovery is required.
 `LCT - Pack 1` remains a composite pack with fixed slots:
 
 - Layout 1: `lct - ice colony`
-- Layout 2: `lct - lava temple v2.1`
+- Layout 2: `lct - lava temple`
 - Layout 3: `lct - mars base`
 
 The DEBUG-gated `All BM`/`LCT P1` cache buttons and

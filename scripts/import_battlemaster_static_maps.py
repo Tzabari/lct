@@ -39,11 +39,11 @@ All-themes workflow (pairs with the debug "All BM" button):
 Composite LCT Pack 1 workflow (pairs with the debug "LCT P1" button):
   1. Click "LCT P1" and wait for all three themes to finish, then save once.
      The debug batch includes public community/pending themes and archives Ice
-     Colony, Lava Temple v2.1, and Mars Base independently.
+     Colony, Lava Temple, and Mars Base independently.
   2. Run this script with `--lct-pack-1`. It requires a complete 15-map slot
      from each archive, then composes one 45-map creator set:
        layout 1 -> LCT Ice Colony
-       layout 2 -> LCT Lava Temple v2.1
+       layout 2 -> LCT Lava Temple
        layout 3 -> LCT Mars Base
   3. Preview first, then rerun with `--write`. The write removes the old
      map_crt_lct1 set completely (cards, manifest rows, and obsolete payloads)
@@ -121,17 +121,17 @@ LCT_PACK_1_EXPECTED_PER_SLOT = 15
 LCT_PACK_1_SLOT_THEMES = [
     {
         "slot": 1,
-        "theme_id": "tts-theme-36235f46-c306-4738-b33d-cca12bee9cfc",
+        "theme_id": "tts-theme-6bec677d-1eb3-43e5-bb55-bc2f5f4d2b8b",
         "theme_name": "LCT - Ice Colony",
     },
     {
         "slot": 2,
-        "theme_id": "tts-theme-5d7d19f2-af5d-4c1c-b2b2-d839b3a8ea8f",
-        "theme_name": "LCT - Lava Temple v2.1",
+        "theme_id": "tts-theme-1d124ba8-f308-482e-9d7a-eae4e8e157c4",
+        "theme_name": "LCT - Lava Temple",
     },
     {
         "slot": 3,
-        "theme_id": "tts-theme-5933b001-4acd-453e-af37-acf01356429b",
+        "theme_id": "tts-theme-190bfe5c-c240-495d-bd21-59c55b67c2ec",
         "theme_name": "LCT - Mars Base",
     },
 ]

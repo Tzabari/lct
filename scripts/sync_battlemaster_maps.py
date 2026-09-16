@@ -104,9 +104,9 @@ PACKS: dict[str, PackSpec] = {
         "map_crt_lct1",
         "LCT - Pack 1",
         (
-            ThemeSlice("tts-theme-36235f46-c306-4738-b33d-cca12bee9cfc", (1,), "LCT - Ice Colony"),
-            ThemeSlice("tts-theme-5d7d19f2-af5d-4c1c-b2b2-d839b3a8ea8f", (2,), "LCT - Lava Temple v2.1"),
-            ThemeSlice("tts-theme-5933b001-4acd-453e-af37-acf01356429b", (3,), "LCT - Mars Base"),
+            ThemeSlice("tts-theme-6bec677d-1eb3-43e5-bb55-bc2f5f4d2b8b", (1,), "LCT - Ice Colony"),
+            ThemeSlice("tts-theme-1d124ba8-f308-482e-9d7a-eae4e8e157c4", (2,), "LCT - Lava Temple"),
+            ThemeSlice("tts-theme-190bfe5c-c240-495d-bd21-59c55b67c2ec", (3,), "LCT - Mars Base"),
         ),
         footprint_profile=reconstruction.FOOTPRINT_PROFILE_LCT,
         include_in_battlemaster_batch=False,
