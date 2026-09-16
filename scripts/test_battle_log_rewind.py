@@ -358,12 +358,18 @@ function spawnObjectJSON(params)
         SPAWN_FORCE_RENAME[guid] = nil
         guid = guid .. "_dup"
     end
+    -- position/rotation are overrides on top of whatever Transform is baked
+    -- into the JSON, mirroring the real spawnObjectJSON API -- the graveyard
+    -- redesign relies on these, not the JSON's own Transform, to place a
+    -- respawned model.
+    local pos = params.position or {x = decoded.Transform.posX, y = decoded.Transform.posY, z = decoded.Transform.posZ}
+    local rot = params.rotation or {x = decoded.Transform.rotX, y = decoded.Transform.rotY, z = decoded.Transform.rotZ}
     local obj = {
         getGUID = function() return guid end,
         getName = function() return decoded.Nickname or "" end,
         setName = function() end,
-        getPosition = function() return {x = decoded.Transform.posX, y = decoded.Transform.posY, z = decoded.Transform.posZ} end,
-        getRotation = function() return {x = decoded.Transform.rotX, y = decoded.Transform.rotY, z = decoded.Transform.rotZ} end,
+        getPosition = function() return pos end,
+        getRotation = function() return rot end,
         setLock = function() end,
         setPosition = function() end,
         setRotation = function() end,
@@ -450,7 +456,7 @@ class RegisteredObjectSetStateTest(unittest.TestCase):
 
 @unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
 class GraveyardRoundTripTest(unittest.TestCase):
-    """Delete stores a slim, pooled entry; a rewind respawns from it on demand."""
+    """Delete stores the raw getJSON() string untouched; a rewind respawns from it on demand."""
 
     def setUp(self):
         self.rt = make_rewind_runtime()
@@ -474,28 +480,33 @@ class GraveyardRoundTripTest(unittest.TestCase):
             FAKE_OBJECTS["%(guid)s"] = nil
         ''' % {"guid": guid})
 
-    def test_destroy_stores_a_slim_pooled_entry(self):
+    def test_destroy_stores_the_raw_json_untouched(self):
         self._register_and_destroy()
-        is_pooled, pooled_script = self.rt.execute('''
-            local id = battleRewindGrave["m1"].LuaScript
-            return type(id) == "number", battleRewindPoolList[id]
+        is_string, decoded_script, decoded_guid = self.rt.execute('''
+            local raw = battleRewindGrave["m1"]
+            local decoded = JSON.decode(raw)
+            return type(raw) == "string", decoded.LuaScript, decoded.GUID
         ''')
-        self.assertTrue(is_pooled, "long fields must be replaced with a pool id, not stored inline")
-        self.assertEqual(pooled_script, "print(1)")
+        self.assertTrue(is_string, "the raw getJSON() string must be stored as-is, never decoded")
+        self.assertEqual(decoded_script, "print(1)")
+        self.assertEqual(decoded_guid, "m1")
 
     def test_save_and_load_round_trip_preserves_the_graveyard(self):
         self._register_and_destroy()
         saved = self.rt.execute('return battleRewindOnSave()')
         self.rt.globals()["_SAVED_BLOB"] = saved
+        no_pool_key = self.rt.execute('return JSON.decode(_SAVED_BLOB).pool == nil')
+        self.assertTrue(no_pool_key, "the new design has no separate pool key in the save blob")
         self.rt.execute('''
             battleRewindOnLoad(JSON.decode(_SAVED_BLOB))
         ''')
-        entry_present, script = self.rt.execute('''
-            local e = battleRewindGrave["m1"]
-            return e ~= nil, e and battleRewindPoolList[e.LuaScript]
+        entry_present, decoded_script = self.rt.execute('''
+            local raw = battleRewindGrave["m1"]
+            local decoded = raw and JSON.decode(raw)
+            return raw ~= nil, decoded and decoded.LuaScript
         ''')
         self.assertTrue(entry_present)
-        self.assertEqual(script, "print(1)")
+        self.assertEqual(decoded_script, "print(1)")
 
     def test_a_rewind_to_alive_respawns_the_model_at_the_target(self):
         self._register_and_destroy()
