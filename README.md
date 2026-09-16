@@ -8,12 +8,36 @@ Run the compiler from the `scripts` folder:
 
 ```bash
 python3 compile.py             # prompt for a version, write the compiled JSON
-python3 compile.py --test      # tag as "test", copy to your TTS saves folder
+python3 compile.py --test      # tag as "test-<branch>", copy to your TTS saves folder
 python3 compile.py --release   # version + patch notes from CHANGELOG.md, then copy
 python3 compile.py --no-validate   # skip the map-card validation gate
 ```
 
 `compile.py` stitches `TTSLUA/*.ttslua` back into `TTSJSON/ftc_base.json`, stamps the version, and writes `lct_base_<version>_compiled.json` into `builds/`, printing a build summary at the end.
+
+### Errors in your editor (`tts_console.py`)
+
+Tabletop Simulator's External Editor API always listens on port 39999 for commands and pushes every `print()`, `log()` and script error to whatever is listening on 39998 — no in-game setting to turn on. `tts_console.py` sits on that second port:
+
+```bash
+python3 scripts/tts_console.py                       # relay errors + prints (ctrl-c to stop)
+python3 scripts/tts_console.py -e "print(#getAllObjects())"   # run Lua in the live game
+python3 scripts/tts_console.py --raw                 # also dump each message's JSON
+```
+
+The reason to prefer it over reading TTS's own chat log is the location. TTS reports an error against the **compiled** Global script — one ~10k-line blob that `compile.py` assembles from `global.ttslua` plus its companions, with the version stamp and `MAP_INDEX` baked in — so `chunk_3:(8214,9)` names a line that exists in no file on disk. The console maps it back and prints
+
+```
+TTSLUA/battleLog.ttslua:412:9: error: attempt to index a nil value  [Global]
+```
+
+which VSCode's terminal turns into a clickable link. It does this by matching line *text* against the sources, not by tracking the build's offsets, so it keeps working when the build is a few edits behind. Object scripts are injected verbatim, so their line numbers need no mapping — only the GUID on the file's first line, which is where `compile.py` reads it from too.
+
+In VSCode, **Terminal → Run Task… → "TTS: console"** runs it with a problem matcher, so the errors also land in the Problems panel. (`.vscode/tasks.json` also has "TTS: build (test)" and "TTS: tests".) If the Problems panel stays empty while the terminal shows errors, run it with `NO_COLOR=1`.
+
+This is the same connection the Atom plugin and the VSCode "Tabletop Simulator Lua" extension use — without the rest of the plugin, which wants to own the script files and push them back with Save & Play. That is `compile.py`'s job here. **Only one process can hold port 39998**, so the extension's console and this cannot both run.
+
+This whole section, `battleDebug.ttslua`, and `test_battle_log_rewind.py` live only on `feature/battle-rewind-v3-dev` (see `docs/battle-log-rewind-architecture.md` Part C) and are never merged upstream.
 
 ### Map terrain payloads (`data/maps/`)
 

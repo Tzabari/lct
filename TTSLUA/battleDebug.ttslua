@@ -1,0 +1,79 @@
+-- Battle Log/Rewind debug tools: Global companion, dev branch only (never
+-- merged -- see docs/battle-log-rewind-architecture.md Part C). Every
+-- function here returns immediately unless DEBUG is set, so a --release
+-- build (which bakes DEBUG = false) can still include this file harmlessly
+-- if it's ever left in by mistake.
+
+-- Prints snapshot i (or the current base if i is nil) and its resolved state.
+function battleDebugDump(i)
+    if not DEBUG then return end
+    i = i or battleLog.base
+    local snap = battleLog.snaps[i]
+    if not snap then
+        print("battleDebugDump: no snapshot " .. tostring(i))
+        return
+    end
+    print("snapshot " .. i .. " tag=" .. tostring(snap.tag) .. " base=" .. tostring(snap.b)
+        .. " key=" .. JSON.encode(snap.k))
+    print("  parts stored: " .. JSON.encode(snap.parts))
+    local resolved = battleLogResolve(i)
+    print("  resolved: turn=" .. JSON.encode(resolved.turn) .. " cp=" .. JSON.encode(resolved.cp))
+    local objCount = 0
+    for _ in pairs(resolved.objs) do objCount = objCount + 1 end
+    print("  resolved objs: " .. objCount .. " / registered " .. (function()
+        local n = 0
+        for _ in pairs(battleLogRegistry) do n = n + 1 end
+        return n
+    end)())
+end
+
+-- Walks every snapshot's base link and calls battleLogResolve on each,
+-- reporting the first broken link or resolve error found (if any).
+function battleDebugCheckChain()
+    if not DEBUG then return end
+    local checked, broken = 0, 0
+    for i, snap in ipairs(battleLog.snaps) do
+        checked = checked + 1
+        if snap.b ~= nil and battleLog.snaps[snap.b] == nil then
+            broken = broken + 1
+            print("battleDebugCheckChain: snapshot " .. i .. " points at missing base " .. tostring(snap.b))
+        end
+        local ok, err = pcall(battleLogResolve, i)
+        if not ok then
+            broken = broken + 1
+            print("battleDebugCheckChain: resolve(" .. i .. ") failed: " .. tostring(err))
+        end
+    end
+    print("battleDebugCheckChain: " .. checked .. " snapshot(s) checked, " .. broken .. " problem(s)")
+end
+
+-- Deletes a registered model through the same path a real delete takes
+-- (destroyObject -> onObjectDestroy -> battleLogOnDestroy), for exercising
+-- the off-field/graveyard path without leaving your seat.
+function battleDebugSimulateDelete(guid)
+    if not DEBUG then return end
+    local obj = getObjectFromGUID(guid)
+    if not obj then
+        print("battleDebugSimulateDelete: no object " .. tostring(guid))
+        return
+    end
+    if not battleLogRegistry[guid] then
+        print("battleDebugSimulateDelete: " .. guid .. " is not a registered model")
+        return
+    end
+    destroyObject(obj)
+    print("battleDebugSimulateDelete: destroyed " .. guid)
+end
+
+-- Times one capture and one resolve of the current base, for checking the
+-- "no hitches during play" requirement against a real, populated log.
+function battleDebugTimeCapture()
+    if not DEBUG then return end
+    local t0 = os.clock()
+    battleLogCapture("phase")
+    local t1 = os.clock()
+    battleLogResolve(battleLog.base)
+    local t2 = os.clock()
+    print(string.format("battleDebugTimeCapture: capture %.1fms, resolve %.1fms",
+        (t1 - t0) * 1000, (t2 - t1) * 1000))
+end
