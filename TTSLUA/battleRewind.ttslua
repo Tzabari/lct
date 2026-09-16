@@ -55,29 +55,63 @@ battleRewindDestroyQueue = {}
 function battleRewindOnDestroy(obj)
     local guid = obj.getGUID()
     if not battleLogRegistry[guid] then return end
+    local t0 = DEBUG and os.clock() or nil
     local ok, json = pcall(function() return obj.getJSON() end)
+    if DEBUG then
+        print(string.format("[battleRewindOnDestroy] %s getJSON() = %.1fms, %d bytes, ok=%s",
+            tostring(guid), (os.clock() - t0) * 1000, ok and #json or -1, tostring(ok)))
+    end
     if not ok or type(json) ~= "string" then return end
-    battleRewindDestroyQueue[#battleRewindDestroyQueue + 1] = {guid = guid, json = json}
+    battleRewindDestroyQueue[#battleRewindDestroyQueue + 1] = {guid = guid, json = json, queuedAt = DEBUG and os.clock() or nil}
     if #battleRewindDestroyQueue == 1 then
         Wait.frames(battleRewindProcessDestroyQueue, 1)
     end
 end
 
 function battleRewindStoreDestroyedEntry(guid, json)
+    local t0 = DEBUG and os.clock() or nil
     local ok, decoded = pcall(function() return JSON.decode(json) end)
-    if not ok or type(decoded) ~= "table" then return end
+    local tDecode = DEBUG and os.clock() or nil
+    if not ok or type(decoded) ~= "table" then
+        if DEBUG then
+            print(string.format("[battleRewindStoreDestroyedEntry] %s JSON.decode FAILED after %.1fms: %s",
+                tostring(guid), (tDecode - t0) * 1000, tostring(decoded)))
+        end
+        return
+    end
     local entry = {}
     for k, v in pairs(decoded) do entry[k] = v end
+    local tCopy = DEBUG and os.clock() or nil
     for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
         entry[field] = battleRewindPoolRef(entry[field])
     end
+    local tPool = DEBUG and os.clock() or nil
     battleRewindGrave[guid] = entry
     battleRewindGraveCache[guid] = JSON.encode(entry)
+    if DEBUG then
+        local tEncode = os.clock()
+        print(string.format(
+            "[battleRewindStoreDestroyedEntry] %s total=%.1fms (decode=%.1fms, copy=%.1fms, pool=%.1fms, encode=%.1fms), %d bytes in",
+            tostring(guid), (tEncode - t0) * 1000,
+            (tDecode - t0) * 1000, (tCopy - tDecode) * 1000, (tPool - tCopy) * 1000, (tEncode - tPool) * 1000,
+            #json))
+    end
 end
 
 function battleRewindProcessDestroyQueue()
     local item = table.remove(battleRewindDestroyQueue, 1)
-    if item then battleRewindStoreDestroyedEntry(item.guid, item.json) end
+    if item then
+        if DEBUG then
+            print(string.format("[battleRewindProcessDestroyQueue] %s waited %.1fms since queued, %d item(s) left after this one",
+                tostring(item.guid), (os.clock() - (item.queuedAt or os.clock())) * 1000, #battleRewindDestroyQueue))
+        end
+        local t0 = DEBUG and os.clock() or nil
+        battleRewindStoreDestroyedEntry(item.guid, item.json)
+        if DEBUG then
+            print(string.format("[battleRewindProcessDestroyQueue] %s storeDestroyedEntry call returned after %.1fms",
+                tostring(item.guid), (os.clock() - t0) * 1000))
+        end
+    end
     if #battleRewindDestroyQueue > 0 then
         Wait.frames(battleRewindProcessDestroyQueue, 1)
     end
@@ -426,6 +460,16 @@ function battleRewindCollectColorCandidates(scene, color)
         if deck.tag == "Card" then addLoose(deck) else addDeck(deck) end
     end
 
+    if DEBUG then
+        local names, total = {}, 0
+        for n, list in pairs(byName) do
+            names[#names + 1] = n .. "x" .. #list
+            total = total + #list
+        end
+        print(string.format("[battleRewindCollectColorCandidates] %s: %d name(s), %d candidate(s): %s",
+            color, #names, total, table.concat(names, ", ")))
+    end
+
     return byName
 end
 
@@ -433,7 +477,12 @@ end
 -- later slot nor the discard/deck sweep can also claim it.
 function battleRewindNearestSecondaryCandidate(candidates, name, near)
     local list = candidates[name]
-    if type(list) ~= "table" or #list == 0 then return nil end
+    if type(list) ~= "table" or #list == 0 then
+        if DEBUG then
+            print(string.format("[battleRewindNearestSecondaryCandidate] %s: no candidate left (pool empty or never had one)", tostring(name)))
+        end
+        return nil
+    end
     local bestIdx, bestScore = nil, nil
     for i, cand in ipairs(list) do
         local p = cand.pos or near
@@ -443,19 +492,29 @@ function battleRewindNearestSecondaryCandidate(candidates, name, near)
         if cand.deck ~= nil then score = score + 1e6 end
         if bestScore == nil or score < bestScore then bestScore, bestIdx = score, i end
     end
+    local remainingBefore = #list
     local chosen = table.remove(list, bestIdx)
     if #list == 0 then candidates[name] = nil end
+    if DEBUG then
+        print(string.format("[battleRewindNearestSecondaryCandidate] %s: picked %s of %d candidate(s), %d left",
+            tostring(name), tostring(chosen.obj and chosen.obj.getGUID() or chosen.guid), remainingBefore, #list))
+    end
     return chosen
 end
 
 local function battleRewindTakeCandidateTo(candidates, name, target, rot, wantFaceDown, missing, label, onPlaced)
     local hit = battleRewindNearestSecondaryCandidate(candidates, name, target)
     if hit == nil then
+        if DEBUG then print("[battleRewindTakeCandidateTo] MISSING: " .. tostring(label)) end
         missing[#missing + 1] = label
         return
     end
     if hit.obj ~= nil then
         local found = hit.obj
+        if DEBUG then
+            print(string.format("[battleRewindTakeCandidateTo] %s: placing loose obj %s (path=obj)",
+                tostring(label), tostring(found.getGUID())))
+        end
         pcall(function()
             found.locked = false
             found.setPosition(target)
@@ -475,6 +534,10 @@ local function battleRewindTakeCandidateTo(candidates, name, target, rot, wantFa
     local liveDeck = hit.deckGuid and getObjectFromGUID(hit.deckGuid) or nil
     local stillADeck = liveDeck ~= nil and (liveDeck.tag == "Deck" or liveDeck.type == "Deck")
     if stillADeck then
+        if DEBUG then
+            print(string.format("[battleRewindTakeCandidateTo] %s: taking %s from deck %s (path=deck)",
+                tostring(label), tostring(hit.guid), tostring(hit.deckGuid)))
+        end
         liveDeck.takeObject({
             guid = hit.guid, position = target, rotation = rot, smooth = false,
             callback_function = function(card)
@@ -497,6 +560,10 @@ local function battleRewindTakeCandidateTo(candidates, name, target, rot, wantFa
     -- under its own GUID, not inside a container takeObject can reach.
     local lone = getObjectFromGUID(hit.guid)
     if lone ~= nil then
+        if DEBUG then
+            print(string.format("[battleRewindTakeCandidateTo] %s: deck collapsed, using lone card %s (path=lone)",
+                tostring(label), tostring(hit.guid)))
+        end
         pcall(function()
             lone.locked = false
             lone.setPosition(target)
@@ -512,6 +579,10 @@ local function battleRewindTakeCandidateTo(candidates, name, target, rot, wantFa
             end, 20)
         end
     else
+        if DEBUG then
+            print(string.format("[battleRewindTakeCandidateTo] MISSING: %s (deck %s collapsed and lone %s not found either)",
+                tostring(label), tostring(hit.deckGuid), tostring(hit.guid)))
+        end
         missing[#missing + 1] = label
     end
 end
@@ -525,6 +596,12 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
         if zone == nil then return end
         local target = getSecondarySlotCardPosition(zone)
         local occupants = getCardsInSecondarySlotForColor(job.color, job.index, zone)
+        if DEBUG then
+            local occNames = {}
+            for _, o in ipairs(occupants) do occNames[#occNames + 1] = tostring(o.getGUID()) end
+            print(string.format("[battleRewindSecondaryStep] slot %s/%d: wants %s, %d occupant(s) [%s]",
+                job.color, job.index, tostring(job.entry and job.entry.n), #occupants, table.concat(occNames, ", ")))
+        end
         if job.entry == nil then
             for _, o in ipairs(occupants) do
                 pcall(function()
@@ -549,6 +626,9 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
                     end
                 end
             end
+        end
+        if DEBUG then
+            print(string.format("[battleRewindSecondaryStep] slot %s/%d: keepGuid=%s", job.color, job.index, tostring(keepGuid)))
         end
         for _, o in ipairs(occupants) do
             if o.getGUID() ~= keepGuid then
@@ -604,6 +684,12 @@ function setSecondariesState(sec, done)
             candidatesByColor[color] = battleRewindCollectColorCandidates(scene, color)
             local wantedSlot = {}
             for i, entry in pairs(side.slots or {}) do wantedSlot[tonumber(i) or i] = entry end
+            if DEBUG then
+                local slotNames = {}
+                for idx = 1, 8 do slotNames[#slotNames + 1] = idx .. "=" .. tostring(wantedSlot[idx] and wantedSlot[idx].n) end
+                print(string.format("[setSecondariesState] %s target: slots {%s}, discard {%s}",
+                    color, table.concat(slotNames, ", "), table.concat(side.discard or {}, ", ")))
+            end
             for index = 1, 8 do
                 queue[#queue + 1] = {kind = "slot", color = color, index = index, entry = wantedSlot[index]}
             end
@@ -623,6 +709,10 @@ function setSecondariesState(sec, done)
                 local side = sec[color]
                 if type(side) == "table" then discardedCardTurns[color] = side.turns or {} end
             end
+            if DEBUG then
+                print(string.format("[setSecondariesState] done: %d job(s) processed, %d missing (%s)",
+                    #queue, #missing, table.concat(missing, ", ")))
+            end
             if #missing > 0 then
                 broadcastToAll("Rewind: could not find secondary card(s): " .. table.concat(missing, ", "), {1, 0.6, 0.2})
             end
@@ -631,6 +721,11 @@ function setSecondariesState(sec, done)
         end
         local job = queue[i]
         i = i + 1
+        if DEBUG then
+            print(string.format("[setSecondariesState] job %d/%d: kind=%s color=%s index=%s name=%s",
+                i - 1, #queue, tostring(job.kind), tostring(job.color), tostring(job.index),
+                tostring(job.name or (job.entry and job.entry.n))))
+        end
         local ok, err = pcall(battleRewindSecondaryStep, job, candidatesByColor, missing)
         if not ok then missing[#missing + 1] = tostring(job.color) .. ": " .. tostring(err) end
         Wait.frames(step, 1)
