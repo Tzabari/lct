@@ -90,3 +90,31 @@ function battleDebugTimeCapture()
     print(string.format("battleDebugTimeCapture: capture %.1fms, resolve %.1fms",
         (t1 - t0) * 1000, (t2 - t1) * 1000))
 end
+
+-- Times obj.clone() on a live object, for weighing a clone-based graveyard
+-- against the raw-JSON one currently in place (see docs/battle-log-rewind-
+-- architecture.md B4) -- clone() still has to materialize a full duplicate
+-- object, which is the same costly step that made JSON.decode freeze the
+-- game on delete, just moved to a different API. Destroys the clone right
+-- after timing it, so nothing is left in the scene.
+function battleDebugTimeClone(guid)
+    if not DEBUG then return end
+    local obj = getObjectFromGUID(guid)
+    if not obj then
+        print("battleDebugTimeClone: no object " .. tostring(guid))
+        return
+    end
+    local pos = obj.getPosition()
+    local t0 = os.clock()
+    local ok, clone = pcall(function()
+        return obj.clone({position = {x = pos.x, y = pos.y + 30, z = pos.z}})
+    end)
+    local elapsed = (os.clock() - t0) * 1000
+    if not ok or clone == nil then
+        print(string.format("battleDebugTimeClone: %s clone() failed after %.1fms: %s",
+            tostring(guid), elapsed, tostring(clone)))
+        return
+    end
+    print(string.format("battleDebugTimeClone: %s clone() = %.1fms", tostring(guid), elapsed))
+    Wait.frames(function() pcall(function() destroyObject(clone) end) end, 1)
+end
