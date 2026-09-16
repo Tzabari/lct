@@ -316,5 +316,376 @@ class ResolveAndBranchingTest(unittest.TestCase):
         self.assertEqual(a_x_on_old_3, 2, "the old, abandoned snapshot 3 must still resolve correctly")
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 (battleRewind.ttslua): extends the stub with just what that file
+# needs beyond battleLog.ttslua's own prelude -- HUD calls are recorded into
+# HUD_LOG instead of touching real UI, and spawnObjectJSON is a synchronous
+# stand-in (SPAWN_FORCE_RENAME lets a test force the "GUID already taken"
+# branch without needing a second live object at the same GUID).
+# ---------------------------------------------------------------------------
+STUB_PRELUDE_REWIND_EXTRA = r"""
+HUD_LOG = {}
+playerHudSettings = {}
+function ensureHudSettings(color)
+    if color ~= "Red" and color ~= "Blue" and color ~= "Grey" then color = "Blue" end
+    playerHudSettings[color] = playerHudSettings[color] or {}
+    return playerHudSettings[color]
+end
+function getHudColorFromCallback(player, id)
+    if id then
+        local fromId = string.match(id, "^(Red)Hud_") or string.match(id, "^(Blue)Hud_") or string.match(id, "^(Grey)Hud_")
+        if fromId then return fromId end
+    end
+    if player == "Red" or player == "Blue" or player == "Grey" then return player end
+    return "Blue"
+end
+function setHudAttribute(params) HUD_LOG[#HUD_LOG + 1] = {kind = "attr", id = params.id} end
+function setHudValue(params) HUD_LOG[#HUD_LOG + 1] = {kind = "value", id = params.id} end
+function applyHudPreferencesForColor(color) HUD_LOG[#HUD_LOG + 1] = {kind = "apply", color = color} end
+function refreshScoringOverlay() HUD_LOG[#HUD_LOG + 1] = {kind = "scoring"} end
+
+function counterSetValue(counter, value)
+    if not counter then return 0 end
+    counter.value = value
+    return value
+end
+
+SPAWN_FORCE_RENAME = {}
+function spawnObjectJSON(params)
+    local decoded = JSON.decode(params.json)
+    local guid = decoded.GUID
+    if SPAWN_FORCE_RENAME[guid] then
+        SPAWN_FORCE_RENAME[guid] = nil
+        guid = guid .. "_dup"
+    end
+    local obj = {
+        getGUID = function() return guid end,
+        getName = function() return decoded.Nickname or "" end,
+        setName = function() end,
+        getPosition = function() return {x = decoded.Transform.posX, y = decoded.Transform.posY, z = decoded.Transform.posZ} end,
+        getRotation = function() return {x = decoded.Transform.rotX, y = decoded.Transform.rotY, z = decoded.Transform.rotZ} end,
+        setLock = function() end,
+        setPosition = function() end,
+        setRotation = function() end,
+        setVelocity = function() end,
+        setAngularVelocity = function() end,
+    }
+    FAKE_OBJECTS[guid] = obj
+    if params.callback_function then params.callback_function(obj) end
+end
+"""
+
+
+def make_rewind_runtime():
+    rt = lua52.LuaRuntime(unpack_returned_tuples=True)
+    rt.execute(STUB_PRELUDE)
+    rt.execute(STUB_PRELUDE_REWIND_EXTRA)
+    rt.execute((LUA_DIR / "battleLog.ttslua").read_text(encoding="utf-8"))
+    rt.execute((LUA_DIR / "battleRewind.ttslua").read_text(encoding="utf-8"))
+    return rt
+
+
+@unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
+class RegisteredObjectSetStateTest(unittest.TestCase):
+    """RegisteredObject:setState, added to battleLog's class by battleRewind.ttslua."""
+
+    def setUp(self):
+        self.rt = make_rewind_runtime()
+        self.rt.execute('''
+            local function makeModel(name0)
+                local t = {_pos = {x=0,y=0,z=0}, _rot = {x=0,y=0,z=0}, _locked = false,
+                           _name = name0, interactable = true}
+                t.getPosition = function() return t._pos end
+                t.getRotation = function() return t._rot end
+                t.getName = function() return t._name end
+                t.getGUID = function() return "m1" end
+                t.setLock = function(v) t._locked = v end
+                t.setPosition = function(p) t._pos = p end
+                t.setRotation = function(r) t._rot = r end
+                t.setVelocity = function() end
+                t.setAngularVelocity = function() end
+                t.setName = function(n) t._name = n end
+                return t
+            end
+            FAKE_OBJECTS["m1"] = makeModel("Model")
+            battleLogRegistry = {m1 = RegisteredObject.new("m1", "Red")}
+        ''')
+
+    def test_move_teleports_and_queues_for_unlock(self):
+        x, ry, locked_during_move, interactable, off, queued = self.rt.execute('''
+            local ro = battleLogRegistry.m1
+            ro:setState(State.new({x=5, y=0, z=1, rx=0, ry=90, rz=0, name="Model"}))
+            local obj = FAKE_OBJECTS["m1"]
+            return obj._pos.x, obj._rot.y, obj._locked, obj.interactable, ro.off, #battleRewindUnlockQueue
+        ''')
+        self.assertEqual(x, 5)
+        self.assertEqual(ry, 90)
+        self.assertTrue(locked_during_move, "locked for the move itself, so it can't push/topple anything "
+            "mid-restore; only setRegisteredObjectsState's batch-end pass unlocks it")
+        self.assertTrue(interactable)
+        self.assertFalse(off)
+        self.assertEqual(queued, 1, "must be queued so the batch-end pass can unlock it")
+
+    def test_unlock_queue_is_drained_once_the_whole_batch_settles(self):
+        locked_after_drain = self.rt.execute('''
+            local ro = battleLogRegistry.m1
+            setRegisteredObjectsState({m1 = State.new({x=5, y=0, z=1, rx=0, ry=90, rz=0, name="Model"}):encode()})
+            return FAKE_OBJECTS["m1"]._locked
+        ''')
+        self.assertFalse(locked_after_drain)
+
+    def test_park_locks_and_hides_the_model_under_the_table(self):
+        park_y = self.rt.execute('return BATTLE_REWIND_PARK_Y')
+        y, locked, interactable, off = self.rt.execute('''
+            local ro = battleLogRegistry.m1
+            ro:setState(State.new({x=0, y=0, z=0, rx=0, ry=0, rz=0, name="Model", off=true}))
+            local obj = FAKE_OBJECTS["m1"]
+            return obj._pos.y, obj._locked, obj.interactable, ro.off
+        ''')
+        self.assertEqual(y, park_y)
+        self.assertTrue(locked)
+        self.assertFalse(interactable)
+        self.assertTrue(off)
+
+
+@unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
+class GraveyardRoundTripTest(unittest.TestCase):
+    """Delete stores a slim, pooled entry; a rewind respawns from it on demand."""
+
+    def setUp(self):
+        self.rt = make_rewind_runtime()
+
+    def _register_and_destroy(self, guid="m1"):
+        self.rt.execute('''
+            FAKE_OBJECTS["%(guid)s"] = {
+                getGUID = function() return "%(guid)s" end,
+                getJSON = function()
+                    return JSON.encode({
+                        GUID = "%(guid)s", Nickname = "Bob",
+                        LuaScript = "print(1)", LuaScriptState = "{}", XmlUI = "", Description = "d",
+                        Transform = {posX=1,posY=2,posZ=3,rotX=0,rotY=90,rotZ=0,scaleX=1,scaleY=1,scaleZ=1},
+                        Locked = false,
+                    })
+                end,
+            }
+            battleLogRegistry = battleLogRegistry or {}
+            battleLogRegistry["%(guid)s"] = RegisteredObject.new("%(guid)s", "Red")
+            battleRewindOnDestroy(FAKE_OBJECTS["%(guid)s"])
+            FAKE_OBJECTS["%(guid)s"] = nil
+        ''' % {"guid": guid})
+
+    def test_destroy_stores_a_slim_pooled_entry(self):
+        self._register_and_destroy()
+        is_pooled, pooled_script = self.rt.execute('''
+            local id = battleRewindGrave["m1"].LuaScript
+            return type(id) == "number", battleRewindPoolList[id]
+        ''')
+        self.assertTrue(is_pooled, "long fields must be replaced with a pool id, not stored inline")
+        self.assertEqual(pooled_script, "print(1)")
+
+    def test_save_and_load_round_trip_preserves_the_graveyard(self):
+        self._register_and_destroy()
+        saved = self.rt.execute('return battleRewindOnSave()')
+        self.rt.globals()["_SAVED_BLOB"] = saved
+        self.rt.execute('''
+            battleRewindOnLoad(JSON.decode(_SAVED_BLOB))
+        ''')
+        entry_present, script = self.rt.execute('''
+            local e = battleRewindGrave["m1"]
+            return e ~= nil, e and battleRewindPoolList[e.LuaScript]
+        ''')
+        self.assertTrue(entry_present)
+        self.assertEqual(script, "print(1)")
+
+    def test_a_rewind_to_alive_respawns_the_model_at_the_target(self):
+        self._register_and_destroy()
+        self.rt.execute('''
+            local ro = battleLogRegistry["m1"]
+            ro:setState(State.new({x=9, y=1, z=2, rx=0, ry=0, rz=0, name="Bob"}))
+        ''')
+        x, off, grave_gone, nickname = self.rt.execute('''
+            local ro = battleLogRegistry["m1"]
+            local obj = FAKE_OBJECTS["m1"]
+            return obj.getPosition().x, ro.off, battleRewindGrave["m1"] == nil, obj.getName()
+        ''')
+        self.assertEqual(x, 9)
+        self.assertFalse(off)
+        self.assertTrue(grave_gone, "the graveyard entry must be consumed once the model is back")
+        self.assertEqual(nickname, "Bob")
+
+    def test_a_guid_already_taken_at_respawn_rekeys_the_registry_and_army_list(self):
+        self._register_and_destroy()
+        self.rt.execute('''
+            battleLog.army = {Red = {"m1"}, Blue = {}}
+            SPAWN_FORCE_RENAME["m1"] = true
+            local ro = battleLogRegistry["m1"]
+            ro:setState(State.new({x=0, y=0, z=0, rx=0, ry=0, rz=0, name="Bob"}))
+        ''')
+        new_ro_present, old_removed, guid_field, army_red0, grave_moved = self.rt.execute('''
+            return battleLogRegistry["m1_dup"] ~= nil, battleLogRegistry["m1"] == nil,
+                   battleLogRegistry["m1_dup"] and battleLogRegistry["m1_dup"].guid,
+                   battleLog.army.Red[1], battleRewindGrave["m1_dup"] ~= nil
+        ''')
+        self.assertTrue(new_ro_present, "the registry must gain an entry at the new GUID")
+        self.assertTrue(old_removed, "the old GUID must be dropped from the registry")
+        self.assertEqual(guid_field, "m1_dup")
+        self.assertEqual(army_red0, "m1_dup", "the army list must be re-keyed too")
+        self.assertTrue(grave_moved, "the graveyard entry must follow the GUID, not be lost")
+
+
+@unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
+class BattleRewindCheckMapTest(unittest.TestCase):
+    def setUp(self):
+        self.rt = make_rewind_runtime()
+
+    def test_no_recorded_map_always_passes(self):
+        self.assertTrue(self.rt.execute('battleLog.map = nil; return battleRewindCheckMap()'))
+
+    def test_matching_map_passes(self):
+        result = self.rt.execute('''
+            battleLog.map = {guid = "abc"}
+            FAKE_OBJECTS["startMenu"] = {getVar = function(k)
+                if k == "debugCurrentMapGuid" then return "abc" end
+            end}
+            return battleRewindCheckMap()
+        ''')
+        self.assertTrue(result)
+
+    def test_mismatched_map_is_refused(self):
+        result = self.rt.execute('''
+            battleLog.map = {guid = "abc"}
+            FAKE_OBJECTS["startMenu"] = {getVar = function(k)
+                if k == "debugCurrentMapGuid" then return "xyz" end
+            end}
+            return battleRewindCheckMap()
+        ''')
+        self.assertFalse(result)
+
+
+@unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
+class BattleRewindToIntegrationTest(unittest.TestCase):
+    """battleRewindTo(i): map check -> battleLogResolve(i) -> every setter -> finish."""
+
+    def setUp(self):
+        self.rt = make_rewind_runtime()
+        self.rt.execute('''
+            FAKE_OBJECTS["startMenu"] = {
+                getVar = function(k) if k == "debugCurrentMapGuid" then return "map1" end end,
+                call = function(name, params) end,
+            }
+            FAKE_OBJECTS["roundCounter"] = {value = 0}
+            FAKE_OBJECTS["redTurnCounter"] = {value = 0}
+            FAKE_OBJECTS["blueTurnCounter"] = {value = 0}
+            FAKE_OBJECTS["cpRed"] = {value = 0}
+            FAKE_OBJECTS["cpBlue"] = {value = 0}
+
+            local t = {_pos = {x=0,y=0,z=0}, _rot = {x=0,y=0,z=0}, _name = "A"}
+            t.getPosition = function() return t._pos end
+            t.getRotation = function() return t._rot end
+            t.getName = function() return t._name end
+            t.getGUID = function() return "a" end
+            t.setLock = function() end
+            t.setPosition = function(p) t._pos = p end
+            t.setRotation = function(r) t._rot = r end
+            t.setVelocity = function() end
+            t.setAngularVelocity = function() end
+            t.setName = function(n) t._name = n end
+            FAKE_OBJECTS["a"] = t
+
+            battleLog.map = {guid = "map1"}
+            battleLogRegistry = {a = RegisteredObject.new("a", "Red")}
+            battleLog.snaps = {
+                {k={1,"Red",1}, tag="start", b=nil, parts={
+                    turn={r=1,t="Red",p=1,rt=0,bt=0}, cp={r=0,b=0},
+                    objs={a={0,0,0,0,0,0,"A",0}},
+                }},
+                {k={1,"Red",2}, tag="phase", b=1, parts={
+                    cp={r=2,b=1},
+                    objs={a={5,0,1,0,90,0,"A",0}},
+                }},
+            }
+            battleLog.base = 1
+        ''')
+
+    def test_rewinding_forward_applies_turn_cp_and_position(self):
+        ok = self.rt.execute('return battleRewindTo(2)')
+        self.assertTrue(ok)
+        x, ry, cp_r, cp_b, base, busy = self.rt.execute('''
+            return FAKE_OBJECTS["a"]._pos.x, FAKE_OBJECTS["a"]._rot.y,
+                   FAKE_OBJECTS["cpRed"].value, FAKE_OBJECTS["cpBlue"].value,
+                   battleLog.base, battleRewindBusy
+        ''')
+        self.assertEqual(x, 5)
+        self.assertEqual(ry, 90)
+        self.assertEqual(cp_r, 2, "cp comes from snapshot 2, resolved forward from the base")
+        self.assertEqual(cp_b, 1)
+        self.assertEqual(base, 2, "battleLog.base must move to the rewound-to index")
+        self.assertFalse(busy, "the busy flag must clear once the batch settles")
+
+    def test_a_map_mismatch_refuses_and_changes_nothing(self):
+        self.rt.execute('''
+            FAKE_OBJECTS["startMenu"].getVar = function(k)
+                if k == "debugCurrentMapGuid" then return "otherMap" end
+            end
+        ''')
+        ok = self.rt.execute('return battleRewindTo(2, "Red")')
+        self.assertFalse(ok)
+        x, base = self.rt.execute('return FAKE_OBJECTS["a"]._pos.x, battleLog.base')
+        self.assertEqual(x, 0, "nothing should have moved")
+        self.assertEqual(base, 1, "base must stay put on a refused rewind")
+
+
+@unittest.skipUnless(lua52, "lupa not installed (pip install lupa) -- skipping Lua-logic tests")
+class BattleRewindNextTest(unittest.TestCase):
+    """NEXT prefers a direct child: apply only that snapshot's diff, not a full resolve."""
+
+    def setUp(self):
+        self.rt = make_rewind_runtime()
+        self.rt.execute('''
+            FAKE_OBJECTS["startMenu"] = {
+                getVar = function(k) if k == "debugCurrentMapGuid" then return "map1" end end,
+                call = function(name, params) MENU_CALL_COUNT = (MENU_CALL_COUNT or 0) + 1 end,
+            }
+            FAKE_OBJECTS["roundCounter"] = {value = 0}
+            FAKE_OBJECTS["redTurnCounter"] = {value = 0}
+            FAKE_OBJECTS["blueTurnCounter"] = {value = 0}
+
+            local t = {_pos = {x=0,y=0,z=0}, _rot = {x=0,y=0,z=0}, _name = "A"}
+            t.getPosition = function() return t._pos end
+            t.getRotation = function() return t._rot end
+            t.getName = function() return t._name end
+            t.getGUID = function() return "a" end
+            t.setLock = function() end
+            t.setPosition = function(p) t._pos = p end
+            t.setRotation = function(r) t._rot = r end
+            t.setVelocity = function() end
+            t.setAngularVelocity = function() end
+            t.setName = function(n) t._name = n end
+            FAKE_OBJECTS["a"] = t
+
+            battleLog.map = {guid = "map1"}
+            battleLogRegistry = {a = RegisteredObject.new("a", "Red")}
+            battleLog.snaps = {
+                {k={1,"Red",1}, tag="start", b=nil, parts={
+                    turn={r=1,t="Red",p=1,rt=0,bt=0}, objs={a={0,0,0,0,0,0,"A",0}},
+                }},
+                {k={1,"Red",2}, tag="phase", b=1, parts={objs={a={3,0,0,0,0,0,"A",0}}}},
+            }
+            battleLog.base = 1
+            battleRewindSel = {r=1, t="Red", p=1}
+        ''')
+
+    def test_next_applies_only_the_childs_diff_not_a_full_resolve(self):
+        self.rt.execute('battleRewindNext()')
+        x, base, sel_p, menu_calls = self.rt.execute('''
+            return FAKE_OBJECTS["a"]._pos.x, battleLog.base, battleRewindSel.p, MENU_CALL_COUNT
+        ''')
+        self.assertEqual(x, 3)
+        self.assertEqual(base, 2)
+        self.assertEqual(sel_p, 2, "the selection must follow the applied snapshot's key")
+        self.assertIsNone(menu_calls, "snapshot 2's diff has no turn part, so setTurnState (and its "
+            "startMenu.call) must never run -- proves this took the diff-only path, not a full resolve")
+
+
 if __name__ == "__main__":
     unittest.main()
