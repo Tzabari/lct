@@ -68,6 +68,15 @@ BM_MAT_RANDOMIZER_ENABLED = False
 LCT_MAT_RANDOMIZER_ENABLED = False
 GLOBAL_LUA = "global.ttslua"
 
+# Global-companion source files: concatenated onto global.ttslua's text before
+# it is injected into the Global object's single LuaScript slot, so their
+# functions/variables land in Global's ordinary Lua environment exactly as if
+# still written inline. Not standalone objects -- no GUID header, never
+# matched against a JSON object -- so collect_lua_files() excludes them from
+# its GUID scan. Split out purely to keep a large feature's source readable
+# on its own; add to this list to split out another one.
+GLOBAL_COMPANION_LUA = ["battleLog.ttslua"]
+
 # The Battlemaster dynamic spawner bakes the canonical map-card machinery into
 # its own script (via @@MAP_CARD_MACHINERY@@), so it must be excluded from the
 # map-card load-hook injector or its embedded template would be rewritten.
@@ -304,13 +313,21 @@ def inject_map_payloads(json_lines: list, json_guid_entries: list,
 
 
 def collect_lua_files() -> list:
-    """Return [global.ttslua, ...all other .ttslua files recursively sorted]."""
+    """Return [global.ttslua, ...all other GUID-bearing .ttslua files recursively
+    sorted]. Excludes GLOBAL_COMPANION_LUA -- those aren't standalone objects."""
     global_file = PATH_LUA / GLOBAL_LUA
+    companion_names = set(GLOBAL_COMPANION_LUA)
     others = sorted(
         f for f in PATH_LUA.rglob("*.ttslua")
-        if f.name != GLOBAL_LUA
+        if f.name != GLOBAL_LUA and f.name not in companion_names
     )
     return [global_file] + others
+
+
+def collect_global_companion_files() -> list:
+    """GLOBAL_COMPANION_LUA file paths, in the order their text is appended to
+    global.ttslua's before injection into the Global LuaScript slot."""
+    return [PATH_LUA / name for name in GLOBAL_COMPANION_LUA]
 
 
 def parse_changelog(path: Path):
@@ -572,6 +589,7 @@ def main():
             version = "v" + version
 
     lua_files = collect_lua_files()
+    companion_files = collect_global_companion_files()
 
     # --- Extract GUIDs from each non-global lua file ---
     lua_guids = []  # [(guid_str, file_index), ...]
@@ -612,7 +630,8 @@ def main():
     print(f"Injecting {xml_file.name}... ", end="")
     inject_xml(json_lines, xml_file)
 
-    # --- Inject global.ttslua into the first LuaScript slot ---
+    # --- Inject global.ttslua (+ its Global-companion files) into the first
+    # LuaScript slot ---
     # Stamp the player-facing version + patch notes into the Global script as it
     # is injected; the source file on disk is left untouched.
     # Debug build switch: on for --test, off for --release and prompted builds.
@@ -622,6 +641,10 @@ def main():
         lua_files[0].read_text(encoding="utf-8"), version, patch, changelog_notes, debug_enabled
     )
     global_text = bake_map_index(global_text)
+    for f in companion_files:
+        if not f.exists():
+            fail(f"{f} not found. Ending compilation.")
+        global_text += "\n\n" + f.read_text(encoding="utf-8")
     inject_lua_into_line(json_lines, json_lua_line_idxs[0], global_text)
     print(term.green("Done."))
 

@@ -27,6 +27,23 @@ local showArmyBtnB = {
     height=500, width=2400, font_size=200, color="Green", font_color={1,1,1}
 }
 
+-- Battle log: register/clear each side's army for snapshotting. One row inboard
+-- of HIDE/SHOW ARMY, matching their size and Red(+Z)/Blue(-Z) mirroring.
+local ZposBattle = ZposHideArmy - 2.5
+local registerBtnLbl = "REGISTER ARMY\nLMB set  /  RMB clear"
+local registerArmyBtnR = {
+    label=registerBtnLbl, click_function="registerArmyR", function_owner=self,
+    position={XposHideArmy,Ypos,ZposBattle}, rotation={0,0,0},
+    height=500, width=2400, font_size=200, color={0.55,0.15,0.15}, font_color={1,1,1},
+    tooltip="Select your models, then LEFT CLICK to register them as the Red army.\nRIGHT CLICK clears Red's registration."
+}
+local registerArmyBtnB = {
+    label=registerBtnLbl, click_function="registerArmyB", function_owner=self,
+    position={XposHideArmy+Xoffset,Ypos,-ZposBattle}, rotation={0,180,0},
+    height=500, width=2400, font_size=200, color={0.15,0.25,0.6}, font_color={1,1,1},
+    tooltip="Select your models, then LEFT CLICK to register them as the Blue army.\nRIGHT CLICK clears Blue's registration."
+}
+
 -- Activation / Wound tracker tokens: a Reset button (also auto-fired at every
 -- phase change from startMenu) plus per-token Spawn buttons that clone the parked
 -- master copies. Mirrored on the Red (+Z) and Blue (-Z) edges of the tool.
@@ -124,6 +141,8 @@ function createMenu()
     self.createButton(hideArmyBtnB)
     self.createButton(showArmyBtnR)
     self.createButton(showArmyBtnB)
+    self.createButton(registerArmyBtnR)
+    self.createButton(registerArmyBtnB)
 end
 
 -- Reset every Activation token on the table to its "not acted" (green) state.
@@ -181,6 +200,24 @@ end
 function showArmyB(obj, player, alt)
     if player ~= "Blue" then print("INTRUDER") return end
     hideShowArmy("Blue", false)
+end
+
+-- Battle-log forwarders. No local seat guard: an unseated side must stay
+-- registerable by whoever is present, so Global.call owns that rule.
+function registerArmyR(obj, player, alt)
+    if alt then
+        Global.call("battleLogClearArmy", {color = "Red"})
+    else
+        Global.call("battleLogRegister", {clicker = player, color = "Red"})
+    end
+end
+
+function registerArmyB(obj, player, alt)
+    if alt then
+        Global.call("battleLogClearArmy", {color = "Blue"})
+    else
+        Global.call("battleLogRegister", {clicker = player, color = "Blue"})
+    end
 end
 
 function hideShowArmy(color, hideShow)

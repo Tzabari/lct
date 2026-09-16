@@ -1,0 +1,432 @@
+-- Battle Log: Global companion (no FTC-GUID header -- see compile.py's
+-- GLOBAL_COMPANION_LUA). Concatenated onto global.ttslua's text before
+-- injection, so everything below runs in Global's own environment and can
+-- call Global's existing helpers (counterValue, cpCounterForColor, the
+-- secondary zone tables, etc.) directly.
+--
+-- Records a snapshot of the battle (turn/round, VP, CP, secondaries and every
+-- registered model) at battle start and at every phase change. Each snapshot
+-- stores only what changed since the snapshot it's based on; battleLogResolve
+-- walks backward to reconstruct the full state at any point. See
+-- docs/battle-log-rewind-architecture.md (binding; §A is this file).
+
+battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}}
+battleLogEncoded = nil
+battleLogRegistry = {}       -- guid -> RegisteredObject
+battleLogPrevParts = nil     -- {turn, vp, cp, sec} as last observed; nil until battleLogEnsurePrev runs
+battleLogCapturePending = nil
+battleLogCapWarned = false
+
+-- ===== State: an immutable snapshot of one model's position/rotation/name =====
+
+State = {}
+State.__index = State
+
+function State.new(t)
+    return setmetatable({
+        x = t.x, y = t.y, z = t.z,
+        rx = t.rx, ry = t.ry, rz = t.rz,
+        name = t.name, off = t.off or false,
+    }, State)
+end
+
+function State.fromObject(obj)
+    local p = obj.getPosition()
+    local r = obj.getRotation()
+    return State.new({x = p.x, y = p.y, z = p.z, rx = r.x, ry = r.y, rz = r.z, name = obj.getName(), off = false})
+end
+
+-- Inverse of State:encode(): rebuilds a State from a stored {x,y,z,rx,ry,rz,name,off} tuple.
+function State.fromTuple(t)
+    return State.new({x = t[1], y = t[2], z = t[3], rx = t[4], ry = t[5], rz = t[6], name = t[7], off = t[8] == 1})
+end
+
+local function battleLogAngleDiff(a, b)
+    local d = math.abs(a - b) % 360
+    return math.min(d, 360 - d)
+end
+
+-- Position to 0.01, rotation to 0.5 degrees, name and off exactly. A model
+-- marked off never compares its (stale) position/rotation.
+function State.equals(a, b)
+    if a == nil or b == nil then return a == b end
+    if a.off ~= b.off then return false end
+    if a.off then return a.name == b.name end
+    if a.name ~= b.name then return false end
+    if math.abs(a.x - b.x) > 0.01 or math.abs(a.y - b.y) > 0.01 or math.abs(a.z - b.z) > 0.01 then return false end
+    if battleLogAngleDiff(a.rx, b.rx) > 0.5 or battleLogAngleDiff(a.ry, b.ry) > 0.5 or battleLogAngleDiff(a.rz, b.rz) > 0.5 then return false end
+    return true
+end
+
+function State:encode()
+    return {self.x, self.y, self.z, self.rx, self.ry, self.rz, self.name, self.off and 1 or 0}
+end
+
+-- ===== RegisteredObject: one registered model, tracked by GUID =====
+--
+-- :setState(state) is NOT defined here. It's added to this same table by
+-- battleRewind.ttslua (phase 2), which is appended after this file, so the
+-- restore logic never has to live in the log.
+
+RegisteredObject = {}
+RegisteredObject.__index = RegisteredObject
+
+function RegisteredObject.new(guid, color)
+    return setmetatable({guid = guid, color = color, prev = nil, off = false}, RegisteredObject)
+end
+
+function RegisteredObject:object()
+    return getObjectFromGUID(self.guid)
+end
+
+-- Returns the new State if it differs from prev (and updates prev), or nil if
+-- nothing changed. A model whose .off flag is set (by battleLogOnDestroy)
+-- reads as off regardless of whether TTS has finished removing it yet.
+function RegisteredObject:getState()
+    local state
+    if self.off then
+        local base = self.prev
+        state = State.new({
+            x = base and base.x or 0, y = base and base.y or 0, z = base and base.z or 0,
+            rx = base and base.rx or 0, ry = base and base.ry or 0, rz = base and base.rz or 0,
+            name = base and base.name or "?", off = true,
+        })
+    else
+        local obj = self:object()
+        if obj == nil then return nil end
+        state = State.fromObject(obj)
+    end
+    if State.equals(state, self.prev) then return nil end
+    self.prev = state
+    return state
+end
+
+-- ===== Registration selection filter (trimmed from feature/battle-log's isBattleModel) =====
+
+BATTLE_LOG_EXCLUDED_GMNOTES = {
+    MapExclude = true, objective = true, deployZone = true, quarter = true,
+    stratreserves = true, areaDeny = true, coherencyLabel = true,
+    TacticalObjectives = true,
+}
+
+function isBattleLogModel(obj)
+    if obj == nil then return false end
+    local tag = obj.tag
+    if tag ~= "Figurine" and tag ~= "Generic" and tag ~= "Custom_Model" then return false end
+    local locked = false
+    pcall(function() locked = obj.getLock() end)
+    if locked then return false end
+    local gm = ""
+    pcall(function() gm = obj.getGMNotes() or "" end)
+    if BATTLE_LOG_EXCLUDED_GMNOTES[gm] then return false end
+    local bcb = nil
+    pcall(function() bcb = obj.getVar("BCBtype") end)
+    if bcb ~= nil then return false end
+    return true
+end
+
+-- ===== Registration (REGISTER ARMY button, spawnGameTools.ttslua) =====
+
+function battleLogRegister(params)
+    if type(params) ~= "table" then return end
+    local color = params.color
+    if color ~= "Red" and color ~= "Blue" then return end
+    local clicker = params.clicker
+    local selected = (clicker and Player[clicker]) and Player[clicker].getSelectedObjects() or {}
+    local guids = {}
+    for _, obj in ipairs(selected) do
+        if isBattleLogModel(obj) then
+            guids[#guids + 1] = obj.getGUID()
+        end
+    end
+    if #guids == 0 then
+        broadcastToColor("No valid models selected to register.", color, "Orange")
+        return
+    end
+    battleLogClearArmy({color = color, silent = true})
+    battleLog.army[color] = guids
+    for _, guid in ipairs(guids) do
+        battleLogRegistry[guid] = RegisteredObject.new(guid, color)
+    end
+    battleLogEncode()
+    broadcastToColor("Registered " .. #guids .. " models for " .. color .. ".", color, color)
+end
+
+function battleLogClearArmy(params)
+    if type(params) ~= "table" then return end
+    local color = params.color
+    if color ~= "Red" and color ~= "Blue" then return end
+    for _, guid in ipairs(battleLog.army[color] or {}) do
+        battleLogRegistry[guid] = nil
+    end
+    battleLog.army[color] = {}
+    battleLogEncode()
+    if not params.silent then
+        broadcastToColor(color .. " army registration cleared.", color, color)
+    end
+end
+
+-- ===== Capture =====
+
+-- Coalesces same-frame calls (nextPhase calling passTurn fires this twice in
+-- the same frame) into a single capture one frame later. "start" always wins,
+-- since startGame's own call can race with the passTurn inside startCustomTurns.
+function battleLogRequestCapture(tag)
+    if battleLogCapturePending == nil then
+        battleLogCapturePending = tag
+        Wait.frames(function()
+            local t = battleLogCapturePending
+            battleLogCapturePending = nil
+            battleLogCapture(t)
+        end, 1)
+    elseif tag == "start" then
+        battleLogCapturePending = "start"
+    end
+end
+
+-- Fills battleLogPrevParts (and any registered model's .prev) from the
+-- resolved state at battleLog.base. Only does real work once per load/rewind.
+function battleLogEnsurePrev()
+    if battleLogPrevParts ~= nil then return end
+    local resolved = battleLog.base and battleLogResolve(battleLog.base) or {}
+    battleLogPrevParts = {turn = resolved.turn, vp = resolved.vp, cp = resolved.cp, sec = resolved.sec}
+    for guid, ro in pairs(battleLogRegistry) do
+        if ro.prev == nil and resolved.objs and resolved.objs[guid] then
+            ro.prev = State.fromTuple(resolved.objs[guid])
+        end
+    end
+end
+
+local function battleLogPartChanged(name, value)
+    local prev = battleLogPrevParts[name]
+    if prev == nil and value == nil then return false end
+    if name == "vp" then return prev ~= value end
+    return JSON.encode(prev) ~= JSON.encode(value)
+end
+
+function battleLogCapture(tag)
+    battleLogEnsurePrev()
+    if tag == "start" then
+        local menu = getObjectFromGUID(startMenu_GUID)
+        battleLog.map = {
+            guid = menu and menu.getVar("debugCurrentMapGuid") or nil,
+            name = menu and menu.getVar("debugCurrentMapName") or nil,
+        }
+    end
+
+    local turn = getTurnState()
+    local vp   = getVpState()
+    local cp   = getCpState()
+    local sec  = getSecondariesState()
+    local objs = getRegisteredObjectsState()
+
+    local parts = {}
+    if battleLogPartChanged("turn", turn) then parts.turn = turn end
+    if battleLogPartChanged("vp", vp) then parts.vp = vp end
+    if battleLogPartChanged("cp", cp) then parts.cp = cp end
+    if battleLogPartChanged("sec", sec) then parts.sec = sec end
+    if next(objs) ~= nil then parts.objs = objs end
+
+    battleLogPrevParts.turn, battleLogPrevParts.vp, battleLogPrevParts.cp, battleLogPrevParts.sec = turn, vp, cp, sec
+
+    if next(parts) == nil then return battleLog.base end
+
+    table.insert(battleLog.snaps, {k = {turn.r, turn.t, turn.p}, tag = tag, b = battleLog.base, parts = parts})
+    battleLog.base = #battleLog.snaps
+    if #battleLog.snaps > 200 and not battleLogCapWarned then
+        battleLogCapWarned = true
+        broadcastToAll("Battle log: over 200 snapshots recorded.", "Orange")
+    end
+    battleLogEncode()
+    return battleLog.base
+end
+
+-- ===== Part getters (thin wrappers around existing state) =====
+
+function getTurnState()
+    local menu = getObjectFromGUID(startMenu_GUID)
+    return {
+        r = counterValue(getObjectFromGUID(gameTurnCounter_GUID)),
+        t = menu and menu.getVar("currentTurn") or "Red",
+        p = menu and menu.getVar("currentPhase") or 1,
+        rt = counterValue(getObjectFromGUID(redTurnCounter_GUID)),
+        bt = counterValue(getObjectFromGUID(blueTurnCounter_GUID)),
+    }
+end
+
+function getVpState()
+    local sheet = getObjectFromGUID(scoresheet_GUID)
+    return sheet and sheet.call("getScoreGridJSON") or ""
+end
+
+function getCpState()
+    return {
+        r = counterValue(cpCounterForColor("Red")),
+        b = counterValue(cpCounterForColor("Blue")),
+        gr = cpGainRoundUsed["Red"],
+        gb = cpGainRoundUsed["Blue"],
+    }
+end
+
+-- One getAllObjects() scan for both sides' 8 slots and discard piles, instead
+-- of the 16 scans that calling the existing per-zone getter would cost.
+function getSecondariesState()
+    local zoneBounds = {Red = {}, Blue = {}}
+    for _, color in ipairs({"Red", "Blue"}) do
+        local guids = (color == "Red") and redSecondaryCardZone_GUIDs or blueSecondaryCardZone_GUIDs
+        for i, guid in ipairs(guids) do
+            local zone = getObjectFromGUID(guid)
+            if zone then
+                local b = zone.getBounds()
+                zoneBounds[color][i] = {cx = b.center.x, cz = b.center.z, hx = b.size.x / 2, hz = b.size.z / 2}
+            end
+        end
+    end
+    local discardBounds = {}
+    for _, color in ipairs({"Red", "Blue"}) do
+        local pos = getSecondaryDiscardPosition(color)
+        discardBounds[color] = {cx = pos.x, cz = pos.z}
+    end
+
+    local slots = {Red = {}, Blue = {}}
+    local discard = {Red = {}, Blue = {}}
+
+    for _, obj in ipairs(getAllObjects()) do
+        local tag = obj.tag
+        if tag == "Card" or tag == "Deck" then
+            local pos = obj.getPosition()
+            if pos.y > 0.5 and pos.y < 3.0 then
+                local matched = false
+                for _, color in ipairs({"Red", "Blue"}) do
+                    for i, zb in pairs(zoneBounds[color]) do
+                        if math.abs(pos.x - zb.cx) <= zb.hx and math.abs(pos.z - zb.cz) <= zb.hz then
+                            if tag == "Card" then
+                                local name = obj.getName()
+                                if name and name ~= "" then
+                                    slots[color][i] = {n = name, fd = obj.is_face_down}
+                                end
+                            end
+                            matched = true
+                        end
+                    end
+                end
+                if not matched then
+                    for _, color in ipairs({"Red", "Blue"}) do
+                        local db = discardBounds[color]
+                        if math.abs(pos.x - db.cx) < 2.5 and math.abs(pos.z - db.cz) < 2.5 then
+                            if tag == "Card" then
+                                local n = obj.getName()
+                                if n and n ~= "" and not DISCARD_NAME_IGNORE[n] then
+                                    discard[color][#discard[color] + 1] = n
+                                end
+                            else
+                                for _, d in ipairs(obj.getObjects() or {}) do
+                                    if d.name and d.name ~= "" and not DISCARD_NAME_IGNORE[d.name] then
+                                        discard[color][#discard[color] + 1] = d.name
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return {
+        Red = {slots = slots.Red, discard = discard.Red, turns = discardedCardTurns.Red or {}},
+        Blue = {slots = slots.Blue, discard = discard.Blue, turns = discardedCardTurns.Blue or {}},
+    }
+end
+
+function getRegisteredObjectsState()
+    local objs = {}
+    for guid, ro in pairs(battleLogRegistry) do
+        local state = ro:getState()
+        if state ~= nil then
+            objs[guid] = state:encode()
+        end
+    end
+    return objs
+end
+
+-- ===== Resolve =====
+
+-- The full state at snapshot i: the most recent recorded value of each part
+-- and each registered model, found by walking backward along base links (b).
+-- Stops as soon as every part and every currently-registered model has a
+-- value, so it never has to replay from the start of the log.
+function battleLogResolve(i)
+    local turn, vp, cp, sec
+    local objs = {}
+    local remaining = 0
+    for _ in pairs(battleLogRegistry) do remaining = remaining + 1 end
+
+    local idx = i
+    while idx ~= nil do
+        local snap = battleLog.snaps[idx]
+        if not snap then break end
+        local parts = snap.parts or {}
+        if turn == nil and parts.turn ~= nil then turn = parts.turn end
+        if vp == nil and parts.vp ~= nil then vp = parts.vp end
+        if cp == nil and parts.cp ~= nil then cp = parts.cp end
+        if sec == nil and parts.sec ~= nil then sec = parts.sec end
+        if parts.objs then
+            for guid, tuple in pairs(parts.objs) do
+                if objs[guid] == nil and battleLogRegistry[guid] then
+                    objs[guid] = tuple
+                    remaining = remaining - 1
+                end
+            end
+        end
+        if turn and vp and cp and sec and remaining <= 0 then break end
+        idx = snap.b
+    end
+    return {turn = turn, vp = vp, cp = cp, sec = sec, objs = objs}
+end
+
+-- Latest non-"last" snapshot with this (round, turn, phase) key, for the
+-- rewind panel.
+function battleLogFindSnapshot(r, t, p)
+    for idx = #battleLog.snaps, 1, -1 do
+        local snap = battleLog.snaps[idx]
+        if snap.tag ~= "last" and snap.k[1] == r and snap.k[2] == t and snap.k[3] == p then
+            return idx
+        end
+    end
+    return nil
+end
+
+-- ===== Save / load =====
+
+function battleLogEncode()
+    battleLogEncoded = JSON.encode(battleLog)
+end
+
+function battleLogOnSave()
+    return battleLogEncoded
+end
+
+function battleLogOnLoad(data)
+    battleLogRegistry = {}
+    battleLogPrevParts = nil
+    battleLogCapWarned = false
+    if type(data) == "table" and data.v == 1 then
+        battleLog = data
+        battleLog.army = battleLog.army or {Red = {}, Blue = {}}
+        battleLog.snaps = battleLog.snaps or {}
+    else
+        battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}}
+    end
+    for _, color in ipairs({"Red", "Blue"}) do
+        for _, guid in ipairs(battleLog.army[color] or {}) do
+            battleLogRegistry[guid] = RegisteredObject.new(guid, color)
+        end
+    end
+    battleLogEncode()
+end
+
+function battleLogOnDestroy(obj)
+    local ro = battleLogRegistry[obj.getGUID()]
+    if ro then ro.off = true end
+end

@@ -1274,6 +1274,7 @@ function onSave()
         svPlayerHudSettings = playerHudSettings,
         svVersion = GAME_VERSION
     })
+    saved_data = saved_data:sub(1, -2) .. ',"svBattleLog":' .. battleLogOnSave() .. '}'
     --saved_data = ""
     return saved_data
 end
@@ -1372,6 +1373,7 @@ end
 
 function onObjectDestroy(obj)
     if not obj or not obj.getGUID then return end
+    battleLogOnDestroy(obj)
     -- Dice can never carry a yellowscribe (ymc-) card, so skip the sweep: it
     -- starts with a full Global.UI.getXmlTable() marshal, and mass dice
     -- destruction (vortex, Clear Mat, bag entry) would pay it once per die.
@@ -1397,6 +1399,7 @@ function onLoad(saved_data)
         playerHudSettings = loaded_data.svPlayerHudSettings or playerHudSettings
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
+        battleLogOnLoad(loaded_data.svBattleLog)
         if packSelected then
             missionPackData[packSelected].redSecondaryDeck_GUID = loaded_data.svRedSecondaryDeckGUID or edition11RedSecondaryDeck_GUID
             missionPackData[packSelected].blueSecondaryDeck_GUID = loaded_data.svBlueSecondaryDeckGUID or edition11BlueSecondaryDeck_GUID
@@ -1407,6 +1410,7 @@ function onLoad(saved_data)
         packSelected = nil
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
+        battleLogOnLoad(nil)
     end
     if not packSelected then
         hideMissionDeckUntilSelected(edition11RedSecondaryDeck_GUID)

@@ -143,6 +143,8 @@ function onLoad(saved_data)
         inGame = loaded_data.svinGame
         currentTurn = loaded_data.svcurrentTurn
         currentPhase = loaded_data.svcurrentPhase
+        debugCurrentMapGuid = loaded_data.svDebugCurrentMapGuid
+        debugCurrentMapName = loaded_data.svDebugCurrentMapName
         mapSizeSelected = loaded_data.svmapSizeSelected
         sizeConfirmed = loaded_data.svsizeConfirmed
         deploySelected = loaded_data.svdeploySelected
@@ -255,6 +257,8 @@ function onSave()
         svMatrixPropsDisabled = matrixPropsDisabled,
         svcurrentTurn = currentTurn,
         svcurrentPhase = currentPhase,
+        svDebugCurrentMapGuid = debugCurrentMapGuid,
+        svDebugCurrentMapName = debugCurrentMapName,
         svmapSizeSelected = mapSizeSelected,
         svsizeConfirmed = sizeConfirmed,
         svdeploySelected = deploySelected,
@@ -5569,6 +5573,7 @@ function startGame(obj, player, alt)
     writeMenus()
     updateGameStateHUD()
     simulation = false
+    Global.call("battleLogRequestCapture", "start")
 end
 
 function startGameDisabled()
@@ -5705,6 +5710,7 @@ function jumpToPhase(idx)
     broadcastToAll(phases[currentPhase], "Yellow")
     writeMenus()
     updateGameStateHUD()
+    Global.call("battleLogRequestCapture", "phase")
 end
 
 function updateGameStateHUD()
@@ -5744,6 +5750,7 @@ function nextPhase(obj, player_color_click, alt_click)
     broadcastToAll(phases[currentPhase], "Yellow")
     writeMenus()
     updateGameStateHUD()
+    Global.call("battleLogRequestCapture", "phase")
 end
 
 function passTurn(obj, player_color_click, alt_click)
@@ -5801,6 +5808,7 @@ function passTurn(obj, player_color_click, alt_click)
     printToAll(getTurnStateLabel() .. " - " .. cpMessage, "Yellow")
     broadcastToAll("It's " .. currentTurn .. " Player's turn", currentTurn)
     writeMenus()
+    Global.call("battleLogRequestCapture", "phase")
 end
 
 

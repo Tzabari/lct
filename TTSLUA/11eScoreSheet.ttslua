@@ -1449,3 +1449,32 @@ end
 function minus_253(_, _, alt)
 	minus(2, 5, 3, alt)
 end
+
+-- The whole scoresheet as a JSON string, for the battle log to snapshot.
+--
+-- A STRING, not a table: a table built here belongs to this object's script, and
+-- reading a field of it from Global raises "Attempt to perform operations with
+-- resources owned by different scripts". JSON is the mod's established way across
+-- that boundary (see selectedDeploymentJSON in startMenu.ttslua).
+--
+-- The grid is stored raw, exactly as the cells read -- k indices are the board's
+-- own (BOARD_PRIMARY_K / BOARD_SECONDARY_K), not reinterpreted, so a round-trip
+-- through setScoreGrid is an identity.
+function getScoreGridJSON()
+	local grid = {}
+	for i = 1, 2 do
+		local player = {}
+		for j = 1, 5 do
+			local round = {}
+			for k = 1, 3 do
+				round[k] = safeScoreNumber(scores[i][j][k])
+			end
+			player[j] = round
+		end
+		grid[i] = player
+	end
+	return JSON.encode({
+		scores = grid,
+		eob = {safeScoreNumber(endOfBattle[1]), safeScoreNumber(endOfBattle[2])},
+	})
+end
