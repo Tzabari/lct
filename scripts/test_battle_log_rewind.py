@@ -124,7 +124,7 @@ decodeValue = function(s, i)
             j = skipSpace(s, j)
             local closer = isObj and "}" or "]"
             if s:sub(j, j) == closer then return t, j + 1 end
-            j = j + 1  -- skip ','
+            j = skipSpace(s, j + 1)  -- skip ',' and any following space
         end
     end
     if c == "t" then return true, i + 4 end
