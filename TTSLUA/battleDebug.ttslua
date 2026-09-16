@@ -65,6 +65,22 @@ function battleDebugSimulateDelete(guid)
     print("battleDebugSimulateDelete: destroyed " .. guid)
 end
 
+-- Reports the graveyard's size, for checking the Phase 2 test checklist's
+-- "log the graveyard size" step against a real, populated game.
+function battleDebugGraveSize()
+    if not DEBUG then return end
+    local entries, poolBytes, graveBytes = 0, 0, 0
+    for _, cached in pairs(battleRewindGraveCache) do
+        entries = entries + 1
+        graveBytes = graveBytes + #cached
+    end
+    for _, cached in pairs(battleRewindPoolCache) do
+        poolBytes = poolBytes + #cached
+    end
+    print(string.format("battleDebugGraveSize: %d entrie(s), %d pooled string(s) -- ~%.1f KB grave + ~%.1f KB pool",
+        entries, #battleRewindPoolList, graveBytes / 1024, poolBytes / 1024))
+end
+
 -- Times one capture and one resolve of the current base, for checking the
 -- "no hitches during play" requirement against a real, populated log.
 function battleDebugTimeCapture()
