@@ -45,15 +45,21 @@ class StaticChecksTest(unittest.TestCase):
             "onSave must return the cache, never encode")
 
     def test_companion_files_have_no_polling(self):
-        for name in ("battleLog.ttslua", "battleDebug.ttslua"):
+        for name in ("battleLog.ttslua", "battleRewind.ttslua", "battleDebug.ttslua"):
             text = (LUA_DIR / name).read_text(encoding="utf-8")
             self.assertNotIn("Wait.repeat", text,
                 f"{name}: no polling allowed (principle #2 - button presses only)")
 
     def test_companion_files_use_tilde_not_bang_equal(self):
-        for name in ("battleLog.ttslua", "battleDebug.ttslua"):
+        for name in ("battleLog.ttslua", "battleRewind.ttslua", "battleDebug.ttslua"):
             text = (LUA_DIR / name).read_text(encoding="utf-8")
             self.assertNotIn("!=", text, f"{name} uses != instead of ~=")
+
+    def test_rewind_hooks_are_wired(self):
+        text = (LUA_DIR / "global.ttslua").read_text(encoding="utf-8")
+        self.assertIn("battleRewindOnDestroy(obj)", text)
+        self.assertIn("battleRewindOnLoad(", text)
+        self.assertIn("battleRewindOnSave()", text)
 
 
 # A minimal TTS-API stand-in: just enough for battleLog.ttslua's functions to
