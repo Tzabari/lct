@@ -408,11 +408,14 @@ function battleRewindCollectColorCandidates(scene, color)
         end
     end
 
+    -- x/z proximity only, no y bound -- matching getDiscardedSecondaryNames's own
+    -- check for the same pile. A y<3.0 cutoff (this code's earlier version) misses
+    -- cards once a growing discard stack -- several rounds in -- climbs past it.
     local dpos = getSecondaryDiscardPosition(color)
     for _, o in ipairs(scene) do
         if o.tag == "Card" or o.tag == "Deck" then
             local p = o.getPosition()
-            if p.y > 0.5 and p.y < 3.0 and math.abs(p.x - dpos.x) < 2.5 and math.abs(p.z - dpos.z) < 2.5 then
+            if math.abs(p.x - dpos.x) < 2.5 and math.abs(p.z - dpos.z) < 2.5 then
                 if o.tag == "Card" then addLoose(o) else addDeck(o) end
             end
         end
