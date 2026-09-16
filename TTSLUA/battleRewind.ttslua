@@ -42,13 +42,30 @@ end
 
 -- Store-only: no spawning happens here. See battleRewindRespawn for the other
 -- half, which only runs when a rewind actually needs the model back.
+--
+-- obj.getJSON() has to run right here, synchronously, while obj is still a
+-- live reference -- but decoding and pooling a model's full JSON (its
+-- datasheet LuaScript alone runs tens of KB) turned out to be slow enough to
+-- freeze the whole game for close to a minute on a single delete. So this
+-- hook only takes the getJSON() snapshot; battleRewindProcessDestroyQueue
+-- does the actual decode/pool/encode work spread one entry per frame,
+-- matching how every other batch in this file is paced.
+battleRewindDestroyQueue = {}
+
 function battleRewindOnDestroy(obj)
     local guid = obj.getGUID()
     if not battleLogRegistry[guid] then return end
     local ok, json = pcall(function() return obj.getJSON() end)
     if not ok or type(json) ~= "string" then return end
-    local ok2, decoded = pcall(function() return JSON.decode(json) end)
-    if not ok2 or type(decoded) ~= "table" then return end
+    battleRewindDestroyQueue[#battleRewindDestroyQueue + 1] = {guid = guid, json = json}
+    if #battleRewindDestroyQueue == 1 then
+        Wait.frames(battleRewindProcessDestroyQueue, 1)
+    end
+end
+
+function battleRewindStoreDestroyedEntry(guid, json)
+    local ok, decoded = pcall(function() return JSON.decode(json) end)
+    if not ok or type(decoded) ~= "table" then return end
     local entry = {}
     for k, v in pairs(decoded) do entry[k] = v end
     for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
@@ -58,7 +75,21 @@ function battleRewindOnDestroy(obj)
     battleRewindGraveCache[guid] = JSON.encode(entry)
 end
 
+function battleRewindProcessDestroyQueue()
+    local item = table.remove(battleRewindDestroyQueue, 1)
+    if item then battleRewindStoreDestroyedEntry(item.guid, item.json) end
+    if #battleRewindDestroyQueue > 0 then
+        Wait.frames(battleRewindProcessDestroyQueue, 1)
+    end
+end
+
 function battleRewindOnSave()
+    -- A save can land mid-queue (Ctrl+S right after a delete); drain it now
+    -- rather than lose those entries. Only ever the last few frames' worth.
+    while #battleRewindDestroyQueue > 0 do
+        local item = table.remove(battleRewindDestroyQueue, 1)
+        battleRewindStoreDestroyedEntry(item.guid, item.json)
+    end
     local poolParts = {}
     for id = 1, #battleRewindPoolCache do
         poolParts[#poolParts + 1] = battleRewindPoolCache[id] or "null"
