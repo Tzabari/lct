@@ -367,7 +367,11 @@ function battleRewindCollectColorCandidates(scene, color)
     for index = 1, 8 do
         local zone = getSecondaryCardZoneByIndex(color, index)
         if zone then
-            for _, o in ipairs(getCardsInSecondarySlot(zone)) do
+            -- getCardsInSecondarySlotForColor, not the plain zone/position scan:
+            -- it also falls back to secondarySlotAssignments, which is the only
+            -- thing that still finds a card once it's locked and the zone query
+            -- (per that function's own comment) can miss it.
+            for _, o in ipairs(getCardsInSecondarySlotForColor(color, index, zone)) do
                 if o.tag == "Card" then addLoose(o) end
             end
         end
