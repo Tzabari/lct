@@ -603,9 +603,17 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
                 job.color, job.index, tostring(job.entry and job.entry.n), #occupants, table.concat(occNames, ", ")))
         end
         if job.entry == nil then
+            -- Locked, not unlocked: several occupants can land on the exact same
+            -- discard point within one restore pass (this slot plus others being
+            -- cleared the same frame or two later). Left unlocked, TTS's physics
+            -- merges overlapping loose cards into a fresh Deck object, which
+            -- invalidates any GUID this pass's collection already cached for
+            -- whatever else is sitting at that pile -- surfacing as a false
+            -- "could not find" on an unrelated discard job later in this same
+            -- queue. Locked cards don't collide/merge.
             for _, o in ipairs(occupants) do
                 pcall(function()
-                    o.locked = false
+                    o.locked = true
                     o.setPosition(getSecondaryDiscardPosition(job.color))
                 end)
             end
@@ -632,8 +640,9 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
         end
         for _, o in ipairs(occupants) do
             if o.getGUID() ~= keepGuid then
+                -- Locked, not unlocked: see the same-named comment above.
                 pcall(function()
-                    o.locked = false
+                    o.locked = true
                     o.setPosition(getSecondaryDiscardPosition(job.color))
                 end)
             end
@@ -646,8 +655,13 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
 
     if job.kind == "discard" then
         local dpos = getSecondaryDiscardPosition(job.color)
+        -- Lock on placement (via onPlaced): several cards can land on this
+        -- exact point within one restore pass, and left unlocked they'd merge
+        -- into a fresh Deck under physics, invalidating whatever GUID this
+        -- pass's collection cached for anything else headed to this same pile.
         battleRewindTakeCandidateTo(candidates, job.name, dpos, nil, nil, missing,
-            job.color .. " discard: " .. tostring(job.name), nil)
+            job.color .. " discard: " .. tostring(job.name),
+            function(card) pcall(function() card.locked = true end) end)
         return
     end
 
@@ -661,7 +675,12 @@ function battleRewindSecondaryStep(job, candidatesByColor, missing)
                 if cand.obj ~= nil then
                     pcall(function()
                         cand.obj.locked = false
-                        if deck then deck.putObject(cand.obj) else cand.obj.setPosition(getSecondaryDiscardPosition(job.color)) end
+                        if deck then
+                            deck.putObject(cand.obj)
+                        else
+                            cand.obj.setPosition(getSecondaryDiscardPosition(job.color))
+                            cand.obj.locked = true
+                        end
                     end)
                 end
             end
