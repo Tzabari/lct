@@ -16,40 +16,26 @@ BATTLE_REWIND_PHASE_LABELS = {"Cmd", "Mov", "Sht", "Chr", "Fgt"}
 BATTLE_REWIND_PARK_Y = -12
 
 -- ===== Graveyard: destroyed registered models, stored so a later rewind can
--- respawn them. Long strings (LuaScript/LuaScriptState/XmlUI/Description) are
--- shared across models via a pool keyed by the string itself, so models from
--- the same unit only pay for one copy. =====
+-- respawn them. The raw getJSON() string is kept as-is (no decode, no field
+-- pooling): a full model JSON.decode measured at 5+ seconds in testing, which
+-- is what actually froze the game on delete, not the getJSON() call itself.
+-- spawnObjectJSON's own position/rotation params (verified against the TTS
+-- API docs) cover everything battleRewindRespawn needs to place a model, so
+-- there's nothing here that ever requires parsing the JSON at all. The
+-- trade-off is a bigger save file (no cross-model string sharing), which is
+-- a fair price for not freezing during play. =====
 
-battleRewindGrave = {}         -- guid -> slim entry (pooled fields replaced with ids)
-battleRewindGraveCache = {}    -- guid -> JSON.encode(entry), cached at store time
-battleRewindPoolList = {}      -- id -> string
-battleRewindPoolIds = {}       -- string -> id
-battleRewindPoolCache = {}     -- id -> JSON.encode(string), cached at store time
+battleRewindGrave = {}         -- guid -> raw getJSON() string, untouched
+battleRewindGraveCache = {}    -- guid -> JSON.encode(that string), cached at store time
 battleRewindGravePending = {}  -- guid -> true while its respawn is in flight
-
-local BATTLE_REWIND_POOL_FIELDS = {"LuaScript", "LuaScriptState", "XmlUI", "Description"}
-
-local function battleRewindPoolRef(s)
-    if type(s) ~= "string" or s == "" then return nil end
-    local id = battleRewindPoolIds[s]
-    if id then return id end
-    id = #battleRewindPoolList + 1
-    battleRewindPoolList[id] = s
-    battleRewindPoolIds[s] = id
-    battleRewindPoolCache[id] = JSON.encode(s)
-    return id
-end
 
 -- Store-only: no spawning happens here. See battleRewindRespawn for the other
 -- half, which only runs when a rewind actually needs the model back.
 --
 -- obj.getJSON() has to run right here, synchronously, while obj is still a
--- live reference -- but decoding and pooling a model's full JSON (its
--- datasheet LuaScript alone runs tens of KB) turned out to be slow enough to
--- freeze the whole game for close to a minute on a single delete. So this
--- hook only takes the getJSON() snapshot; battleRewindProcessDestroyQueue
--- does the actual decode/pool/encode work spread one entry per frame,
--- matching how every other batch in this file is paced.
+-- live reference. Everything after that -- just a JSON.encode of the raw
+-- string now, since there's no decode/pool step left -- is deferred one
+-- entry per frame, matching how every other batch in this file is paced.
 battleRewindDestroyQueue = {}
 
 function battleRewindOnDestroy(obj)
@@ -70,31 +56,11 @@ end
 
 function battleRewindStoreDestroyedEntry(guid, json)
     local t0 = DEBUG and os.clock() or nil
-    local ok, decoded = pcall(function() return JSON.decode(json) end)
-    local tDecode = DEBUG and os.clock() or nil
-    if not ok or type(decoded) ~= "table" then
-        if DEBUG then
-            print(string.format("[battleRewindStoreDestroyedEntry] %s JSON.decode FAILED after %.1fms: %s",
-                tostring(guid), (tDecode - t0) * 1000, tostring(decoded)))
-        end
-        return
-    end
-    local entry = {}
-    for k, v in pairs(decoded) do entry[k] = v end
-    local tCopy = DEBUG and os.clock() or nil
-    for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
-        entry[field] = battleRewindPoolRef(entry[field])
-    end
-    local tPool = DEBUG and os.clock() or nil
-    battleRewindGrave[guid] = entry
-    battleRewindGraveCache[guid] = JSON.encode(entry)
+    battleRewindGrave[guid] = json
+    battleRewindGraveCache[guid] = JSON.encode(json)
     if DEBUG then
-        local tEncode = os.clock()
-        print(string.format(
-            "[battleRewindStoreDestroyedEntry] %s total=%.1fms (decode=%.1fms, copy=%.1fms, pool=%.1fms, encode=%.1fms), %d bytes in",
-            tostring(guid), (tEncode - t0) * 1000,
-            (tDecode - t0) * 1000, (tCopy - tDecode) * 1000, (tPool - tCopy) * 1000, (tEncode - tPool) * 1000,
-            #json))
+        print(string.format("[battleRewindStoreDestroyedEntry] %s encode=%.1fms, %d bytes in",
+            tostring(guid), (os.clock() - t0) * 1000, #json))
     end
 end
 
@@ -124,33 +90,23 @@ function battleRewindOnSave()
         local item = table.remove(battleRewindDestroyQueue, 1)
         battleRewindStoreDestroyedEntry(item.guid, item.json)
     end
-    local poolParts = {}
-    for id = 1, #battleRewindPoolCache do
-        poolParts[#poolParts + 1] = battleRewindPoolCache[id] or "null"
-    end
     local graveParts = {}
     for guid, piece in pairs(battleRewindGraveCache) do
         graveParts[#graveParts + 1] = JSON.encode(guid) .. ":" .. piece
     end
-    return "{\"pool\":[" .. table.concat(poolParts, ",") .. "],\"grave\":{" .. table.concat(graveParts, ",") .. "}}"
+    return "{\"grave\":{" .. table.concat(graveParts, ",") .. "}}"
 end
 
 function battleRewindOnLoad(data)
     battleRewindGrave, battleRewindGraveCache = {}, {}
-    battleRewindPoolList, battleRewindPoolIds, battleRewindPoolCache = {}, {}, {}
     battleRewindGravePending = {}
     if type(data) ~= "table" then return end
-    if type(data.pool) == "table" then
-        for id, s in ipairs(data.pool) do
-            battleRewindPoolList[id] = s
-            battleRewindPoolIds[s] = id
-            battleRewindPoolCache[id] = JSON.encode(s)
-        end
-    end
     if type(data.grave) == "table" then
-        for guid, entry in pairs(data.grave) do
-            battleRewindGrave[guid] = entry
-            battleRewindGraveCache[guid] = JSON.encode(entry)
+        for guid, json in pairs(data.grave) do
+            if type(json) == "string" then
+                battleRewindGrave[guid] = json
+                battleRewindGraveCache[guid] = JSON.encode(json)
+            end
         end
     end
 end
@@ -226,37 +182,29 @@ end
 function battleRewindRespawn(ro, state)
     local guid = ro.guid
     if battleRewindGravePending[guid] then return end
-    local entry = battleRewindGrave[guid]
-    if entry == nil then
+    local json = battleRewindGrave[guid]
+    if json == nil then
         broadcastToAll("Rewind: " .. tostring(guid) .. " has no graveyard entry to respawn from.", {1, 0.6, 0.2})
         return
     end
     battleRewindGravePending[guid] = true
-    local full = {}
-    for k, v in pairs(entry) do full[k] = v end
-    for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
-        local id = entry[field]
-        full[field] = (id and battleRewindPoolList[id]) or ""
-    end
-    full.GUID = guid
-    full.Locked = true
-    full.Transform = full.Transform or {}
-    full.Transform.posX, full.Transform.posY, full.Transform.posZ = state.x, state.y, state.z
-    full.Transform.rotX, full.Transform.rotY, full.Transform.rotZ = state.rx, state.ry, state.rz
-    if state.name and state.name ~= "" then full.Nickname = state.name end
 
-    local ok, json = pcall(JSON.encode, full)
-    if not ok then
-        battleRewindGravePending[guid] = false
-        broadcastToAll("Rewind: could not rebuild " .. tostring(guid) .. " from the graveyard.", {1, 0.4, 0.2})
-        return
-    end
-
+    -- position/rotation are spawnObjectJSON's own override params (confirmed
+    -- against the TTS API docs), so the raw graveyard JSON never needs to be
+    -- touched to place this at the target state. GUID comes along for free
+    -- since it's still baked into that JSON from when it was captured; the
+    -- (very unlikely) case where it's already taken is re-keyed below.
     spawnObjectJSON({
         json = json,
+        position = {x = state.x, y = state.y, z = state.z},
+        rotation = {x = state.rx, y = state.ry, z = state.rz},
         callback_function = function(spawned)
             battleRewindGravePending[guid] = false
             if spawned == nil then return end
+            spawned.setLock(true)
+            if state.name and state.name ~= "" and state.name ~= spawned.getName() then
+                pcall(function() spawned.setName(state.name) end)
+            end
             local newGuid = spawned.getGUID()
             if newGuid ~= guid then
                 battleLogRegistry[newGuid] = ro

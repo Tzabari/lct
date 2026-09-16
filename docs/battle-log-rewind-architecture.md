@@ -395,11 +395,12 @@ flowchart TB
   H --> R1["battleRewindOnDestroy(obj)"]
   R1 --> Q{"registered?"}
   Q -->|no| Z["return (one hash lookup)"]
-  Q -->|yes| J["data = JSON.decode(obj.getJSON())<br/>move LuaScript / LuaScriptState / XmlUI / Description<br/>into the string pool, replacing each with a pool ref"]
-  J --> E["battleRewindGrave[guid] = JSON.encode(slim entry)<br/>+ encode any NEW pool strings<br/>(small; cached per piece)"]
-  E --> SV["onSave: table.concat of the cached pieces<br/>(no encoding)"]
+  Q -->|yes| G["json = obj.getJSON()<br/>(the only synchronous part; obj is only valid inside this hook)"]
+  G --> QU["queued, one entry per frame"]
+  QU --> E["battleRewindGrave[guid] = json, untouched<br/>battleRewindGraveCache[guid] = JSON.encode(json)"]
+  E --> SV["onSave: table.concat of the cached pieces<br/>(no re-encoding)"]
 
-  RW["rewind: target alive, object missing"] --> SP["battleRewindRespawn(ro, target)<br/>rebuild the JSON from the entry + pool<br/>spawnObjectJSON at the target, locked"]
+  RW["rewind: target alive, object missing"] --> SP["battleRewindRespawn(ro, target)<br/>spawnObjectJSON{json, position, rotation}, then setLock(true)"]
   SP --> CB{"callback: GUID unchanged?"}
   CB -->|yes| OK["remove the grave entry · ro.off = false"]
   CB -->|no| RK["re-key the registry and army list · re-encode"]
@@ -407,18 +408,24 @@ flowchart TB
 
 **Why the rewind spawns the model instead of the delete:**
 
-- Deleting stays cheap. It costs one `getJSON` and a small encode, with no
-  spawning during play.
 - No hidden models exist during play, so nothing extra appears in scans such as
   the dice mats' `getAllObjects()`.
 - There is no revive loop.
 - There is no GUID race: the original is long gone by the time the rewind spawns
   the copy.
 
-**Size:** a model with its datasheet script and UI is about 98 KB. Pooling stores
-each distinct script, UI and description once, so one unit's models share them.
-The pool is keyed by the string itself, which Lua hashes when the string is
-created.
+**The raw JSON is never parsed, on either end.** An earlier version of this
+file ran `JSON.decode` on the model's full JSON at delete time, to pool its
+long script/UI/description fields into shared storage. In testing that decode
+alone measured 5+ seconds for one model -- which is what actually froze the
+game on delete, not the `getJSON()` call itself (measured at ~1ms). Since
+`spawnObjectJSON`'s own `position`/`rotation` parameters override whatever
+transform is baked into the JSON, and `GUID`/lock/name are all handled after
+spawning via plain object calls, nothing here ever needs the JSON's contents
+-- it's carried through delete, save, load and respawn as an opaque string.
+The trade-off is a bigger save file (no cross-model string sharing: a model
+with its datasheet script and UI is about 98 KB, stored once per dead model
+instead of pooled), which is a fair price for not freezing during play.
 
 **Scrubbing is only slow the first time.** Once a model has been respawned, a
 later "dead" target parks it instead of deleting it, so moving back and forth
@@ -467,7 +474,7 @@ and skipped. There is no card graveyard; see §D.
 | `battleRewindPark(ro)` | `setState` | lock, hide and teleport to the park slot | 15 |
 | `battleRewindRespawn(ro, state)` | `setState` (queued, 4 per frame) | §B4, including the GUID check | 30 |
 | `battleRewindOnDestroy(obj)` | `global.onObjectDestroy` | §B4: store only, no spawn | 30 |
-| `battleRewindOnSave() / battleRewindOnLoad(data)` | `global.onSave` / `onLoad` | join the cached graveyard and pool pieces; on load, take the already-decoded table and rebuild the cached pieces | 20 |
+| `battleRewindOnSave() / battleRewindOnLoad(data)` | `global.onSave` / `onLoad` | join the cached graveyard pieces (raw JSON strings, no pooling); on load, take the already-decoded table and rebuild the cache | 15 |
 | **Total** | | | **~540** |
 
 ## B7. Edits to existing files (phase 2)
@@ -523,5 +530,7 @@ Changing any of these needs approval first.
    drawn isn't handled. The existing draw code has the same limitation.
 6. **Snapshots are capped at 200**, with a warning. A full five-round game uses
    about 50.
-7. **Save size target:** under about 500 KB of log data and a few hundred KB of
-   graveyard for a full game. Measured on the dev branch.
+7. **Save size target:** under about 500 KB of log data. The graveyard has no
+   pooling (see §B4), so it costs roughly 98 KB per dead model with no sharing
+   across a unit -- a heavy-casualty game could run into the low single-digit
+   MB. Measured on the dev branch.
