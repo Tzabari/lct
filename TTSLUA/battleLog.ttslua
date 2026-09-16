@@ -140,7 +140,7 @@ function battleLogRegister(params)
         end
     end
     if #guids == 0 then
-        broadcastToColor("No valid models selected to register.", color, "Orange")
+        if clicker then broadcastToColor("No valid models selected to register.", clicker, "Orange") end
         return
     end
     battleLogClearArmy({color = color, silent = true})
@@ -149,7 +149,7 @@ function battleLogRegister(params)
         battleLogRegistry[guid] = RegisteredObject.new(guid, color)
     end
     battleLogEncode()
-    broadcastToColor("Registered " .. #guids .. " models for " .. color .. ".", color, color)
+    if clicker then broadcastToColor("Registered " .. #guids .. " models for " .. color .. ".", clicker, color) end
 end
 
 function battleLogClearArmy(params)
@@ -161,8 +161,9 @@ function battleLogClearArmy(params)
     end
     battleLog.army[color] = {}
     battleLogEncode()
-    if not params.silent then
-        broadcastToColor(color .. " army registration cleared.", color, color)
+    local clicker = params.clicker
+    if not params.silent and clicker then
+        broadcastToColor(color .. " army registration cleared.", clicker, color)
     end
 end
 

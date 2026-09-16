@@ -206,7 +206,7 @@ end
 -- registerable by whoever is present, so Global.call owns that rule.
 function registerArmyR(obj, player, alt)
     if alt then
-        Global.call("battleLogClearArmy", {color = "Red"})
+        Global.call("battleLogClearArmy", {clicker = player, color = "Red"})
     else
         Global.call("battleLogRegister", {clicker = player, color = "Red"})
     end
@@ -214,7 +214,7 @@ end
 
 function registerArmyB(obj, player, alt)
     if alt then
-        Global.call("battleLogClearArmy", {color = "Blue"})
+        Global.call("battleLogClearArmy", {clicker = player, color = "Blue"})
     else
         Global.call("battleLogRegister", {clicker = player, color = "Blue"})
     end
