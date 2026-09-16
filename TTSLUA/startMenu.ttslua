@@ -5704,6 +5704,21 @@ function hudPhaseShtRed(player) hudJumpToPhaseForTurn(player, "Red", 3) end
 function hudPhaseChrRed(player) hudJumpToPhaseForTurn(player, "Red", 4) end
 function hudPhaseFgtRed(player) hudJumpToPhaseForTurn(player, "Red", 5) end
 
+-- Sets currentTurn/currentPhase from a rewind and repaints the menus/HUD, but
+-- (unlike jumpToPhase) never fires battleLogRequestCapture: a rewind is
+-- restoring a moment the log already has, not creating a new one.
+function rewindSetTurnState(params)
+    if type(params) ~= "table" then return end
+    if params.t == "Red" or params.t == "Blue" then
+        currentTurn = params.t
+    end
+    if type(params.p) == "number" and params.p >= 1 and params.p <= #phases then
+        currentPhase = params.p
+    end
+    writeMenus()
+    updateGameStateHUD()
+end
+
 function jumpToPhase(idx)
     if gameNotStartedGuard() then return end
     currentPhase = idx

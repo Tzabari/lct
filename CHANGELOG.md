@@ -13,6 +13,9 @@ How this file is used by the compiler (`compile.py --release`):
 To cut a release: add a new `## vX.Y.Z` section at the top with its bullets,
 then run `python3 compile.py --release`.
 
+## v1.13.0
+- Feat: Added a REWIND BATTLE button next to REGISTER ARMY. Opens a panel to pick any recorded round/turn/phase and restore models, VP, CP and secondaries to that moment, or jump back to the moment before the panel was opened.
+
 ## v1.12.0
 - Feat: Added REGISTER ARMY buttons (right-click to clear) next to HIDE/SHOW ARMY, registering your models so the game can track them through the battle. Lays the groundwork for the upcoming Battle Rewind feature.
 

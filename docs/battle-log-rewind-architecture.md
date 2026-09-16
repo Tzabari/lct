@@ -1,8 +1,9 @@
 # Battle Log & Battle Rewind: Architecture
 
-> **Status:** design, awaiting review. This document is binding. Any deviation
-> needs the maintainer's approval first, and the document must be updated in the
-> same commit as the code it describes. Line budgets are targets, not limits.
+> **Status:** Parts A and B are implemented (awaiting in-TTS testing per §6 of
+> the plan). This document is binding. Any deviation needs the maintainer's
+> approval first, and the document must be updated in the same commit as the
+> code it describes. Line budgets are targets, not limits.
 
 There are two features, built in order, each in its own file:
 
@@ -55,7 +56,7 @@ flowchart LR
 
 ---
 
-# Part A: Battle Log (phase 1)
+# Part A: Battle Log (phase 1) — implemented
 
 ## A1. Components
 
@@ -263,7 +264,7 @@ flowchart LR
 
 ---
 
-# Part B: Battle Rewind (phase 2)
+# Part B: Battle Rewind (phase 2) — implemented
 
 ## B1. Components
 
@@ -480,6 +481,7 @@ and skipped. There is no card graveyard; see §D.
 | `TTSLUA/11eScoreSheet.ttslua` | new function | `setScoreGrid(raw)` (from battle-log l.1052) | ~30 |
 | `TTSLUA/spawnGameTools.ttslua` | button table, `createMenu`, handler | REWIND BATTLE, next to REGISTER ARMY on each side | ~15 |
 | `TTSJSON/ftc_base_ui.xml` | new panel | a single `RewindPanel` (markup trimmed from battle-log's overlay). Visibility is set to the colours that have it open. | ~40 |
+| `TTSLUA/global.ttslua` | `playerHudSettings` / `getDefaultHudSettings` / `applyHudPreferencesForColor` / `hudToggleHelp` / `hudToggleLock` | a `rewindOverlayOpen` flag, following the existing `helpOverlayOpen`/`scoringOverlayOpen` pattern: added to both HUD-settings tables, applied to the panel's `active` attribute, and cleared by the other two toggles so only one overlay is open at a time | ~10 |
 | `CHANGELOG.md`, `README.md` | | short notes | ~15 |
 
 ---

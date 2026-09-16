@@ -50,13 +50,13 @@ function setHudValue(params)
 end
 
 playerHudSettings = {
-    Red = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
-    Blue = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
-    Grey = {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Red = {helpOverlayOpen = false, scoringOverlayOpen = false, rewindOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Blue = {helpOverlayOpen = false, scoringOverlayOpen = false, rewindOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
+    Grey = {helpOverlayOpen = false, scoringOverlayOpen = false, rewindOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"},
 }
 
 function getDefaultHudSettings()
-    return {helpOverlayOpen = false, scoringOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"}
+    return {helpOverlayOpen = false, scoringOverlayOpen = false, rewindOverlayOpen = false, scoringOverlayMinimalist = false, clockHidden = false, hudVisible = true, scale = "Medium"}
 end
 
 function ensureHudSettings(color)
@@ -280,6 +280,7 @@ function applyHudPreferencesForColor(color)
     setHudAttributeForColor(color, {id = "HelpOverlay", attr = "active", value = helpOverlayActive})
     setHudAttributeForColor(color, {id = "VPScores", attr = "active", value = overlayActive})
     setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "active", value = scoringOverlayActive})
+    setHudAttributeForColor(color, {id = "RewindOverlay", attr = "active", value = settings.rewindOverlayOpen and "true" or "false"})
     setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "scale", value = scoringMinimalist and SCORING_OVERLAY_SCALE_MINIMAL or SCORING_OVERLAY_SCALE_FULL})
     setHudAttributeForColor(color, {id = "ScoringOverlay", attr = "height", value = scoringMinimalist and SCORING_OVERLAY_HEIGHT_MINIMAL or SCORING_OVERLAY_HEIGHT_FULL})
     local headerY = scoringMinimalist and SCORING_OVERLAY_HEADER_Y_MINIMAL or SCORING_OVERLAY_HEADER_Y_FULL
@@ -310,6 +311,7 @@ function hudToggleHelp(player, value, id)
     settings.helpOverlayOpen = not settings.helpOverlayOpen
     if settings.helpOverlayOpen then
         settings.scoringOverlayOpen = false
+        settings.rewindOverlayOpen = false
     end
     applyHudPreferencesForColor(color)
 end
@@ -327,6 +329,7 @@ function hudToggleLock(player, value, id)
     settings.scoringOverlayOpen = not settings.scoringOverlayOpen
     if settings.scoringOverlayOpen then
         settings.helpOverlayOpen = false
+        settings.rewindOverlayOpen = false
         -- The freshly-opened board renders from XML defaults, so drop the cache to
         -- force a full repaint (cached values would otherwise be skipped as "current").
         invalidateScoringCache()
@@ -1274,7 +1277,8 @@ function onSave()
         svPlayerHudSettings = playerHudSettings,
         svVersion = GAME_VERSION
     })
-    saved_data = saved_data:sub(1, -2) .. ',"svBattleLog":' .. battleLogOnSave() .. '}'
+    saved_data = saved_data:sub(1, -2) .. ',"svBattleLog":' .. battleLogOnSave() ..
+                 ',"svBattleGrave":' .. battleRewindOnSave() .. '}'
     --saved_data = ""
     return saved_data
 end
@@ -1374,6 +1378,7 @@ end
 function onObjectDestroy(obj)
     if not obj or not obj.getGUID then return end
     battleLogOnDestroy(obj)
+    battleRewindOnDestroy(obj)
     -- Dice can never carry a yellowscribe (ymc-) card, so skip the sweep: it
     -- starts with a full Global.UI.getXmlTable() marshal, and mass dice
     -- destruction (vortex, Clear Mat, bag entry) would pay it once per die.
@@ -1400,6 +1405,7 @@ function onLoad(saved_data)
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         battleLogOnLoad(loaded_data.svBattleLog)
+        battleRewindOnLoad(loaded_data.svBattleGrave)
         if packSelected then
             missionPackData[packSelected].redSecondaryDeck_GUID = loaded_data.svRedSecondaryDeckGUID or edition11RedSecondaryDeck_GUID
             missionPackData[packSelected].blueSecondaryDeck_GUID = loaded_data.svBlueSecondaryDeckGUID or edition11BlueSecondaryDeck_GUID
@@ -1411,6 +1417,7 @@ function onLoad(saved_data)
         ensureHudSettings("Red")
         ensureHudSettings("Blue")
         battleLogOnLoad(nil)
+        battleRewindOnLoad(nil)
     end
     if not packSelected then
         hideMissionDeckUntilSelected(edition11RedSecondaryDeck_GUID)

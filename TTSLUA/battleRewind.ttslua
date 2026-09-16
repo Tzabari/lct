@@ -1,0 +1,847 @@
+-- Battle Rewind: Global companion (no FTC-GUID header -- see compile.py's
+-- GLOBAL_COMPANION_LUA). Appended after battleLog.ttslua, so it shares its
+-- Lua environment and can extend RegisteredObject, call battleLogResolve,
+-- battleLogFindSnapshot, etc. directly. See
+-- docs/battle-log-rewind-architecture.md (binding; Part B is this file).
+
+-- ===== Panel selection + busy state =====
+
+battleRewindSel = {r = 1, t = "Red", p = 1}
+battleRewindBusy = false
+battleRewindUnlockQueue = {}
+
+BATTLE_REWIND_ROUNDS = 5
+BATTLE_REWIND_PHASES = 5
+BATTLE_REWIND_PHASE_LABELS = {"Cmd", "Mov", "Sht", "Chr", "Fgt"}
+BATTLE_REWIND_PARK_Y = -12
+
+-- ===== Graveyard: destroyed registered models, stored so a later rewind can
+-- respawn them. Long strings (LuaScript/LuaScriptState/XmlUI/Description) are
+-- shared across models via a pool keyed by the string itself, so models from
+-- the same unit only pay for one copy. =====
+
+battleRewindGrave = {}         -- guid -> slim entry (pooled fields replaced with ids)
+battleRewindGraveCache = {}    -- guid -> JSON.encode(entry), cached at store time
+battleRewindPoolList = {}      -- id -> string
+battleRewindPoolIds = {}       -- string -> id
+battleRewindPoolCache = {}     -- id -> JSON.encode(string), cached at store time
+battleRewindGravePending = {}  -- guid -> true while its respawn is in flight
+
+local BATTLE_REWIND_POOL_FIELDS = {"LuaScript", "LuaScriptState", "XmlUI", "Description"}
+
+local function battleRewindPoolRef(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    local id = battleRewindPoolIds[s]
+    if id then return id end
+    id = #battleRewindPoolList + 1
+    battleRewindPoolList[id] = s
+    battleRewindPoolIds[s] = id
+    battleRewindPoolCache[id] = JSON.encode(s)
+    return id
+end
+
+-- Store-only: no spawning happens here. See battleRewindRespawn for the other
+-- half, which only runs when a rewind actually needs the model back.
+function battleRewindOnDestroy(obj)
+    local guid = obj.getGUID()
+    if not battleLogRegistry[guid] then return end
+    local ok, json = pcall(function() return obj.getJSON() end)
+    if not ok or type(json) ~= "string" then return end
+    local ok2, decoded = pcall(function() return JSON.decode(json) end)
+    if not ok2 or type(decoded) ~= "table" then return end
+    local entry = {}
+    for k, v in pairs(decoded) do entry[k] = v end
+    for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
+        entry[field] = battleRewindPoolRef(entry[field])
+    end
+    battleRewindGrave[guid] = entry
+    battleRewindGraveCache[guid] = JSON.encode(entry)
+end
+
+function battleRewindOnSave()
+    local poolParts = {}
+    for id = 1, #battleRewindPoolCache do
+        poolParts[#poolParts + 1] = battleRewindPoolCache[id] or "null"
+    end
+    local graveParts = {}
+    for guid, piece in pairs(battleRewindGraveCache) do
+        graveParts[#graveParts + 1] = JSON.encode(guid) .. ":" .. piece
+    end
+    return "{\"pool\":[" .. table.concat(poolParts, ",") .. "],\"grave\":{" .. table.concat(graveParts, ",") .. "}}"
+end
+
+function battleRewindOnLoad(data)
+    battleRewindGrave, battleRewindGraveCache = {}, {}
+    battleRewindPoolList, battleRewindPoolIds, battleRewindPoolCache = {}, {}, {}
+    battleRewindGravePending = {}
+    if type(data) ~= "table" then return end
+    if type(data.pool) == "table" then
+        for id, s in ipairs(data.pool) do
+            battleRewindPoolList[id] = s
+            battleRewindPoolIds[s] = id
+            battleRewindPoolCache[id] = JSON.encode(s)
+        end
+    end
+    if type(data.grave) == "table" then
+        for guid, entry in pairs(data.grave) do
+            battleRewindGrave[guid] = entry
+            battleRewindGraveCache[guid] = JSON.encode(entry)
+        end
+    end
+end
+
+-- ===== Moving a model: RegisteredObject:setState (declared in battleLog.ttslua) =====
+
+local battleRewindParkNext = {Red = 0, Blue = 0}
+local battleRewindParkSlot = {}   -- guid -> {x,y,z}, assigned once per session
+
+local function battleRewindParkPosition(guid, color)
+    local slot = battleRewindParkSlot[guid]
+    if slot then return slot end
+    local n = battleRewindParkNext[color] or 0
+    battleRewindParkNext[color] = n + 1
+    local row = math.floor(n / 20)
+    local col = n % 20
+    local baseX = (color == "Red") and 40 or -40
+    slot = {x = baseX + col * 3, y = BATTLE_REWIND_PARK_Y, z = -80 + row * 3}
+    battleRewindParkSlot[guid] = slot
+    return slot
+end
+
+-- A parked object is locked + non-interactable + tucked under the table: no
+-- gravity, no falling, no settling, and nothing to grab through the floor.
+function battleRewindPark(ro, obj)
+    obj = obj or ro:object()
+    if obj == nil then return end
+    ro.off = true
+    local slot = battleRewindParkPosition(ro.guid, ro.color)
+    obj.setLock(true)
+    obj.interactable = false
+    obj.setPosition(slot)
+    pcall(function() obj.setVelocity({0, 0, 0}) end)
+    pcall(function() obj.setAngularVelocity({0, 0, 0}) end)
+end
+
+-- Teleports a model to its recorded state. Locked for the move (queued for
+-- unlock once the whole batch settles) so it can't push or topple anything
+-- mid-restore; instant setPosition/setRotation, never the *Smooth variants.
+function battleRewindUnpark(ro, obj, state)
+    ro.off = false
+    obj.setLock(true)
+    obj.setPosition({x = state.x, y = state.y, z = state.z})
+    obj.setRotation({x = state.rx, y = state.ry, z = state.rz})
+    pcall(function() obj.setVelocity({0, 0, 0}) end)
+    pcall(function() obj.setAngularVelocity({0, 0, 0}) end)
+    if state.name and state.name ~= "" and state.name ~= obj.getName() then
+        obj.setName(state.name)
+    end
+    obj.interactable = true
+    battleRewindUnlockQueue[#battleRewindUnlockQueue + 1] = obj
+end
+
+function RegisteredObject:setState(state)
+    local obj = self:object()
+    if obj == nil then
+        if not state.off then
+            battleRewindRespawn(self, state)
+        end
+        return
+    end
+    if state.off then
+        battleRewindPark(self, obj)
+    else
+        battleRewindUnpark(self, obj, state)
+    end
+end
+
+-- Rebuilds a destroyed model from its graveyard entry and spawns it locked at
+-- the target state. The original is long gone by now, so there's no GUID race
+-- to avoid -- only the (very unlikely) case where the saved GUID is already
+-- taken, which the callback below re-keys the registry for.
+function battleRewindRespawn(ro, state)
+    local guid = ro.guid
+    if battleRewindGravePending[guid] then return end
+    local entry = battleRewindGrave[guid]
+    if entry == nil then
+        broadcastToAll("Rewind: " .. tostring(guid) .. " has no graveyard entry to respawn from.", {1, 0.6, 0.2})
+        return
+    end
+    battleRewindGravePending[guid] = true
+    local full = {}
+    for k, v in pairs(entry) do full[k] = v end
+    for _, field in ipairs(BATTLE_REWIND_POOL_FIELDS) do
+        local id = entry[field]
+        full[field] = (id and battleRewindPoolList[id]) or ""
+    end
+    full.GUID = guid
+    full.Locked = true
+    full.Transform = full.Transform or {}
+    full.Transform.posX, full.Transform.posY, full.Transform.posZ = state.x, state.y, state.z
+    full.Transform.rotX, full.Transform.rotY, full.Transform.rotZ = state.rx, state.ry, state.rz
+    if state.name and state.name ~= "" then full.Nickname = state.name end
+
+    local ok, json = pcall(JSON.encode, full)
+    if not ok then
+        battleRewindGravePending[guid] = false
+        broadcastToAll("Rewind: could not rebuild " .. tostring(guid) .. " from the graveyard.", {1, 0.4, 0.2})
+        return
+    end
+
+    spawnObjectJSON({
+        json = json,
+        callback_function = function(spawned)
+            battleRewindGravePending[guid] = false
+            if spawned == nil then return end
+            local newGuid = spawned.getGUID()
+            if newGuid ~= guid then
+                battleLogRegistry[newGuid] = ro
+                battleLogRegistry[guid] = nil
+                ro.guid = newGuid
+                for _, color in ipairs({"Red", "Blue"}) do
+                    for i, g in ipairs(battleLog.army[color] or {}) do
+                        if g == guid then battleLog.army[color][i] = newGuid end
+                    end
+                end
+                battleRewindGrave[newGuid] = battleRewindGrave[guid]
+                battleRewindGraveCache[newGuid] = battleRewindGraveCache[guid]
+                battleRewindGrave[guid], battleRewindGraveCache[guid] = nil, nil
+            else
+                battleRewindGrave[guid], battleRewindGraveCache[guid] = nil, nil
+            end
+            ro.off = false
+            ro.prev = state
+            battleLogEncode()
+        end,
+    })
+end
+
+-- Applies a batch of registered-model states: moves/parks 25 per frame,
+-- respawns 4 per frame (spawnObjectJSON is heavier), then unlocks whatever
+-- landed on the field once both queues have drained.
+function setRegisteredObjectsState(objs, done)
+    battleRewindUnlockQueue = {}
+    local moves, respawns = {}, {}
+    for guid, tuple in pairs(objs or {}) do
+        local ro = battleLogRegistry[guid]
+        if ro then
+            local state = State.fromTuple(tuple)
+            if ro:object() == nil and not state.off then
+                respawns[#respawns + 1] = {ro = ro, state = state}
+            else
+                moves[#moves + 1] = {ro = ro, state = state}
+            end
+        end
+    end
+
+    local pending = (#moves > 0 and 1 or 0) + (#respawns > 0 and 1 or 0)
+    local function finishOne()
+        pending = pending - 1
+        if pending <= 0 then
+            Wait.frames(function()
+                for _, obj in ipairs(battleRewindUnlockQueue) do
+                    if obj ~= nil then pcall(function() obj.setLock(false) end) end
+                end
+                battleRewindUnlockQueue = {}
+                if done then done() end
+            end, 2)
+        end
+    end
+
+    if pending == 0 then
+        if done then done() end
+        return
+    end
+
+    if #moves > 0 then
+        local i = 1
+        local function stepMoves()
+            local stop = math.min(i + 24, #moves)
+            while i <= stop do
+                local w = moves[i]
+                local ok, err = pcall(function() w.ro:setState(w.state) end)
+                if ok then
+                    w.ro.prev = w.state
+                else
+                    broadcastToAll("Rewind: could not restore " .. tostring(w.ro.guid) .. ": " .. tostring(err), {1, 0.4, 0.2})
+                end
+                i = i + 1
+            end
+            if i <= #moves then Wait.frames(stepMoves, 1) return end
+            finishOne()
+        end
+        stepMoves()
+    end
+
+    if #respawns > 0 then
+        local i = 1
+        local function stepRespawns()
+            local stop = math.min(i + 3, #respawns)
+            while i <= stop do
+                local w = respawns[i]
+                local ok, err = pcall(battleRewindRespawn, w.ro, w.state)
+                if not ok then
+                    broadcastToAll("Rewind: could not respawn " .. tostring(w.ro.guid) .. ": " .. tostring(err), {1, 0.4, 0.2})
+                end
+                i = i + 1
+            end
+            if i <= #respawns then Wait.frames(stepRespawns, 1) return end
+            finishOne()
+        end
+        stepRespawns()
+    end
+end
+
+-- ===== Turn / VP / CP setters =====
+
+function setTurnState(turn)
+    if type(turn) ~= "table" then return end
+    local round = getObjectFromGUID(gameTurnCounter_GUID)
+    local redT = getObjectFromGUID(redTurnCounter_GUID)
+    local blueT = getObjectFromGUID(blueTurnCounter_GUID)
+    counterSetValue(round, turn.r)
+    counterSetValue(redT, turn.rt)
+    counterSetValue(blueT, turn.bt)
+    for _, counter in ipairs({round, redT, blueT}) do
+        if counter then pcall(function() counter.call("updateHUD") end) end
+    end
+    local menu = getObjectFromGUID(startMenu_GUID)
+    if menu then menu.call("rewindSetTurnState", {t = turn.t, p = turn.p}) end
+end
+
+function setVpState(json)
+    if type(json) ~= "string" or json == "" then return end
+    local sheet = getObjectFromGUID(scoresheet_GUID)
+    if sheet == nil then return end
+    sheet.call("setScoreGrid", json)
+    refreshScoringOverlay()
+end
+
+function setCpState(cp)
+    if type(cp) ~= "table" then return end
+    local red = cpCounterForColor("Red")
+    local blue = cpCounterForColor("Blue")
+    counterSetValue(red, cp.r)
+    counterSetValue(blue, cp.b)
+    if red then pcall(function() red.call("markBaseline") end) end
+    if blue then pcall(function() blue.call("markBaseline") end) end
+    cpGainRoundUsed["Red"] = cp.gr
+    cpGainRoundUsed["Blue"] = cp.gb
+    local menu = getObjectFromGUID(startMenu_GUID)
+    if menu then menu.call("updateCpHUD") end
+end
+
+-- ===== Secondaries =====
+--
+-- Ported from feature/battle-rewind's battleRestoreSecondaries, which found
+-- and fixed the two real bugs here (deck-collapse mid-restore, and a discard
+-- move racing the name-label refresh). Restructured into a one-slot-per-frame
+-- queue per the architecture doc: each queue step re-resolves any deck by the
+-- GUID captured at scan time (never a handle that might already be stale),
+-- so a deck collapsing between two queued steps is a normal, handled case
+-- rather than a race to guard against.
+
+-- Indexes one color's own cards by name: its 8 slots, its discard pile, and
+-- its secondary deck. Scoped per color (never a shared table), so Red and
+-- Blue holding identically-named cards can never cross-match.
+function battleRewindCollectColorCandidates(scene, color)
+    local byName = {}
+    local function addLoose(o)
+        local n = o.getName()
+        if n == nil or n == "" then return end
+        byName[n] = byName[n] or {}
+        table.insert(byName[n], {obj = o, pos = o.getPosition()})
+    end
+    local function addDeck(deck)
+        if deck == nil then return end
+        local deckGuid = deck.getGUID()
+        local pos = deck.getPosition()
+        for _, entry in ipairs(deck.getObjects() or {}) do
+            local n = entry.name
+            if n ~= nil and n ~= "" then
+                byName[n] = byName[n] or {}
+                table.insert(byName[n], {deck = deck, deckGuid = deckGuid, guid = entry.guid, pos = pos})
+            end
+        end
+    end
+
+    for index = 1, 8 do
+        local zone = getSecondaryCardZoneByIndex(color, index)
+        if zone then
+            for _, o in ipairs(getCardsInSecondarySlot(zone)) do
+                if o.tag == "Card" then addLoose(o) end
+            end
+        end
+    end
+
+    local dpos = getSecondaryDiscardPosition(color)
+    for _, o in ipairs(scene) do
+        if o.tag == "Card" or o.tag == "Deck" then
+            local p = o.getPosition()
+            if p.y > 0.5 and p.y < 3.0 and math.abs(p.x - dpos.x) < 2.5 and math.abs(p.z - dpos.z) < 2.5 then
+                if o.tag == "Card" then addLoose(o) else addDeck(o) end
+            end
+        end
+    end
+
+    local deck = getSecondaryDeckByColor(color)
+    if deck ~= nil then
+        if deck.tag == "Card" then addLoose(deck) else addDeck(deck) end
+    end
+
+    return byName
+end
+
+-- Nearest-by-position match, removed from the pool once chosen so neither a
+-- later slot nor the discard/deck sweep can also claim it.
+function battleRewindNearestSecondaryCandidate(candidates, name, near)
+    local list = candidates[name]
+    if type(list) ~= "table" or #list == 0 then return nil end
+    local bestIdx, bestScore = nil, nil
+    for i, cand in ipairs(list) do
+        local p = cand.pos or near
+        local dx = (p.x or 0) - (near.x or 0)
+        local dz = (p.z or 0) - (near.z or 0)
+        local score = dx * dx + dz * dz
+        if cand.deck ~= nil then score = score + 1e6 end
+        if bestScore == nil or score < bestScore then bestScore, bestIdx = score, i end
+    end
+    local chosen = table.remove(list, bestIdx)
+    if #list == 0 then candidates[name] = nil end
+    return chosen
+end
+
+local function battleRewindTakeCandidateTo(candidates, name, target, rot, wantFaceDown, missing, label, onPlaced)
+    local hit = battleRewindNearestSecondaryCandidate(candidates, name, target)
+    if hit == nil then
+        missing[#missing + 1] = label
+        return
+    end
+    if hit.obj ~= nil then
+        local found = hit.obj
+        pcall(function()
+            found.locked = false
+            found.setPosition(target)
+            if rot then found.setRotation(rot) end
+        end)
+        if onPlaced then onPlaced(found) end
+        if wantFaceDown ~= nil then
+            Wait.frames(function()
+                pcall(function()
+                    if found.is_face_down ~= wantFaceDown then found.flip() end
+                    if rot then found.locked = true end
+                end)
+            end, 20)
+        end
+        return
+    end
+    local liveDeck = hit.deckGuid and getObjectFromGUID(hit.deckGuid) or nil
+    local stillADeck = liveDeck ~= nil and (liveDeck.tag == "Deck" or liveDeck.type == "Deck")
+    if stillADeck then
+        liveDeck.takeObject({
+            guid = hit.guid, position = target, rotation = rot, smooth = false,
+            callback_function = function(card)
+                if card == nil then return end
+                if onPlaced then onPlaced(card) end
+                if wantFaceDown ~= nil then
+                    Wait.frames(function()
+                        pcall(function()
+                            if card.is_face_down ~= wantFaceDown then card.flip() end
+                            if rot then card.locked = true end
+                        end)
+                    end, 20)
+                end
+            end,
+        })
+        return
+    end
+    -- The deck already collapsed to its last card (an earlier step in this
+    -- same restore took the other one out of it): that card is now loose
+    -- under its own GUID, not inside a container takeObject can reach.
+    local lone = getObjectFromGUID(hit.guid)
+    if lone ~= nil then
+        pcall(function()
+            lone.locked = false
+            lone.setPosition(target)
+            if rot then lone.setRotation(rot) end
+        end)
+        if onPlaced then onPlaced(lone) end
+        if wantFaceDown ~= nil then
+            Wait.frames(function()
+                pcall(function()
+                    if lone.is_face_down ~= wantFaceDown then lone.flip() end
+                    if rot then lone.locked = true end
+                end)
+            end, 20)
+        end
+    else
+        missing[#missing + 1] = label
+    end
+end
+
+local BATTLE_REWIND_SLOT_ROT = {x = 0, y = 270, z = 0}
+
+function battleRewindSecondaryStep(job, candidatesByColor, missing)
+    local candidates = candidatesByColor[job.color]
+    if job.kind == "slot" then
+        local zone = getSecondaryCardZoneByIndex(job.color, job.index)
+        if zone == nil then return end
+        local target = getSecondarySlotCardPosition(zone)
+        local occupants = getCardsInSecondarySlotForColor(job.color, job.index, zone)
+        if job.entry == nil then
+            for _, o in ipairs(occupants) do
+                pcall(function()
+                    o.locked = false
+                    o.setPosition(getSecondaryDiscardPosition(job.color))
+                end)
+            end
+            clearSecondarySlotAssignment(job.color, job.index)
+            return
+        end
+        local wantFaceDown = (job.entry.fd == true)
+        local hitName = job.entry.n
+        -- Peek which candidate would be chosen before clearing occupants, so a
+        -- card already correctly seated isn't discarded and re-drawn.
+        local keepGuid = nil
+        local list = candidates[hitName]
+        if type(list) == "table" then
+            for _, cand in ipairs(list) do
+                if cand.obj ~= nil then
+                    for _, o in ipairs(occupants) do
+                        if o.getGUID() == cand.obj.getGUID() then keepGuid = o.getGUID() end
+                    end
+                end
+            end
+        end
+        for _, o in ipairs(occupants) do
+            if o.getGUID() ~= keepGuid then
+                pcall(function()
+                    o.locked = false
+                    o.setPosition(getSecondaryDiscardPosition(job.color))
+                end)
+            end
+        end
+        battleRewindTakeCandidateTo(candidates, hitName, target, BATTLE_REWIND_SLOT_ROT, wantFaceDown, missing,
+            job.color .. " slot " .. job.index .. ": " .. tostring(hitName),
+            function(card) assignSecondarySlotCard(job.color, job.index, card) end)
+        return
+    end
+
+    if job.kind == "discard" then
+        local dpos = getSecondaryDiscardPosition(job.color)
+        battleRewindTakeCandidateTo(candidates, job.name, dpos, nil, nil, missing,
+            job.color .. " discard: " .. tostring(job.name), nil)
+        return
+    end
+
+    if job.kind == "sweep" then
+        -- Whatever's left in this color's candidate pool is neither wanted in
+        -- a slot nor in the discard pile, so it goes back into the deck (the
+        -- "undrawn" state after rewinding to before it was picked up).
+        local deck = getSecondaryDeckByColor(job.color)
+        for _, list in pairs(candidates) do
+            for _, cand in ipairs(list) do
+                if cand.obj ~= nil then
+                    pcall(function()
+                        cand.obj.locked = false
+                        if deck then deck.putObject(cand.obj) else cand.obj.setPosition(getSecondaryDiscardPosition(job.color)) end
+                    end)
+                end
+            end
+        end
+    end
+end
+
+function setSecondariesState(sec, done)
+    if type(sec) ~= "table" then
+        if done then done() end
+        return
+    end
+    local scene = getAllObjects()
+    local candidatesByColor = {}
+    local queue = {}
+
+    for _, color in ipairs({"Red", "Blue"}) do
+        local side = sec[color]
+        if type(side) == "table" then
+            candidatesByColor[color] = battleRewindCollectColorCandidates(scene, color)
+            local wantedSlot = {}
+            for i, entry in pairs(side.slots or {}) do wantedSlot[tonumber(i) or i] = entry end
+            for index = 1, 8 do
+                queue[#queue + 1] = {kind = "slot", color = color, index = index, entry = wantedSlot[index]}
+            end
+            for _, name in ipairs(side.discard or {}) do
+                queue[#queue + 1] = {kind = "discard", color = color, name = name}
+            end
+            queue[#queue + 1] = {kind = "sweep", color = color}
+        end
+    end
+
+    local missing = {}
+    local i = 1
+    local function step()
+        if i > #queue then
+            for _, color in ipairs({"Red", "Blue"}) do
+                pcall(refreshSecondaryNamesForColor, color)
+                local side = sec[color]
+                if type(side) == "table" then discardedCardTurns[color] = side.turns or {} end
+            end
+            if #missing > 0 then
+                broadcastToAll("Rewind: could not find secondary card(s): " .. table.concat(missing, ", "), {1, 0.6, 0.2})
+            end
+            if done then done() end
+            return
+        end
+        local job = queue[i]
+        i = i + 1
+        local ok, err = pcall(battleRewindSecondaryStep, job, candidatesByColor, missing)
+        if not ok then missing[#missing + 1] = tostring(job.color) .. ": " .. tostring(err) end
+        Wait.frames(step, 1)
+    end
+    step()
+end
+
+-- ===== The rewind itself =====
+
+function battleRewindCheckMap()
+    if type(battleLog.map) ~= "table" or not battleLog.map.guid then return true end
+    local menu = getObjectFromGUID(startMenu_GUID)
+    local current = menu and menu.getVar("debugCurrentMapGuid") or nil
+    return current == battleLog.map.guid
+end
+
+function battleRewindApply(parts, i)
+    local pendingQueues = 1  -- the objects queue always runs, even with nothing to move
+    if parts.sec then pendingQueues = pendingQueues + 1 end
+
+    local function queueDone()
+        pendingQueues = pendingQueues - 1
+        if pendingQueues <= 0 then battleRewindFinish(parts, i) end
+    end
+
+    if parts.turn then setTurnState(parts.turn) end
+    if parts.vp then setVpState(parts.vp) end
+    if parts.cp then setCpState(parts.cp) end
+
+    setRegisteredObjectsState(parts.objs or {}, queueDone)
+    if parts.sec then setSecondariesState(parts.sec, queueDone) end
+end
+
+function battleRewindFinish(parts, i)
+    battleLog.base = i
+    battleLogPrevParts = battleLogPrevParts or {}
+    if parts.turn then battleLogPrevParts.turn = parts.turn end
+    if parts.vp then battleLogPrevParts.vp = parts.vp end
+    if parts.cp then battleLogPrevParts.cp = parts.cp end
+    if parts.sec then battleLogPrevParts.sec = parts.sec end
+    battleLogEncode()
+    battleRewindBusy = false
+    battleRewindRefresh()
+
+    local snap = battleLog.snaps[i]
+    local label = "?"
+    if snap then
+        label = "R" .. tostring(snap.k[1]) .. " " .. tostring(snap.k[2]) .. " " ..
+                (BATTLE_REWIND_PHASE_LABELS[snap.k[3]] or tostring(snap.k[3]))
+    end
+    broadcastToAll("Rewound to " .. label .. " -- save the game (Ctrl+S) to keep it.", "Yellow")
+end
+
+function battleRewindTo(i, playerColor)
+    if battleRewindBusy then
+        if playerColor then broadcastToColor("Rewind already in progress.", playerColor, "Orange") end
+        return false
+    end
+    local snap = battleLog.snaps[i]
+    if snap == nil then
+        if playerColor then broadcastToColor("Nothing was recorded at that point.", playerColor, "Orange") end
+        return false
+    end
+    if not battleRewindCheckMap() then
+        if playerColor then broadcastToColor("Rewind refused: a different map is loaded now.", playerColor, "Orange") end
+        return false
+    end
+    battleRewindBusy = true
+    battleRewindApply(battleLogResolve(i), i)
+    return true
+end
+
+-- The (round, turn, phase) combination that comes after the current selection
+-- in play order, skipping anything nothing was ever recorded for. Returns
+-- r, t, p, or nil once the selection is at (or past) the last recorded moment.
+function battleRewindNextSelection()
+    local combos = {}
+    for r = 1, BATTLE_REWIND_ROUNDS do
+        for _, t in ipairs({"Red", "Blue"}) do
+            for p = 1, BATTLE_REWIND_PHASES do
+                combos[#combos + 1] = {r = r, t = t, p = p}
+            end
+        end
+    end
+    local at = 0
+    for idx, c in ipairs(combos) do
+        if c.r == battleRewindSel.r and c.t == battleRewindSel.t and c.p == battleRewindSel.p then
+            at = idx
+            break
+        end
+    end
+    for idx = at + 1, #combos do
+        local c = combos[idx]
+        if battleLogFindSnapshot(c.r, c.t, c.p) ~= nil then return c.r, c.t, c.p end
+    end
+    return nil
+end
+
+-- Prefers a direct child of the currently-applied snapshot (applies just that
+-- diff); otherwise falls back to a full rewind of the next recorded moment.
+function battleRewindNext(playerColor)
+    if battleRewindBusy then
+        if playerColor then broadcastToColor("Rewind already in progress.", playerColor, "Orange") end
+        return
+    end
+    local current = battleLog.base
+    for j = 1, #battleLog.snaps do
+        local s = battleLog.snaps[j]
+        if s.b == current and s.tag ~= "last" then
+            if not battleRewindCheckMap() then
+                if playerColor then broadcastToColor("Rewind refused: a different map is loaded now.", playerColor, "Orange") end
+                return
+            end
+            battleRewindBusy = true
+            battleRewindSel.r, battleRewindSel.t, battleRewindSel.p = s.k[1], s.k[2], s.k[3]
+            battleRewindApply(s.parts or {}, j)
+            return
+        end
+    end
+    local r, t, p = battleRewindNextSelection()
+    if r == nil then
+        if playerColor then broadcastToColor("Already at the last recorded phase.", playerColor, "Orange") end
+        return
+    end
+    battleRewindSel.r, battleRewindSel.t, battleRewindSel.p = r, t, p
+    local idx = battleLogFindSnapshot(r, t, p)
+    if idx then battleRewindTo(idx, playerColor) end
+end
+
+function battleRewindReturnLast(playerColor)
+    if battleRewindBusy then
+        if playerColor then broadcastToColor("Rewind already in progress.", playerColor, "Orange") end
+        return
+    end
+    for idx = #battleLog.snaps, 1, -1 do
+        if battleLog.snaps[idx].tag == "last" then
+            battleRewindTo(idx, playerColor)
+            return
+        end
+    end
+    if playerColor then broadcastToColor("Nothing to return to.", playerColor, "Orange") end
+end
+
+-- ===== Panel: open, refresh, and its button handlers =====
+
+BATTLE_REWIND_ON  = "#B52020E6|#D46060E6|#8E1818|#B52020E6"
+BATTLE_REWIND_OFF = "#1A1A2ACC|#2A2A4AE6|#0D0D1A|#1A1A2A55"
+
+function battleRewindOpen(params)
+    if type(params) ~= "table" or not params.clicker then return end
+    local color = params.clicker
+    if battleRewindBusy then
+        broadcastToColor("Rewind already in progress.", color, "Orange")
+        return
+    end
+    local menu = getObjectFromGUID(startMenu_GUID)
+    if not (menu and menu.getVar("inGame")) then
+        broadcastToColor("The battle hasn't started yet.", color, "Orange")
+        return
+    end
+    if #(battleLog.army.Red or {}) == 0 and #(battleLog.army.Blue or {}) == 0 then
+        broadcastToColor("Register at least one army before rewinding.", color, "Orange")
+        return
+    end
+    battleLogCapture("last")
+    local turn = getTurnState()
+    battleRewindSel = {r = turn.r, t = turn.t, p = turn.p}
+    local settings = ensureHudSettings(color)
+    settings.rewindOverlayOpen = true
+    settings.helpOverlayOpen = false
+    settings.scoringOverlayOpen = false
+    applyHudPreferencesForColor(color)
+    battleRewindRefresh()
+end
+
+function battleRewindClose(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local settings = ensureHudSettings(color)
+    settings.rewindOverlayOpen = false
+    applyHudPreferencesForColor(color)
+end
+
+function battleRewindRefresh()
+    local sel = battleRewindSel
+    local function paint(id, chosen, enabled)
+        setHudAttribute({id = id, attr = "colors", value = chosen and BATTLE_REWIND_ON or BATTLE_REWIND_OFF})
+        setHudAttribute({id = id, attr = "interactable", value = enabled and "true" or "false"})
+    end
+    for r = 1, BATTLE_REWIND_ROUNDS do
+        local live = false
+        for p = 1, BATTLE_REWIND_PHASES do
+            if battleLogFindSnapshot(r, sel.t, p) then live = true break end
+        end
+        paint("RewindRound" .. r, sel.r == r, live)
+    end
+    for _, t in ipairs({"Red", "Blue"}) do
+        local live = false
+        for p = 1, BATTLE_REWIND_PHASES do
+            if battleLogFindSnapshot(sel.r, t, p) then live = true break end
+        end
+        paint("RewindTurn" .. t, sel.t == t, live)
+    end
+    for p = 1, BATTLE_REWIND_PHASES do
+        paint("RewindPhase" .. p, sel.p == p, battleLogFindSnapshot(sel.r, sel.t, p) ~= nil)
+    end
+
+    local idx = battleLogFindSnapshot(sel.r, sel.t, sel.p)
+    setHudAttribute({id = "RewindGo", attr = "interactable", value = idx ~= nil and "true" or "false"})
+    local nr = battleRewindNextSelection()
+    setHudAttribute({id = "RewindNext", attr = "interactable", value = nr ~= nil and "true" or "false"})
+    local hasLast = false
+    for _, s in ipairs(battleLog.snaps) do
+        if s.tag == "last" then hasLast = true break end
+    end
+    setHudAttribute({id = "RewindLast", attr = "interactable", value = hasLast and "true" or "false"})
+
+    local status
+    if idx == nil then
+        status = "Nothing recorded there."
+    else
+        status = "R" .. sel.r .. " " .. sel.t .. " " .. (BATTLE_REWIND_PHASE_LABELS[sel.p] or tostring(sel.p))
+    end
+    setHudValue({id = "RewindStatus", value = status .. "   (" .. #battleLog.snaps .. " snapshot(s))"})
+end
+
+function battleRewindPick(player, value, id)
+    local sid = tostring(id or "")
+    local n = tonumber(string.match(sid, "RewindRound(%d+)$"))
+    if n then battleRewindSel.r = n battleRewindRefresh() return end
+    local t = string.match(sid, "RewindTurn(%a+)$")
+    if t == "Red" or t == "Blue" then battleRewindSel.t = t battleRewindRefresh() return end
+    local p = tonumber(string.match(sid, "RewindPhase(%d+)$"))
+    if p then battleRewindSel.p = p battleRewindRefresh() end
+end
+
+function battleRewindGo(player, value, id)
+    local color = getHudColorFromCallback(player, id)
+    local idx = battleLogFindSnapshot(battleRewindSel.r, battleRewindSel.t, battleRewindSel.p)
+    if idx == nil then
+        broadcastToColor("Nothing was recorded at that point.", color, "Orange")
+        return
+    end
+    battleRewindTo(idx, color)
+end
+
+function battleRewindNextBtn(player, value, id)
+    battleRewindNext(getHudColorFromCallback(player, id))
+end
+
+function battleRewindReturnLastBtn(player, value, id)
+    battleRewindReturnLast(getHudColorFromCallback(player, id))
+end

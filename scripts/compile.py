@@ -75,7 +75,7 @@ GLOBAL_LUA = "global.ttslua"
 # matched against a JSON object -- so collect_lua_files() excludes them from
 # its GUID scan. Split out purely to keep a large feature's source readable
 # on its own; add to this list to split out another one.
-GLOBAL_COMPANION_LUA = ["battleLog.ttslua"]
+GLOBAL_COMPANION_LUA = ["battleLog.ttslua", "battleRewind.ttslua"]
 
 # The Battlemaster dynamic spawner bakes the canonical map-card machinery into
 # its own script (via @@MAP_CARD_MACHINERY@@), so it must be excluded from the

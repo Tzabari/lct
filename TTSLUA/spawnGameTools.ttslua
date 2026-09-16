@@ -44,6 +44,22 @@ local registerArmyBtnB = {
     tooltip="Select your models, then LEFT CLICK to register them as the Blue army.\nRIGHT CLICK clears Blue's registration."
 }
 
+-- Battle rewind: opens the rewind picker. One more row inboard, same size.
+local ZposRewind = ZposBattle - 2.5
+local rewindBtnLbl = "REWIND BATTLE"
+local rewindBtnR = {
+    label=rewindBtnLbl, click_function="rewindBattleR", function_owner=self,
+    position={XposHideArmy,Ypos,ZposRewind}, rotation={0,0,0},
+    height=500, width=2400, font_size=200, color={0.35,0.35,0.4}, font_color={1,1,1},
+    tooltip="Open the rewind picker to return the table to any recorded phase."
+}
+local rewindBtnB = {
+    label=rewindBtnLbl, click_function="rewindBattleB", function_owner=self,
+    position={XposHideArmy+Xoffset,Ypos,-ZposRewind}, rotation={0,180,0},
+    height=500, width=2400, font_size=200, color={0.35,0.35,0.4}, font_color={1,1,1},
+    tooltip="Open the rewind picker to return the table to any recorded phase."
+}
+
 -- Activation / Wound tracker tokens: a Reset button (also auto-fired at every
 -- phase change from startMenu) plus per-token Spawn buttons that clone the parked
 -- master copies. Mirrored on the Red (+Z) and Blue (-Z) edges of the tool.
@@ -143,6 +159,8 @@ function createMenu()
     self.createButton(showArmyBtnB)
     self.createButton(registerArmyBtnR)
     self.createButton(registerArmyBtnB)
+    self.createButton(rewindBtnR)
+    self.createButton(rewindBtnB)
 end
 
 -- Reset every Activation token on the table to its "not acted" (green) state.
@@ -218,6 +236,14 @@ function registerArmyB(obj, player, alt)
     else
         Global.call("battleLogRegister", {clicker = player, color = "Blue"})
     end
+end
+
+function rewindBattleR(obj, player, alt)
+    Global.call("battleRewindOpen", {clicker = player})
+end
+
+function rewindBattleB(obj, player, alt)
+    Global.call("battleRewindOpen", {clicker = player})
 end
 
 function hideShowArmy(color, hideShow)
