@@ -137,6 +137,7 @@ battleLog = {                               -- persisted (as battleLogEncoded)
   army  = {Red = {guid, ...}, Blue = {guid, ...}},
   base  = 7,                                -- index the next capture diffs against
   snaps = { snapshot, ... },                -- at most 200 (warning at the cap)
+  baseSize = {[guid] = {bx, bz}, ...},       -- half of getBoundsNormalized().size; set once, at registration
 }
 
 snapshot = {
@@ -221,8 +222,8 @@ flowchart LR
 | `State.new / fromObject / equals / encode` | log and rewind code | the model state value type | 45 |
 | `RegisteredObject.new / object / getState` | log code | wraps one registered model | 35 |
 | `isBattleLogModel(obj)` | `battleLogRegister` | the selection filter (a trimmed copy of battle-log's `isBattleModel`): Figurine, Generic or Custom_Model; not locked; no furniture GMNotes; no `BCBtype` | 20 |
-| `battleLogRegister(params)` | REGISTER ARMY (LMB) | takes the clicker's selected models, replaces that side's army, re-encodes | 35 |
-| `battleLogClearArmy(params)` | REGISTER ARMY (RMB) | unregisters a side and re-encodes | 15 |
+| `battleLogRegister(params)` | REGISTER ARMY (LMB) | takes the clicker's selected models, replaces that side's army, records each model's `baseSize` from `getBoundsNormalized()` (rotation-independent, so facing doesn't matter), re-encodes | 40 |
+| `battleLogClearArmy(params)` | REGISTER ARMY (RMB) | unregisters a side, drops its `baseSize` entries, re-encodes | 15 |
 | `battleLogRequestCapture(tag)` | startMenu hooks | merges calls in the same frame and keeps `start` over `phase` | 15 |
 | `battleLogCapture(tag)` | the above, and rewind (`last`) | the capture flow in §A2; returns the new index or the base index | 60 |
 | `getTurnState()` | capture | reads the round and turn counters, and startMenu's `currentTurn` / `currentPhase` | 15 |

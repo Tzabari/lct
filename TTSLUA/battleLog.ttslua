@@ -10,7 +10,7 @@
 -- walks backward to reconstruct the full state at any point. See
 -- docs/battle-log-rewind-architecture.md (binding; §A is this file).
 
-battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}}
+battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}, baseSize = {}}
 battleLogEncoded = nil
 battleLogRegistry = {}       -- guid -> RegisteredObject
 battleLogPrevParts = nil     -- {turn, vp, cp, sec} as last observed; nil until battleLogEnsurePrev runs
@@ -134,9 +134,18 @@ function battleLogRegister(params)
     local clicker = params.clicker
     local selected = (clicker and Player[clicker]) and Player[clicker].getSelectedObjects() or {}
     local guids = {}
+    local baseSize = {}
     for _, obj in ipairs(selected) do
         if isBattleLogModel(obj) then
-            guids[#guids + 1] = obj.getGUID()
+            local guid = obj.getGUID()
+            guids[#guids + 1] = guid
+            -- Normalized bounds ignore the model's current facing, so this is
+            -- the same footprint regardless of which way it's rotated on the
+            -- table. Half the size gives the radius the report draws with.
+            local ok, size = pcall(function() return obj.getBoundsNormalized().size end)
+            if ok and size then
+                baseSize[guid] = {size.x / 2, size.z / 2}
+            end
         end
     end
     if #guids == 0 then
@@ -147,6 +156,7 @@ function battleLogRegister(params)
     battleLog.army[color] = guids
     for _, guid in ipairs(guids) do
         battleLogRegistry[guid] = RegisteredObject.new(guid, color)
+        if baseSize[guid] then battleLog.baseSize[guid] = baseSize[guid] end
     end
     battleLogEncode()
     if clicker then broadcastToColor("Registered " .. #guids .. " models for " .. color .. ".", clicker, color) end
@@ -158,6 +168,7 @@ function battleLogClearArmy(params)
     if color ~= "Red" and color ~= "Blue" then return end
     for _, guid in ipairs(battleLog.army[color] or {}) do
         battleLogRegistry[guid] = nil
+        battleLog.baseSize[guid] = nil
     end
     battleLog.army[color] = {}
     battleLogEncode()
@@ -416,8 +427,9 @@ function battleLogOnLoad(data)
         battleLog = data
         battleLog.army = battleLog.army or {Red = {}, Blue = {}}
         battleLog.snaps = battleLog.snaps or {}
+        battleLog.baseSize = battleLog.baseSize or {}  -- absent in saves recorded before this field existed
     else
-        battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}}
+        battleLog = {v = 1, map = nil, army = {Red = {}, Blue = {}}, base = nil, snaps = {}, baseSize = {}}
     end
     for _, color in ipairs({"Red", "Blue"}) do
         for _, guid in ipairs(battleLog.army[color] or {}) do
